@@ -1,0 +1,12 @@
+.{
+    .name = .mirage,
+    .version = "0.16.0",
+    .dependencies = .{
+        .dtree = .{
+            .url = "git+https://git.lilithsemi.com/LilithSemi/dtree.git#6ddd53fc04c7480c40557903766c4e8903cd8139",
+            .hash = "dtree-0.1.0-76to8CvlAAD18WmH5ygUHdUtrI3XMYabapbwt1qe2bn1",
+        },
+    },
+    .paths = .{""},
+    .fingerprint = 0xecd09ace8d31239,
+}
