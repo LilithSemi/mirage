@@ -422,7 +422,14 @@ fn joinUnder(self: *Export, nodeid: u64, name: []const u8) Error![]u8 {
 ///
 /// A symlink is never followed here. What it points at is the kernel's to resolve inside its own
 /// mount, and following it on this side is how a guest would be handed something outside the export.
-fn attrOf(self: *Export, path: []const u8) ?wire.Attr {
+/// What `path` looks like to the guest.
+///
+/// **`writable` is the offer's and not this machine's.** The kernel refuses a
+/// write against the mode it was told before it ever sends one, so an inode
+/// reported read only in a writable offer is a share the guest cannot write
+/// whatever the mount says: a workspace offered writable answered `0444` on every
+/// file, and a build in there could not open its own cache directory.
+fn attrOf(self: *Export, path: []const u8, writable: bool) ?wire.Attr {
     const about = std.Io.Dir.cwd().statFile(self.io, path, .{ .follow_symlinks = false }) catch return null;
 
     // The type bits, which the kernel reads to know what it is looking at.
@@ -436,9 +443,11 @@ fn attrOf(self: *Export, path: []const u8) ?wire.Attr {
         .unix_domain_socket => 0o140000,
         else => 0o100000,
     };
-    // Everything is read only whatever this machine says: the write bits come off rather than being
-    // trusted, so a file writable here is not writable there.
-    const allowed: u32 = @intCast(about.permissions.toMode() & 0o777 & ~@as(u32, 0o222));
+    // A read only offer takes the write bits off whatever this machine says, so a file writable
+    // here is not writable there. A writable one keeps them, and a file that is read only here
+    // stays read only there: the offer may take a right away and never add one.
+    const here: u32 = @intCast(about.permissions.toMode() & 0o777);
+    const allowed: u32 = if (writable) here else here & ~@as(u32, 0o222);
 
     return .{
         .ino = @intCast(about.inode),
@@ -571,7 +580,8 @@ fn lookup(self: *Export, into: []u8, head: wire.Header, body: []const u8) usize 
         };
         const path = self.pathOf(nodeid, null, &room) orelse
             return self.refuse(into, head, wire.err.noent);
-        const attr = self.attrOf(path) orelse return self.refuse(into, head, wire.err.noent);
+        const attr = self.attrOf(path, self.mayWrite(nodeid)) orelse
+            return self.refuse(into, head, wire.err.noent);
         self.looked_up += 1;
         return wire.Answer.write(into, head.unique, 0, wire.Entry.writeBriefly(
             into[wire.Answer.size..],
@@ -583,7 +593,9 @@ fn lookup(self: *Export, into: []u8, head: wire.Header, body: []const u8) usize 
     var room: [4096]u8 = undefined;
     const path = self.pathOf(head.nodeid, name, &room) orelse
         return self.refuse(into, head, wire.err.noent);
-    const attr = self.attrOf(path) orelse return self.refuse(into, head, wire.err.noent);
+    // A name inherits the offer of the directory holding it, so the parent answers this.
+    const attr = self.attrOf(path, self.mayWrite(head.nodeid)) orelse
+        return self.refuse(into, head, wire.err.noent);
 
     const node = (self.nodeAt(head.nodeid) orelse return self.refuse(into, head, wire.err.noent)).*;
     const under = self.joinUnder(head.nodeid, name) catch
@@ -604,7 +616,8 @@ fn getattr(self: *Export, into: []u8, head: wire.Header) usize {
     var room: [4096]u8 = undefined;
     const path = self.pathOf(head.nodeid, null, &room) orelse
         return self.refuse(into, head, wire.err.noent);
-    const attr = self.attrOf(path) orelse return self.refuse(into, head, wire.err.noent);
+    const attr = self.attrOf(path, self.mayWrite(head.nodeid)) orelse
+        return self.refuse(into, head, wire.err.noent);
     return wire.Answer.write(into, head.unique, 0, wire.AttrAnswer.write(into[wire.Answer.size..], attr));
 }
 
@@ -740,7 +753,7 @@ fn create(self: *Export, into: []u8, head: wire.Header, body: []const u8) usize 
         .read = true,
         .truncate = truncating,
     }) catch return self.refuse(into, head, wire.err.access);
-    const attr = self.attrOf(path) orelse {
+    const attr = self.attrOf(path, self.mayWrite(head.nodeid)) orelse {
         file.close(self.io);
         return self.refuse(into, head, wire.err.io);
     };
@@ -823,7 +836,8 @@ fn setattr(self: *Export, into: []u8, head: wire.Header, body: []const u8) usize
         file.setPermissions(self.io, @enumFromInt(asked.mode & 0o777)) catch {};
     }
 
-    const attr = self.attrOf(path) orelse return self.refuse(into, head, wire.err.noent);
+    const attr = self.attrOf(path, self.mayWrite(head.nodeid)) orelse
+        return self.refuse(into, head, wire.err.noent);
     return wire.Answer.write(into, head.unique, 0, wire.AttrAnswer.write(into[wire.Answer.size..], attr));
 }
 
@@ -850,7 +864,8 @@ fn makeDirectory(self: *Export, into: []u8, head: wire.Header, body: []const u8)
         else => return self.refuse(into, head, wire.err.access),
     };
 
-    const attr = self.attrOf(path) orelse return self.refuse(into, head, wire.err.io);
+    const attr = self.attrOf(path, self.mayWrite(head.nodeid)) orelse
+        return self.refuse(into, head, wire.err.io);
     const node = (self.nodeAt(head.nodeid) orelse return self.refuse(into, head, wire.err.noent)).*;
     const under = self.joinUnder(head.nodeid, asked.name) catch
         return self.refuse(into, head, wire.err.nomem);
@@ -929,7 +944,8 @@ fn makeLink(self: *Export, into: []u8, head: wire.Header, body: []const u8) usiz
     std.Io.Dir.symLinkAbsolute(self.io, points_at, path, .{}) catch
         return self.refuse(into, head, wire.err.access);
 
-    const attr = self.attrOf(path) orelse return self.refuse(into, head, wire.err.io);
+    const attr = self.attrOf(path, self.mayWrite(head.nodeid)) orelse
+        return self.refuse(into, head, wire.err.io);
     const node = (self.nodeAt(head.nodeid) orelse return self.refuse(into, head, wire.err.noent)).*;
     const under = self.joinUnder(head.nodeid, name) catch
         return self.refuse(into, head, wire.err.nomem);
@@ -970,7 +986,8 @@ fn makeHardLink(self: *Export, into: []u8, head: wire.Header, body: []const u8) 
         else => return self.refuse(into, head, wire.err.access),
     };
 
-    const attr = self.attrOf(to) orelse return self.refuse(into, head, wire.err.io);
+    const attr = self.attrOf(to, self.mayWrite(head.nodeid)) orelse
+        return self.refuse(into, head, wire.err.io);
     const under = self.joinUnder(head.nodeid, name) catch
         return self.refuse(into, head, wire.err.nomem);
     const nodeid = self.nodeFor(here.offer, under) catch {
@@ -1012,7 +1029,7 @@ fn listOffers(self: *Export, into: []u8, head: wire.Header, asked: wire.Read) us
             break;
         };
         const path = self.pathOf(nodeid, null, &room) orelse continue;
-        const attr = self.attrOf(path) orelse continue;
+        const attr = self.attrOf(path, self.mayWrite(nodeid)) orelse continue;
         filled += wire.DirEntry.write(answer_room[filled..], nodeid, attr, index, each.name);
         self.named += 1;
     }
@@ -1066,7 +1083,7 @@ fn readdir(self: *Export, into: []u8, head: wire.Header, body: []const u8) usize
             held.waiting_len = 0;
             continue;
         };
-        const attr = self.attrOf(path) orelse {
+        const attr = self.attrOf(path, self.mayWrite(head.nodeid)) orelse {
             held.waiting_len = 0;
             continue;
         };
@@ -1205,6 +1222,47 @@ test "a guest looks a name up and reads what is there" {
     wrote = offered.answer(ask(&request, .release, nodeid, &release_in), &answered);
     try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
     try std.testing.expectEqual(@as(u64, 1), offered.let_go);
+}
+
+test "a writable offer says so in the mode, and a read only one still does not" {
+    const gpa = std.testing.allocator;
+    var bench = try Bench.open(gpa);
+    defer bench.close();
+
+    var offered = try Export.init(gpa, bench.io);
+    defer offered.deinit();
+    try offered.offer("work", bench.at, true);
+    try offered.offer("store", bench.at, false);
+
+    var request: [512]u8 = undefined;
+    var answered: [4096]u8 = undefined;
+
+    var start: [wire.Init.in_size]u8 = @splat(0);
+    std.mem.writeInt(u32, start[0..4], wire.major, .little);
+    std.mem.writeInt(u32, start[4..8], 41, .little);
+    _ = offered.answer(ask(&request, .init, 1, &start), &answered);
+
+    // **The kernel refuses a write against the mode it was told**, before it sends one. So an
+    // offer made writable and reported `0444` is a share nothing can write: a build in there
+    // could not open its own cache directory, and a commit could not make its lock file.
+    const in_work = try nodeOf(&offered, "work", &request, &answered);
+    var wrote = offered.answer(ask(&request, .lookup, in_work, "hello\x00"), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+    const writable_mode = std.mem.readInt(u32, answered[wire.Answer.size + 40 ..][60..64], .little);
+    try std.testing.expect(writable_mode & 0o200 != 0);
+
+    // The same file under a read only offer keeps none of them, whatever this machine says.
+    const in_store = try nodeOf(&offered, "store", &request, &answered);
+    wrote = offered.answer(ask(&request, .lookup, in_store, "hello\x00"), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+    const read_only_mode = std.mem.readInt(u32, answered[wire.Answer.size + 40 ..][60..64], .little);
+    try std.testing.expectEqual(@as(u32, 0), read_only_mode & 0o222);
+
+    // And the directory itself, which is what a guest checks before it tries to make a file in it.
+    wrote = offered.answer(ask(&request, .getattr, in_work, ""), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+    const dir_mode = std.mem.readInt(u32, answered[wire.Answer.size + 16 ..][60..64], .little);
+    try std.testing.expect(dir_mode & 0o200 != 0);
 }
 
 test "a name that walks out of the export is a name that is not there" {
