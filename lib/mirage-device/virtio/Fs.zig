@@ -117,16 +117,10 @@ pub fn serve(self: *Fs, memory: *GuestMemory, which: usize) Error!u32 {
         // The message is every readable part, one after another. A driver may split it anywhere.
         var asked_len: usize = 0;
         var room_for_answer: usize = 0;
-        var writable: [16]Queue.Segment = undefined;
-        var writable_count: usize = 0;
 
         while (try chain.next(memory)) |segment| {
             if (segment.writable) {
-                if (writable_count < writable.len) {
-                    writable[writable_count] = segment;
-                    writable_count += 1;
-                    room_for_answer += segment.len;
-                }
+                room_for_answer += segment.len;
                 continue;
             }
             const taking = @min(segment.len, self.asked.len - asked_len);
@@ -146,10 +140,19 @@ pub fn serve(self: *Fs, memory: *GuestMemory, which: usize) Error!u32 {
         if (wrote == 0) self.dropped += 1 else self.carried += 1;
 
         // Scattered back into the parts the driver published, in the order it published them.
+        //
+        // **Walked again rather than remembered.** A chain holds as many parts as the driver
+        // cared to publish, and a guest with 4K pages publishes 32 of them for one 128K read.
+        // Keeping the first 16 in an array dropped the rest from the room above and from the
+        // scatter below, so a read of 128K was answered with 60K. A short answer is legal for
+        // `read`, which loops for the rest, and fatal for a page fault, which cannot: the pages
+        // past the answer stay unfilled and the program dies on the first instruction in them.
+        var back = queue.walk(head);
         var left = wrote;
         var at: usize = 0;
-        for (writable[0..writable_count]) |segment| {
+        while (try back.next(memory)) |segment| {
             if (left == 0) break;
+            if (!segment.writable) continue;
             const putting = @min(segment.len, left);
             try memory.write(segment.addr, self.answered[at..][0..putting]);
             at += putting;
@@ -272,6 +275,85 @@ test "a message split across parts arrives whole and the answer goes back scatte
     try testing.expectEqual(@as(u8, 0xab), h.bytes[0x800]);
     try testing.expectEqual(@as(u8, 0xab), h.bytes[0x400 + 127]);
     try testing.expectEqual(@as(u32, 300), h.written());
+}
+
+test "a chain of many parts is answered whole, and never only its first sixteen" {
+    const gpa = std.testing.allocator;
+
+    // A guest with 4K pages publishes one part a page, so a 128K read arrives as 32 of them.
+    // The count is what this measures, so the parts are small.
+    const parts = 32;
+    const part_len = 256;
+
+    var counter: Counter = .{ .said = parts * part_len };
+    var offered: Fs = undefined;
+    try offered.init(gpa, "store", counter.answering());
+    defer offered.deinit(gpa);
+
+    // A table wide enough for the whole chain, which the narrow one above is not.
+    const wide_desc = ram + 0x000;
+    const wide_avail = ram + 0x400;
+    const wide_used = ram + 0x500;
+    const asked_at = 0x600;
+    const answer_at = 0x1000;
+
+    var bytes: [0x4000]u8 = @splat(0);
+    var regions = [1]GuestMemory.Region{.{
+        .gpa = ram,
+        .len = bytes.len,
+        .backing = .{ .shared = &bytes },
+    }};
+    var memory = GuestMemory{ .regions = &regions };
+
+    const put = struct {
+        fn one(into: []u8, index: u16, addr: u64, length: u32, flags: u16, next: u16) void {
+            const at = @as(usize, index) * 16;
+            std.mem.writeInt(u64, into[at..][0..8], addr, .little);
+            std.mem.writeInt(u32, into[at + 8 ..][0..4], length, .little);
+            std.mem.writeInt(u16, into[at + 12 ..][0..2], flags, .little);
+            std.mem.writeInt(u16, into[at + 14 ..][0..2], next, .little);
+        }
+    }.one;
+
+    @memcpy(bytes[asked_at..][0..3], "ask");
+    put(&bytes, 0, ram + asked_at, 3, Queue.flag_next, 1);
+    var index: u16 = 0;
+    while (index < parts) : (index += 1) {
+        const last = index + 1 == parts;
+        put(
+            &bytes,
+            index + 1,
+            ram + answer_at + @as(u64, index) * part_len,
+            part_len,
+            (if (last) 0 else Queue.flag_next) | Queue.flag_write,
+            index + 2,
+        );
+    }
+
+    // One request, at descriptor zero.
+    std.mem.writeInt(u16, bytes[0x404..][0..2], 0, .little);
+    std.mem.writeInt(u16, bytes[0x402..][0..2], 1, .little);
+
+    offered.queues[queue_request] = .{
+        .size = parts + 1,
+        .descriptor = wide_desc,
+        .available = wide_avail,
+        .used = wide_used,
+        .ready = true,
+    };
+
+    try testing.expectEqual(@as(u32, 1), try offered.serve(&memory, queue_request));
+
+    // Every part counted as room, and every part written back. The whole of this: a cap on the
+    // parts kept made a read answer short, and a page fault cannot ask for the rest.
+    try testing.expectEqual(@as(usize, parts * part_len), counter.room_offered);
+    try testing.expectEqual(
+        @as(u32, parts * part_len),
+        std.mem.readInt(u32, bytes[0x508..][0..4], .little),
+    );
+    try testing.expectEqual(@as(u8, 0xab), bytes[answer_at]);
+    try testing.expectEqual(@as(u8, 0xab), bytes[answer_at + (parts - 1) * part_len]);
+    try testing.expectEqual(@as(u8, 0xab), bytes[answer_at + parts * part_len - 1]);
 }
 
 test "an answer is never larger than the room the guest offered" {

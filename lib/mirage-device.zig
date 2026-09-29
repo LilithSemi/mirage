@@ -79,6 +79,7 @@ test {
     _ = virtio.Queue;
     _ = virtio.Mmio;
     _ = virtio.Block;
+    _ = virtio.Fs;
     _ = virtio.Vsock;
     _ = virtio.Balloon;
     _ = virtio.Net;
