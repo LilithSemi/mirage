@@ -544,14 +544,17 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         }
     }
 
+    // The room the filesystem device carries one message and one answer in. Owned here rather than
+    // by the device, because nothing in the device model allocates.
+    const share_asked = if (sharing) try gpa.alloc(u8, device.virtio.Fs.buffer_size) else @as([]u8, &.{});
+    defer if (sharing) gpa.free(share_asked);
+    const share_answered = if (sharing) try gpa.alloc(u8, device.virtio.Fs.buffer_size) else @as([]u8, &.{});
+    defer if (sharing) gpa.free(share_answered);
+
     var shared_fs: device.virtio.Fs = undefined;
     if (sharing) {
-        shared_fs.init(gpa, fsmod.Export.tag, .{ .ctx = &offered.?, .answer = answerFs }) catch {
-            try out.writeAll("no room for the filesystem device\n");
-            return;
-        };
+        shared_fs.init(fsmod.Export.tag, .{ .ctx = &offered.?, .answer = answerFs }, share_asked, share_answered);
     }
-    defer if (sharing) shared_fs.deinit(gpa);
 
     var chip: device.Tpm = .{};
     var chip_socket: ?netmod.Socket = null;

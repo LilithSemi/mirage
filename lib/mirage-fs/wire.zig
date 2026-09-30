@@ -130,7 +130,43 @@ pub const err = struct {
     pub const nametoolong: i32 = 36;
     pub const nosys: i32 = 38;
     pub const nodata: i32 = 61;
+    pub const xdev: i32 = 18;
+    pub const busy: i32 = 16;
+    pub const fbig: i32 = 27;
+    pub const nospc: i32 = 28;
+    pub const notempty: i32 = 39;
+    pub const loop: i32 = 40;
 };
+
+/// What a failure on this machine is, in the numbers the guest's kernel knows.
+///
+/// Every failure answered as one number is a guest that cannot tell why: a move refused because the
+/// name is not there, because the directory is not empty, or because the two ends are on different
+/// filesystems are three different things, and a program told "permission denied" for any of them
+/// looks for a permission problem it will never find. That cost somebody a day.
+pub fn errnoFor(failure: anyerror) i32 {
+    return switch (failure) {
+        error.FileNotFound => err.noent,
+        error.PathAlreadyExists => err.exist,
+        error.AccessDenied => err.access,
+        error.DirNotEmpty => err.notempty,
+        error.NotDir => err.notdir,
+        error.IsDir => err.isdir,
+        error.RenameAcrossMountPoints => err.xdev,
+        error.FileBusy => err.busy,
+        error.NoSpaceLeft, error.DiskQuota => err.nospc,
+        error.FileTooBig => err.fbig,
+        error.SymLinkLoop => err.loop,
+        error.NameTooLong => err.nametoolong,
+        error.ReadOnlyFileSystem => err.rofs,
+        error.OutOfMemory, error.SystemResources => err.nomem,
+        error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => err.nfile,
+        error.InvalidUtf8, error.BadPathName => err.invalid,
+        // Anything with no better name. A guest told this knows something went wrong on the other
+        // side rather than being told something untrue about its own permissions.
+        else => err.io,
+    };
+}
 
 pub const Init = struct {
     pub const in_size = 16;

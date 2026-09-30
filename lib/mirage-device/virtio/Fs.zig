@@ -44,7 +44,6 @@ pub const buffer_size = 132 * 1024;
 /// Serving a queue can only fail the ways a queue can. Making the device needs memory, so that is
 /// said separately: a device that cannot be made is a caller's problem and not a guest's.
 pub const Error = Queue.Error;
-pub const MakeError = Queue.Error || error{OutOfMemory};
 
 mmio: Mmio,
 queues: [queue_count]Queue,
@@ -64,9 +63,13 @@ dropped: u64 = 0,
 
 /// Initialised in place, never returned by value: the transport points at `config` and `queues`
 /// inside this same struct, and a copy leaves those pointers aimed at the copy that has gone.
-pub fn init(self: *Fs, gpa: std.mem.Allocator, tag: []const u8, answering: Answering) MakeError!void {
-    self.asked = try gpa.alloc(u8, buffer_size);
-    self.answered = try gpa.alloc(u8, buffer_size);
+/// The room for one message and one answer comes from the caller, because a device in this repository
+/// does not allocate: whoever builds the machine owns its memory. Both have to be `buffer_size` or a
+/// read of the largest size the protocol agrees to will not fit.
+pub fn init(self: *Fs, tag: []const u8, answering: Answering, asked: []u8, answered: []u8) void {
+    std.debug.assert(asked.len >= buffer_size and answered.len >= buffer_size);
+    self.asked = asked;
+    self.answered = answered;
     self.answering = answering;
     self.carried = 0;
     self.dropped = 0;
@@ -83,11 +86,6 @@ pub fn init(self: *Fs, gpa: std.mem.Allocator, tag: []const u8, answering: Answe
         .config = &self.config,
         .queues = &self.queues,
     };
-}
-
-pub fn deinit(self: *Fs, gpa: std.mem.Allocator) void {
-    gpa.free(self.asked);
-    gpa.free(self.answered);
 }
 
 pub fn device(self: *Fs, at: u64) Bus.Device {
@@ -188,6 +186,13 @@ const Counter = struct {
     }
 };
 
+/// Room for a test's one message and one answer. Held rather than allocated: these tests build for a
+/// machine with no allocator at all, which is the whole point of the freestanding build.
+const Room = struct {
+    asked: [buffer_size]u8,
+    answered: [buffer_size]u8,
+};
+
 const ram = 0x4000_0000;
 const ring_size = 8;
 const desc_at = ram + 0x000;
@@ -245,11 +250,10 @@ const Harness = struct {
 };
 
 test "a message split across parts arrives whole and the answer goes back scattered" {
-    const gpa = std.testing.allocator;
     var counter: Counter = .{ .said = 300 };
+    var room: Room = undefined;
     var offered: Fs = undefined;
-    try offered.init(gpa, "store", counter.answering());
-    defer offered.deinit(gpa);
+    offered.init("store", counter.answering(), &room.asked, &room.answered);
 
     var h: Harness = .{};
     h.attach(&offered, queue_request);
@@ -278,7 +282,6 @@ test "a message split across parts arrives whole and the answer goes back scatte
 }
 
 test "a chain of many parts is answered whole, and never only its first sixteen" {
-    const gpa = std.testing.allocator;
 
     // A guest with 4K pages publishes one part a page, so a 128K read arrives as 32 of them.
     // The count is what this measures, so the parts are small.
@@ -286,9 +289,9 @@ test "a chain of many parts is answered whole, and never only its first sixteen"
     const part_len = 256;
 
     var counter: Counter = .{ .said = parts * part_len };
+    var room: Room = undefined;
     var offered: Fs = undefined;
-    try offered.init(gpa, "store", counter.answering());
-    defer offered.deinit(gpa);
+    offered.init("store", counter.answering(), &room.asked, &room.answered);
 
     // A table wide enough for the whole chain, which the narrow one above is not.
     const wide_desc = ram + 0x000;
@@ -357,13 +360,12 @@ test "a chain of many parts is answered whole, and never only its first sixteen"
 }
 
 test "an answer is never larger than the room the guest offered" {
-    const gpa = std.testing.allocator;
     // Says it wrote more than the guest published room for. Whoever answers is handed only what the
     // guest offered, so it cannot be told to write past it.
     var counter: Counter = .{ .said = 4096 };
+    var room: Room = undefined;
     var offered: Fs = undefined;
-    try offered.init(gpa, "store", counter.answering());
-    defer offered.deinit(gpa);
+    offered.init("store", counter.answering(), &room.asked, &room.answered);
 
     var h: Harness = .{};
     h.attach(&offered, queue_request);
@@ -382,11 +384,10 @@ test "an answer is never larger than the room the guest offered" {
 }
 
 test "a request with nowhere to put an answer is completed rather than left waiting" {
-    const gpa = std.testing.allocator;
     var counter: Counter = .{ .said = 16 };
+    var room: Room = undefined;
     var offered: Fs = undefined;
-    try offered.init(gpa, "store", counter.answering());
-    defer offered.deinit(gpa);
+    offered.init("store", counter.answering(), &room.asked, &room.answered);
 
     var h: Harness = .{};
     h.attach(&offered, queue_hiprio);
@@ -402,11 +403,10 @@ test "a request with nowhere to put an answer is completed rather than left wait
 }
 
 test "the name the guest mounts is in the configuration space" {
-    const gpa = std.testing.allocator;
     var counter: Counter = .{};
+    var room: Room = undefined;
     var offered: Fs = undefined;
-    try offered.init(gpa, "store", counter.answering());
-    defer offered.deinit(gpa);
+    offered.init("store", counter.answering(), &room.asked, &room.answered);
 
     try testing.expectEqualSlices(u8, "store", offered.config[0..5]);
     try testing.expectEqual(@as(u8, 0), offered.config[5]);
@@ -415,11 +415,10 @@ test "the name the guest mounts is in the configuration space" {
 }
 
 test "a name longer than the configuration space holds is cut rather than overflowing it" {
-    const gpa = std.testing.allocator;
     var counter: Counter = .{};
+    var room: Room = undefined;
     var offered: Fs = undefined;
-    try offered.init(gpa, "x" ** 100, counter.answering());
-    defer offered.deinit(gpa);
+    offered.init("x" ** 100, counter.answering(), &room.asked, &room.answered);
     try testing.expectEqual(@as(u8, 'x'), offered.config[tag_size - 1]);
     try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, offered.config[tag_size..][0..4], .little));
 }

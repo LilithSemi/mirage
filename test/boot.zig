@@ -501,7 +501,10 @@ test "a real linux kernel boots far enough to speak" {
     var offered: ?fsmod.Export = null;
     defer if (offered) |*one| one.deinit();
     var shared_fs: device.virtio.Fs = undefined;
-    defer if (share_on) shared_fs.deinit(gpa);
+    const share_asked = if (share_on) try gpa.alloc(u8, device.virtio.Fs.buffer_size) else @as([]u8, &.{});
+    defer if (share_on) gpa.free(share_asked);
+    const share_answered = if (share_on) try gpa.alloc(u8, device.virtio.Fs.buffer_size) else @as([]u8, &.{});
+    defer if (share_on) gpa.free(share_answered);
     if (share_on) {
         var room: [96]u8 = undefined;
         const at = try gpa.dupe(u8, try std.fmt.bufPrint(&room, "/tmp/mirage-share-{d}", .{std.os.linux.getpid()}));
@@ -521,7 +524,7 @@ test "a real linux kernel boots far enough to speak" {
         offered = try fsmod.Export.init(gpa, io);
         try offered.?.offer("store", try std.fmt.bufPrint(&name, "{s}/store", .{at}), false);
         try offered.?.offer("work", try std.fmt.bufPrint(&name, "{s}/work", .{at}), true);
-        try shared_fs.init(gpa, fsmod.Export.tag, .{ .ctx = &offered.?, .answer = answerShare });
+        shared_fs.init(fsmod.Export.tag, .{ .ctx = &offered.?, .answer = answerShare }, share_asked, share_answered);
     }
 
     var devices: [7]device.Device = undefined;
@@ -837,6 +840,12 @@ test "a real linux kernel boots far enough to speak" {
         try std.testing.expect(std.mem.indexOf(u8, log, "share: linked a file") != null);
         try std.testing.expect(std.mem.indexOf(u8, log, "share: set a time") != null);
         try std.testing.expect(std.mem.indexOf(u8, log, "share: there is room") != null);
+        // Committing work the way a build system does: write into a temporary directory, move it into
+        // place, and keep using what is in it. A guest whose numbers go stale across the move is told
+        // the work it just committed is not there, which broke every zig build in a guest.
+        try std.testing.expect(std.mem.indexOf(u8, log, "commit: moved into place") != null);
+        try std.testing.expect(std.mem.indexOf(u8, log, "commit said: the result of the build") != null);
+        try std.testing.expect(std.mem.indexOf(u8, log, "commit: what it held still answers") != null);
         var room: [200]u8 = undefined;
         const written = try std.Io.Dir.cwd().readFileAlloc(
             io,

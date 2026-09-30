@@ -123,6 +123,8 @@ let_go_nodes: u64 = 0,
 /// Directories offered and taken back.
 offered: u64 = 0,
 withdrawn: u64 = 0,
+/// Moves after which the names this end holds were pointed at where they went.
+repointed: u64 = 0,
 /// What the guest changed, where it was allowed to.
 written_bytes: u64 = 0,
 made: u64 = 0,
@@ -667,8 +669,8 @@ fn open(self: *Export, into: []u8, head: wire.Header, body: []const u8, director
     // A directory is read by name when the read arrives, so nothing is opened for one here beyond
     // saying that it is one. A file is opened read only and stays open until the guest lets go.
     if (directory) {
-        const opened = std.Io.Dir.openDirAbsolute(self.io, path, .{ .iterate = true }) catch
-            return self.refuse(into, head, wire.err.access);
+        const opened = std.Io.Dir.openDirAbsolute(self.io, path, .{ .iterate = true }) catch |failure|
+            return self.refuse(into, head, wire.errnoFor(failure));
         slot[0].* = .{ .open = null, .directory = true, .walking = opened };
         slot[0].walker = opened.iterate();
         self.held += 1;
@@ -677,7 +679,7 @@ fn open(self: *Export, into: []u8, head: wire.Header, body: []const u8, director
 
     const file = std.Io.Dir.openFileAbsolute(self.io, path, .{
         .mode = if (writing) .read_write else .read_only,
-    }) catch return self.refuse(into, head, wire.err.access);
+    }) catch |failure| return self.refuse(into, head, wire.errnoFor(failure));
     slot[0].* = .{
         .open = file,
         .directory = false,
@@ -752,7 +754,7 @@ fn create(self: *Export, into: []u8, head: wire.Header, body: []const u8) usize 
     const file = std.Io.Dir.createFileAbsolute(self.io, path, .{
         .read = true,
         .truncate = truncating,
-    }) catch return self.refuse(into, head, wire.err.access);
+    }) catch |failure| return self.refuse(into, head, wire.errnoFor(failure));
     const attr = self.attrOf(path, self.mayWrite(head.nodeid)) orelse {
         file.close(self.io);
         return self.refuse(into, head, wire.err.io);
@@ -800,18 +802,18 @@ fn setattr(self: *Export, into: []u8, head: wire.Header, body: []const u8) usize
                     return self.refuse(into, head, wire.err.io);
             }
         } else {
-            const file = std.Io.Dir.openFileAbsolute(self.io, path, .{ .mode = .write_only }) catch
-                return self.refuse(into, head, wire.err.access);
+            const file = std.Io.Dir.openFileAbsolute(self.io, path, .{ .mode = .write_only }) catch |failure|
+                return self.refuse(into, head, wire.errnoFor(failure));
             defer file.close(self.io);
-            file.setLength(self.io, asked.size) catch
-                return self.refuse(into, head, wire.err.io);
+            file.setLength(self.io, asked.size) catch |failure|
+                return self.refuse(into, head, wire.errnoFor(failure));
         }
     }
     // The times. A build system compares them to decide what to rebuild, so keeping the old ones and
     // reporting success is how a cache becomes wrong rather than slow.
     if (asked.valid & (wire.SetAttr.wants_atime | wire.SetAttr.wants_mtime) != 0) {
-        const file = std.Io.Dir.openFileAbsolute(self.io, path, .{}) catch
-            return self.refuse(into, head, wire.err.access);
+        const file = std.Io.Dir.openFileAbsolute(self.io, path, .{}) catch |failure|
+            return self.refuse(into, head, wire.errnoFor(failure));
         defer file.close(self.io);
         file.setTimestamps(self.io, .{
             .access_timestamp = whenAsked(
@@ -829,8 +831,8 @@ fn setattr(self: *Export, into: []u8, head: wire.Header, body: []const u8) usize
         }) catch return self.refuse(into, head, wire.err.io);
     }
     if (asked.valid & wire.SetAttr.wants_mode != 0) {
-        const file = std.Io.Dir.openFileAbsolute(self.io, path, .{}) catch
-            return self.refuse(into, head, wire.err.access);
+        const file = std.Io.Dir.openFileAbsolute(self.io, path, .{}) catch |failure|
+            return self.refuse(into, head, wire.errnoFor(failure));
         defer file.close(self.io);
         // Only the bits that say who may read and write, because that is all a mode means here.
         file.setPermissions(self.io, @enumFromInt(asked.mode & 0o777)) catch {};
@@ -859,10 +861,8 @@ fn makeDirectory(self: *Export, into: []u8, head: wire.Header, body: []const u8)
     var room: [4096]u8 = undefined;
     const path = self.pathOf(head.nodeid, asked.name, &room) orelse
         return self.refuse(into, head, wire.err.noent);
-    std.Io.Dir.createDirAbsolute(self.io, path, @enumFromInt(asked.mode & 0o777)) catch |err| switch (err) {
-        error.PathAlreadyExists => return self.refuse(into, head, wire.err.exist),
-        else => return self.refuse(into, head, wire.err.access),
-    };
+    std.Io.Dir.createDirAbsolute(self.io, path, @enumFromInt(asked.mode & 0o777)) catch |failure|
+        return self.refuse(into, head, wire.errnoFor(failure));
 
     const attr = self.attrOf(path, self.mayWrite(head.nodeid)) orelse
         return self.refuse(into, head, wire.err.io);
@@ -889,12 +889,20 @@ fn remove(self: *Export, into: []u8, head: wire.Header, body: []const u8, direct
     const path = self.pathOf(head.nodeid, name, &room) orelse
         return self.refuse(into, head, wire.err.noent);
     if (directory) {
-        std.Io.Dir.deleteDirAbsolute(self.io, path) catch
-            return self.refuse(into, head, wire.err.notdir);
+        std.Io.Dir.deleteDirAbsolute(self.io, path) catch |failure|
+            return self.refuse(into, head, wire.errnoFor(failure));
     } else {
-        std.Io.Dir.cwd().deleteFile(self.io, path) catch
-            return self.refuse(into, head, wire.err.access);
+        std.Io.Dir.cwd().deleteFile(self.io, path) catch |failure|
+            return self.refuse(into, head, wire.errnoFor(failure));
     }
+
+    // The node for it stops resolving, so a number the guest kept cannot come to mean whatever is
+    // made under that name next.
+    const node = (self.nodeAt(head.nodeid) orelse return wire.Answer.write(into, head.unique, 0, 0)).*;
+    if (self.joinUnder(head.nodeid, name)) |gone| {
+        defer self.gpa.free(gone);
+        self.dropNode(node.offer, node.generation, gone);
+    } else |_| {}
     self.taken_away += 1;
     return wire.Answer.write(into, head.unique, 0, 0);
 }
@@ -911,7 +919,10 @@ fn rename(self: *Export, into: []u8, head: wire.Header, body: []const u8, wide: 
     if (!self.mayWrite(asked.into_nodeid)) return self.refuse(into, head, wire.err.rofs);
     const here = (self.nodeAt(head.nodeid) orelse return self.refuse(into, head, wire.err.noent)).*;
     const there = (self.nodeAt(asked.into_nodeid) orelse return self.refuse(into, head, wire.err.noent)).*;
-    if (here.offer != there.offer) return self.refuse(into, head, wire.err.invalid);
+    // Two shares are two filesystems as far as the guest is concerned, and a move between them is
+    // answered the way a move across filesystems is answered: every tool that does this falls back to
+    // copying and deleting when it hears that, and none of them has a branch for anything else.
+    if (here.offer != there.offer) return self.refuse(into, head, wire.err.xdev);
 
     var from_room: [4096]u8 = undefined;
     var to_room: [4096]u8 = undefined;
@@ -920,10 +931,83 @@ fn rename(self: *Export, into: []u8, head: wire.Header, body: []const u8, wide: 
     const to = self.pathOf(asked.into_nodeid, asked.to, &to_room) orelse
         return self.refuse(into, head, wire.err.noent);
 
-    std.Io.Dir.renameAbsolute(from, to, self.io) catch
-        return self.refuse(into, head, wire.err.access);
+    // Where the two names are under the share, which is what the nodes are keyed by.
+    const was = self.joinUnder(head.nodeid, asked.from) catch
+        return self.refuse(into, head, wire.err.nomem);
+    defer self.gpa.free(was);
+    const now = self.joinUnder(asked.into_nodeid, asked.to) catch
+        return self.refuse(into, head, wire.err.nomem);
+    defer self.gpa.free(now);
+
+    std.Io.Dir.renameAbsolute(from, to, self.io) catch |failure|
+        return self.refuse(into, head, wire.errnoFor(failure));
+
+    // The guest keeps the numbers it holds across a move, because the files are the same files. This
+    // end holds a path per number, so the paths move with them: without this, every number the guest
+    // was holding answers "no such file" for a file that is right there, and it comes right minutes
+    // later only because the guest's kernel eventually asks again.
+    self.moveNodes(here.offer, here.generation, was, now);
     self.moved += 1;
     return wire.Answer.write(into, head.unique, 0, 0);
+}
+
+/// Point every node under a name at where that name went.
+///
+/// The one that moved and everything beneath it: moving a directory moves every file in it, and a
+/// build commits its work by moving the directory it built in.
+fn moveNodes(self: *Export, which: u32, generation: u32, was: []const u8, now: []const u8) void {
+    for (self.nodes.items[1..], 1..) |*node, index| {
+        if (node.lookups == 0) continue;
+        if (node.offer != which or node.generation != generation) continue;
+
+        // The name itself, or something under it. Nothing else is touched, and a name that merely
+        // starts with the same letters is not something under it.
+        const under = node.path.len > was.len and
+            std.mem.startsWith(u8, node.path, was) and node.path[was.len] == '/';
+        if (!std.mem.eql(u8, node.path, was) and !under) continue;
+
+        const tail = node.path[was.len..];
+        const moved = std.fmt.allocPrint(self.gpa, "{s}{s}", .{ now, tail }) catch continue;
+
+        // The map is keyed by the path, so the old key goes and a new one takes its place. A node
+        // whose key cannot be replaced is one nothing will find again, so it is let go instead.
+        self.forgetKey(node.offer, node.generation, node.path);
+        self.gpa.free(node.path);
+        node.path = moved;
+
+        var key_room: [4200]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_room, "{d}/{d}/{s}", .{ which, generation, moved }) catch continue;
+        const held = self.gpa.dupe(u8, key) catch continue;
+        self.known.put(self.gpa, held, nodeIdOf(index, node.own)) catch self.gpa.free(held);
+    }
+    self.repointed += 1;
+}
+
+/// Take a path out of the map, if it is in there.
+fn forgetKey(self: *Export, which: u32, generation: u32, path: []const u8) void {
+    var key_room: [4200]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_room, "{d}/{d}/{s}", .{ which, generation, path }) catch return;
+    if (self.known.fetchRemove(key)) |gone| self.gpa.free(gone.key);
+}
+
+/// A name that is no longer there: the node for it stops resolving and its slot goes back.
+///
+/// Without this a number the guest holds for a file that was removed would resolve to whatever is
+/// made under that name next, which is one file being handed out under another file's number.
+fn dropNode(self: *Export, which: u32, generation: u32, path: []const u8) void {
+    var key_room: [4200]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_room, "{d}/{d}/{s}", .{ which, generation, path }) catch return;
+    const found = self.known.fetchRemove(key) orelse return;
+    self.gpa.free(found.key);
+
+    const index: u32 = @truncate(found.value);
+    if (index == 0 or index >= self.nodes.items.len) return;
+    const node = &self.nodes.items[index];
+    self.gpa.free(node.path);
+    node.path = &.{};
+    node.lookups = 0;
+    self.free_nodes.append(self.gpa, index) catch {};
+    self.let_go_nodes += 1;
 }
 
 fn makeLink(self: *Export, into: []u8, head: wire.Header, body: []const u8) usize {
@@ -941,8 +1025,8 @@ fn makeLink(self: *Export, into: []u8, head: wire.Header, body: []const u8) usiz
         return self.refuse(into, head, wire.err.noent);
     // What it points at is written down as the guest gave it and never resolved here. A link out of
     // the share is the guest's own to follow inside its own mount, where it means nothing.
-    std.Io.Dir.symLinkAbsolute(self.io, points_at, path, .{}) catch
-        return self.refuse(into, head, wire.err.access);
+    std.Io.Dir.symLinkAbsolute(self.io, points_at, path, .{}) catch |failure|
+        return self.refuse(into, head, wire.errnoFor(failure));
 
     const attr = self.attrOf(path, self.mayWrite(head.nodeid)) orelse
         return self.refuse(into, head, wire.err.io);
@@ -981,10 +1065,8 @@ fn makeHardLink(self: *Export, into: []u8, head: wire.Header, body: []const u8) 
     const to = self.pathOf(head.nodeid, name, &to_room) orelse
         return self.refuse(into, head, wire.err.noent);
 
-    std.Io.Dir.cwd().hardLink(from, .cwd(), to, self.io, .{}) catch |err| switch (err) {
-        error.PathAlreadyExists => return self.refuse(into, head, wire.err.exist),
-        else => return self.refuse(into, head, wire.err.access),
-    };
+    std.Io.Dir.cwd().hardLink(from, .cwd(), to, self.io, .{}) catch |failure|
+        return self.refuse(into, head, wire.errnoFor(failure));
 
     const attr = self.attrOf(to, self.mayWrite(head.nodeid)) orelse
         return self.refuse(into, head, wire.err.io);
@@ -1920,4 +2002,237 @@ test "a guest that makes and forgets many files does not grow this without bound
     // a guest that works for an hour would otherwise grow this until the machine noticed.
     try std.testing.expect(offered.nodes.items.len < 50);
     try std.testing.expect(offered.known.count() < 50);
+}
+
+test "a name the guest still holds keeps working after it is moved" {
+    const gpa = std.testing.allocator;
+    var bench = try Bench.open(gpa);
+    defer bench.close();
+
+    var offered = try Export.init(gpa, bench.io);
+    defer offered.deinit();
+    try offered.offer("work", bench.at, true);
+
+    var request: [1024]u8 = undefined;
+    var answered: [4096]u8 = undefined;
+    const work = try nodeOf(&offered, "work", &request, &answered);
+
+    // What a build system does to commit a result: make a directory, write in it, then move the whole
+    // directory into place under its final name. The kernel keeps the numbers it holds across a move,
+    // because the files are the same files, so this end has to as well.
+    var mkdir_in: [wire.MakeDirectory.in_size + 8]u8 = @splat(0);
+    std.mem.writeInt(u32, mkdir_in[0..4], 0o755, .little);
+    @memcpy(mkdir_in[wire.MakeDirectory.in_size..][0..4], "tmp\x00");
+    var wrote = offered.answer(ask(&request, .mkdir, work, &mkdir_in), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+    const holding_dir = std.mem.readInt(u64, answered[wire.Answer.size..][0..8], .little);
+
+    var create_in: [wire.Create.in_size + 8]u8 = @splat(0);
+    std.mem.writeInt(u32, create_in[0..4], 0o101, .little);
+    std.mem.writeInt(u32, create_in[4..8], 0o100644, .little);
+    @memcpy(create_in[wire.Create.in_size..][0..7], "built\x00\x00");
+    wrote = offered.answer(ask(&request, .create, holding_dir, &create_in), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+    const holding_file = std.mem.readInt(u64, answered[wire.Answer.size..][0..8], .little);
+    const handle = std.mem.readInt(u64, answered[wire.Answer.size + wire.Entry.size ..][0..8], .little);
+    var release_in: [24]u8 = @splat(0);
+    std.mem.writeInt(u64, release_in[0..8], handle, .little);
+    _ = offered.answer(ask(&request, .release, holding_file, &release_in), &answered);
+
+    // Into place.
+    var rename_in: [wire.Rename.in_size + 16]u8 = @splat(0);
+    std.mem.writeInt(u64, rename_in[0..8], work, .little);
+    @memcpy(rename_in[wire.Rename.in_size..][0..9], "tmp\x00done\x00");
+    wrote = offered.answer(ask(&request, .rename, work, &rename_in), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+
+    // The numbers the guest is still holding. A build asks about these straight after committing, and
+    // an answer of "no such file" for a file that is right there is what breaks it.
+    wrote = offered.answer(ask(&request, .getattr, holding_dir, &.{}), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+    wrote = offered.answer(ask(&request, .getattr, holding_file, &.{}), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+
+    // And opening the file through the number it had before the move reads what was written.
+    var open_in: [8]u8 = @splat(0);
+    wrote = offered.answer(ask(&request, .open, holding_file, &open_in), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+}
+
+test "a move that cannot happen says why, rather than saying permission" {
+    const gpa = std.testing.allocator;
+    var bench = try Bench.open(gpa);
+    defer bench.close();
+
+    var offered = try Export.init(gpa, bench.io);
+    defer offered.deinit();
+    try offered.offer("work", bench.at, true);
+
+    var request: [1024]u8 = undefined;
+    var answered: [4096]u8 = undefined;
+    const work = try nodeOf(&offered, "work", &request, &answered);
+
+    // A name that is not there. The guest has to hear that, because a build that is told it may not
+    // do something looks for a permission problem it will never find.
+    var rename_in: [wire.Rename.in_size + 24]u8 = @splat(0);
+    std.mem.writeInt(u64, rename_in[0..8], work, .little);
+    @memcpy(rename_in[wire.Rename.in_size..][0..15], "missing\x00wanted\x00");
+    const wrote = offered.answer(ask(&request, .rename, work, &rename_in), &answered);
+    try std.testing.expectEqual(@as(?i32, wire.err.noent), refusalIn(answered[0..wrote]));
+}
+
+test "a move onto a directory holding something says it is not empty" {
+    const gpa = std.testing.allocator;
+    var bench = try Bench.open(gpa);
+    defer bench.close();
+
+    var offered = try Export.init(gpa, bench.io);
+    defer offered.deinit();
+    try offered.offer("work", bench.at, true);
+
+    // Two directories, the second holding a file. This is what a build cache looks like when a result
+    // for the same hash is already committed, and it is where the wrong answer cost a day: a build
+    // told "permission denied" looks for a permission problem, and one told "not empty" uses what is
+    // already there.
+    var name: [256]u8 = undefined;
+    try std.Io.Dir.cwd().createDir(bench.io, try std.fmt.bufPrint(&name, "{s}/fresh", .{bench.at}), .default_dir);
+    try std.Io.Dir.cwd().createDir(bench.io, try std.fmt.bufPrint(&name, "{s}/already", .{bench.at}), .default_dir);
+    try std.Io.Dir.cwd().writeFile(bench.io, .{
+        .sub_path = try std.fmt.bufPrint(&name, "{s}/already/kept", .{bench.at}),
+        .data = "from the build before\n",
+    });
+
+    var request: [1024]u8 = undefined;
+    var answered: [4096]u8 = undefined;
+    const work = try nodeOf(&offered, "work", &request, &answered);
+
+    var rename_in: [wire.Rename.in_size + 24]u8 = @splat(0);
+    std.mem.writeInt(u64, rename_in[0..8], work, .little);
+    @memcpy(rename_in[wire.Rename.in_size..][0..14], "fresh\x00already\x00");
+    const wrote = offered.answer(ask(&request, .rename, work, &rename_in), &answered);
+    try std.testing.expectEqual(@as(?i32, wire.err.notempty), refusalIn(answered[0..wrote]));
+}
+
+test "a number for a name that was removed does not come to mean the next file under it" {
+    const gpa = std.testing.allocator;
+    var bench = try Bench.open(gpa);
+    defer bench.close();
+
+    var offered = try Export.init(gpa, bench.io);
+    defer offered.deinit();
+    try offered.offer("work", bench.at, true);
+
+    var request: [1024]u8 = undefined;
+    var answered: [4096]u8 = undefined;
+    const work = try nodeOf(&offered, "work", &request, &answered);
+
+    // A build writes a temporary file, takes it away, and writes another under the same name. The
+    // number the guest kept for the first one must not answer about the second.
+    var create_in: [wire.Create.in_size + 8]u8 = @splat(0);
+    std.mem.writeInt(u32, create_in[0..4], 0o101, .little);
+    std.mem.writeInt(u32, create_in[4..8], 0o100644, .little);
+    @memcpy(create_in[wire.Create.in_size..][0..5], "same\x00");
+    var wrote = offered.answer(ask(&request, .create, work, &create_in), &answered);
+    const first = std.mem.readInt(u64, answered[wire.Answer.size..][0..8], .little);
+    const handle = std.mem.readInt(u64, answered[wire.Answer.size + wire.Entry.size ..][0..8], .little);
+    var release_in: [24]u8 = @splat(0);
+    std.mem.writeInt(u64, release_in[0..8], handle, .little);
+    _ = offered.answer(ask(&request, .release, first, &release_in), &answered);
+
+    wrote = offered.answer(ask(&request, .unlink, work, "same\x00"), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+
+    wrote = offered.answer(ask(&request, .create, work, &create_in), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+    const second = std.mem.readInt(u64, answered[wire.Answer.size..][0..8], .little);
+    const later = std.mem.readInt(u64, answered[wire.Answer.size + wire.Entry.size ..][0..8], .little);
+    std.mem.writeInt(u64, release_in[0..8], later, .little);
+    _ = offered.answer(ask(&request, .release, second, &release_in), &answered);
+
+    // Two different files, so two different numbers, and the old one answers about nothing.
+    try std.testing.expect(first != second);
+    wrote = offered.answer(ask(&request, .getattr, first, &.{}), &answered);
+    try std.testing.expectEqual(@as(?i32, wire.err.noent), refusalIn(answered[0..wrote]));
+}
+
+test "a move takes everything under it, not only the name that moved" {
+    const gpa = std.testing.allocator;
+    var bench = try Bench.open(gpa);
+    defer bench.close();
+
+    var offered = try Export.init(gpa, bench.io);
+    defer offered.deinit();
+    try offered.offer("work", bench.at, true);
+
+    // A directory with a directory in it, and a file in that: what a build's output looks like. The
+    // guest holds a number for each, and a move of the top one has to take all of them.
+    var name: [256]u8 = undefined;
+    try std.Io.Dir.cwd().createDir(bench.io, try std.fmt.bufPrint(&name, "{s}/out", .{bench.at}), .default_dir);
+    try std.Io.Dir.cwd().createDir(bench.io, try std.fmt.bufPrint(&name, "{s}/out/deep", .{bench.at}), .default_dir);
+    try std.Io.Dir.cwd().writeFile(bench.io, .{
+        .sub_path = try std.fmt.bufPrint(&name, "{s}/out/deep/thing", .{bench.at}),
+        .data = "built\n",
+    });
+
+    var request: [1024]u8 = undefined;
+    var answered: [4096]u8 = undefined;
+    const work = try nodeOf(&offered, "work", &request, &answered);
+
+    var wrote = offered.answer(ask(&request, .lookup, work, "out\x00"), &answered);
+    const top = std.mem.readInt(u64, answered[wire.Answer.size..][0..8], .little);
+    wrote = offered.answer(ask(&request, .lookup, top, "deep\x00"), &answered);
+    const middle = std.mem.readInt(u64, answered[wire.Answer.size..][0..8], .little);
+    wrote = offered.answer(ask(&request, .lookup, middle, "thing\x00"), &answered);
+    const leaf = std.mem.readInt(u64, answered[wire.Answer.size..][0..8], .little);
+
+    var rename_in: [wire.Rename.in_size + 16]u8 = @splat(0);
+    std.mem.writeInt(u64, rename_in[0..8], work, .little);
+    @memcpy(rename_in[wire.Rename.in_size..][0..10], "out\x00final\x00");
+    wrote = offered.answer(ask(&request, .rename, work, &rename_in), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+
+    // All three still answer, and the one at the bottom still reads what is in it.
+    for ([_]u64{ top, middle, leaf }) |held| {
+        const said = offered.answer(ask(&request, .getattr, held, &.{}), &answered);
+        try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..said]));
+    }
+
+    var open_in: [8]u8 = @splat(0);
+    wrote = offered.answer(ask(&request, .open, leaf, &open_in), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+    const reading = std.mem.readInt(u64, answered[wire.Answer.size..][0..8], .little);
+    var read_in: [wire.Read.in_size]u8 = @splat(0);
+    std.mem.writeInt(u64, read_in[0..8], reading, .little);
+    std.mem.writeInt(u32, read_in[16..20], 64, .little);
+    wrote = offered.answer(ask(&request, .read, leaf, &read_in), &answered);
+    try std.testing.expectEqualSlices(u8, "built\n", answered[wire.Answer.size..wrote]);
+}
+
+test "a move between two shares is answered the way a move between filesystems is" {
+    const gpa = std.testing.allocator;
+    var bench = try Bench.open(gpa);
+    defer bench.close();
+
+    const second = try std.fmt.allocPrint(gpa, "{s}-other", .{bench.at});
+    defer gpa.free(second);
+    std.Io.Dir.cwd().createDir(bench.io, second, .default_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(bench.io, second) catch {};
+
+    var offered = try Export.init(gpa, bench.io);
+    defer offered.deinit();
+    try offered.offer("work", bench.at, true);
+    try offered.offer("elsewhere", second, true);
+
+    var request: [1024]u8 = undefined;
+    var answered: [4096]u8 = undefined;
+    const work = try nodeOf(&offered, "work", &request, &answered);
+    const elsewhere = try nodeOf(&offered, "elsewhere", &request, &answered);
+
+    // Every tool that moves a file falls back to copying when it hears this, and none of them knows
+    // what to do with anything else, so the answer has to be this one.
+    var rename_in: [wire.Rename.in_size + 24]u8 = @splat(0);
+    std.mem.writeInt(u64, rename_in[0..8], elsewhere, .little);
+    @memcpy(rename_in[wire.Rename.in_size..][0..12], "hello\x00moved\x00");
+    const wrote = offered.answer(ask(&request, .rename, work, &rename_in), &answered);
+    try std.testing.expectEqual(@as(?i32, wire.err.xdev), refusalIn(answered[0..wrote]));
 }

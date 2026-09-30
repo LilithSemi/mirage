@@ -40,6 +40,15 @@ const uart_base = 0x0900_0000;
 /// touched its devices, and early enough that it has not finished.
 const move_after = options.move_after;
 
+/// How long to wait for a guest before deciding it is wedged.
+///
+/// Generous on purpose. What bounds this test is the number of exits it gives the guest; the clock is
+/// only here so a guest that has stopped getting anywhere does not hang the run. This whole test takes
+/// a second and a half on an idle machine and nineteen on a busy one, and the fifteen seconds it used
+/// to allow made it fail two runs in six while something else was building. A test that fails when the
+/// machine is busy teaches whoever runs it to ignore failures, which is worse than no test.
+const patience = 120_000;
+
 fn onAlarm(_: linux.SIG) callconv(.c) void {}
 
 fn armTicks(interval_ms: isize) void {
@@ -221,7 +230,7 @@ test "a guest carries on in a machine it did not start in" {
     armTicks(10);
 
     // Run far enough that the kernel is up and has touched its devices.
-    const before = try runFor(&first, &bus, &services, move_after, &sink, nowMs() + 10_000);
+    const before = try runFor(&first, &bus, &services, move_after, &sink, nowMs() + patience);
     if (before) |early| {
         std.debug.print("\nthe guest stopped before it could be moved: {t}\n", .{early});
         return error.StoppedTooEarly;
@@ -316,7 +325,7 @@ test "a guest carries on in a machine it did not start in" {
     services[0] = block.service(arm64.fdt.virtio_intid);
 
     // And on it goes, in a machine that has never run.
-    const after = try runFor(&second, &bus, &services, 4_000_000, &sink, nowMs() + 15_000);
+    const after = try runFor(&second, &bus, &services, 4_000_000, &sink, nowMs() + patience);
 
     const log = sink.buffered();
     std.debug.print(

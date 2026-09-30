@@ -274,6 +274,8 @@ fn writeShare() void {
     }
     say("share: made a directory\n");
 
+    commitLikeABuild();
+
     // The three a real toolchain needs that a guest reading files does not: a second name for a file,
     // a time it chose, and room to work in. A filesystem missing any of them makes a build that is
     // wrong rather than one that fails.
@@ -302,6 +304,74 @@ fn writeShare() void {
         say("share: there is room\n");
     } else {
         say("share: no room reported\n");
+    }
+}
+
+/// Commit work the way a build system does: write into a temporary directory, then move the whole
+/// directory into place and keep using what is in it.
+///
+/// This is the pattern that broke. The kernel keeps the numbers it holds for a file across a move,
+/// because it is the same file, so a filesystem that answers about the old name afterwards tells a
+/// build that the work it has just committed is not there.
+fn commitLikeABuild() void {
+    _ = linux.mkdir("/share/work/tmp-build", 0o755);
+    const made = linux.open("/share/work/tmp-build/result", .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    if (std.posix.errno(made) != .SUCCESS) {
+        say("commit: nowhere to build\n");
+        return;
+    }
+    const fd: i32 = @intCast(made);
+    const said = "the result of the build\n";
+    _ = linux.write(fd, said.ptr, said.len);
+    _ = linux.close(fd);
+
+    // A directory the guest holds open across the move, which is what a build does: it keeps the
+    // handle it was writing through.
+    const holding = linux.open("/share/work/tmp-build", .{ .DIRECTORY = true }, 0);
+    const held: i32 = if (std.posix.errno(holding) == .SUCCESS) @intCast(holding) else -1;
+    defer if (held >= 0) {
+        _ = linux.close(held);
+    };
+
+    if (std.posix.errno(linux.rename("/share/work/tmp-build", "/share/work/committed")) != .SUCCESS) {
+        say("commit: the move failed\n");
+        return;
+    }
+    say("commit: moved into place\n");
+
+    // What broke: reading the work straight after committing it.
+    const reading = linux.open("/share/work/committed/result", .{}, 0);
+    if (std.posix.errno(reading) != .SUCCESS) {
+        say("commit: the result is not there\n");
+        return;
+    }
+    const again: i32 = @intCast(reading);
+    defer _ = linux.close(again);
+    var room: [64]u8 = undefined;
+    const got = linux.read(again, &room, room.len);
+    if (std.posix.errno(got) != .SUCCESS or got == 0) {
+        say("commit: the result would not read\n");
+        return;
+    }
+    say("commit said: ");
+    say(room[0..got]);
+
+    // And the directory the guest was holding open still works, which is the number it kept.
+    if (held >= 0) {
+        var about: [256]u8 align(8) = @splat(0);
+        const asked = linux.syscall5(
+            .statx,
+            @bitCast(@as(isize, held)),
+            @intFromPtr(""),
+            0x1000, // AT_EMPTY_PATH
+            0,
+            @intFromPtr(&about),
+        );
+        if (std.posix.errno(asked) == .SUCCESS) {
+            say("commit: what it held still answers\n");
+        } else {
+            say("commit: what it held went stale\n");
+        }
     }
 }
 
