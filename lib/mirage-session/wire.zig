@@ -92,6 +92,16 @@ pub const Reason = enum(u8) {
     bad_name = 11,
     /// Nothing is holding directories for this guest.
     no_shares = 12,
+    /// How a guest that has gone came to go, said with `lost`. A harness reports this to whoever
+    /// asked for the work, so a build that brought the guest down does not read the same as an
+    /// agent that finished.
+    powered_off = 13,
+    restarted = 14,
+    limit_reached = 15,
+    faulted = 16,
+    /// Whoever holds the session asked for the guest to stop, and it has. Told apart from a limit
+    /// because a caller that asked reports work that was cancelled, not work that ran out of room.
+    was_asked = 17,
     _,
 };
 

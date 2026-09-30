@@ -82,6 +82,15 @@ const Secondary = struct {
     end: *Host,
 };
 
+/// Bring every other CPU out of the hypervisor and wait for its thread.
+///
+/// Nothing that reads the machine's state is safe while another CPU still runs the guest, and
+/// returning is no safer: those threads hold pointers into the frame that started them.
+fn stopOthers(threads: []const std.Thread, end: *Host) void {
+    end.stopping.store(true, .release);
+    for (threads) |each| each.join();
+}
+
 /// A CPU the guest starts itself.
 ///
 /// It makes its own CPU, because this hypervisor binds one to the thread that created it, and then
@@ -455,23 +464,33 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
 
     if (options.seconds) |limit| armDeadline(limit);
 
-    const reason = core.Launch.run(hv, id, driving) catch |err| {
+    const reason = core.Launch.run(hv, id, driving) catch |err| stopped: {
         try out.flush();
+        // Running out of exits is how a caller stops a guest on purpose. It is not a fault, so the
+        // run carries on to the writing below, the same as it does on the other hypervisor.
         if (err == error.ExitsExhausted) {
             try out.print("\nthe guest used all {d} exits it was given\n", .{options.exits});
-            return;
+            break :stopped core.Launch.Reason.stopped;
         }
         try out.print("\nthe guest stopped badly: {t}, the framework said {?}\n", .{ err, machine.fault });
+        // Every other CPU stops here too. A fault is not a reason to return while another CPU is
+        // still inside the hypervisor holding pointers into this frame.
+        stopOthers(threads[0..started], &end);
+        // A caller waiting on this session hears the fault. Without this it learns only that the
+        // socket closed, which reads the same as a guest that finished its work.
+        if (held) |one| {
+            one.lost(.faulted);
+            one.close(&channel);
+        }
         return;
     };
 
     // Every other CPU leaves its loop before anything else happens. A CPU inside the hypervisor is
     // one whose registers cannot be read and whose devices are still being served.
-    end.stopping.store(true, .release);
-    for (threads[0..started]) |each| each.join();
+    stopOthers(threads[0..started], &end);
 
     if (held) |one| {
-        one.lost();
+        one.lost(if (one.asked_stop) .was_asked else host.endingOf(reason));
         one.close(&channel);
     }
 

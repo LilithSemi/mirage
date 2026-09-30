@@ -390,3 +390,15 @@ pub fn withdrawShare(ctx: *anyopaque, name: []const u8) void {
     const offered: *fsmod.Export = @ptrCast(@alignCast(ctx));
     offered.withdraw(name);
 }
+
+/// How a run that ended reaches whoever holds the session.
+///
+/// The loop's own three names say what the guest did. These say what it means to a caller that
+/// started the guest for a piece of work, which is what it reports to whoever asked.
+pub fn endingOf(reason: core.Launch.Reason) sessionmod.wire.Reason {
+    return switch (reason) {
+        .shutdown => .powered_off,
+        .reset => .restarted,
+        .stopped => .limit_reached,
+    };
+}

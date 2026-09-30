@@ -138,11 +138,37 @@ fn take(self: *Server) void {
     self.told_up = false;
 }
 
+/// Drop what the guest has closed: waiting streams, and names it gave up reaching for.
+///
+/// Without this a list comes to hold connections nobody can be handed, and the next one the guest
+/// opens is closed instead of kept. A guest that gives up would cost the one after it its place, and
+/// the limits would mean something other than what they say.
+///
+/// A question already asked is the one that needs this. Being told takes it out of the reading loop,
+/// so nothing else is left to notice the guest has gone. The test is the connection being gone
+/// rather than the guest saying it will write no more, because writing the line and then saying that
+/// is a reasonable way to ask.
+fn tidy(self: *Server, vsock: *Vsock) void {
+    var index: usize = 0;
+    while (index < self.waiting_len) {
+        if (vsock.port(self.waiting[index]) == null) {
+            self.forget(index);
+            continue;
+        }
+        index += 1;
+    }
+    for (&self.reaching) |*each| {
+        if (!each.used) continue;
+        if (vsock.port(each.handle) == null) self.giveUp(vsock, each);
+    }
+}
+
 /// Take the streams the guest opened. The first one means the guest is up.
 ///
 /// A stream to the reaching port is the guest asking to be connected somewhere, and it is held here
 /// rather than handed out. Every other stream is the guest's work and goes to whoever asks for one.
 fn collect(self: *Server, vsock: *Vsock) void {
+    self.tidy(vsock);
     while (vsock.accept()) |handle| {
         self.guest_up = true;
         if (vsock.port(handle) == wire.reaching_port) {
@@ -274,11 +300,12 @@ fn announce(self: *Server, vsock: *Vsock) void {
     self.told_up = true;
 }
 
-/// Say the guest has gone, so whoever holds the other end learns it from a message rather than
-/// from a call that does nothing.
-pub fn lost(self: *Server) void {
+/// Say the guest has gone and how it went, so whoever holds the other end learns it from a message
+/// rather than from a call that does nothing. A harness reports the reason to whoever asked for the
+/// work, so the reason has to come from the runner: this end cannot see how a guest ended.
+pub fn lost(self: *Server, why: wire.Reason) void {
     const client = self.client orelse return;
-    wire.send(client, .{ .tag = .lost, .reason = .guest_gone }, null) catch {};
+    wire.send(client, .{ .tag = .lost, .reason = why }, null) catch {};
 }
 
 fn answer(self: *Server, vsock: *Vsock) void {
@@ -395,15 +422,18 @@ fn refuse(self: *Server, why: wire.Reason) void {
 /// not care takes whatever the guest opened.
 fn claim(self: *Server, vsock: *Vsock, port: u32) ?Vsock.Handle {
     var index: usize = 0;
-    while (index < self.waiting_len) : (index += 1) {
+    while (index < self.waiting_len) {
         const handle = self.waiting[index];
         const on = vsock.port(handle) orelse {
-            // The guest closed it while it waited.
+            // The guest closed it while it waited. Forgetting moves the last one into this place,
+            // so this place is looked at again rather than stepped over.
             self.forget(index);
-            index -%= 1;
             continue;
         };
-        if (port != 0 and on != port) continue;
+        if (port != 0 and on != port) {
+            index += 1;
+            continue;
+        }
         self.forget(index);
         return handle;
     }
@@ -551,4 +581,79 @@ test "a session that ends takes its path with it" {
 
     // Nothing is listening there any more, so nothing can join a session that has ended.
     try std.testing.expectError(socket.Error.Refused, socket.reach(path));
+}
+
+test "a stream the guest closed while it waited is forgotten, whichever place it held" {
+    var name: [96]u8 = undefined;
+    const path = temporary("deadwait", &name);
+
+    var vsock: Vsock = undefined;
+    const ports = [1]u32{1024};
+    untouched(&vsock, &ports);
+    var held = try Server.listen(path);
+    defer held.close(&vsock);
+
+    const mine = try socket.reach(path);
+    defer socket.close(mine);
+    held.pump(&vsock);
+
+    // A handle the transport knows nothing about is a stream the guest opened and closed. The first
+    // place in the list is the one worth testing: walking off the front of it is how a loop over a
+    // shrinking list goes wrong.
+    held.guest_up = true;
+    held.waiting[0] = .{ .index = 0, .generation = 7 };
+    held.waiting_len = 1;
+
+    try wire.send(mine, .{ .tag = .open, .value = 1024 }, null);
+    held.pump(&vsock);
+
+    var carried: ?std.posix.fd_t = null;
+    var came: [wire.size]u8 = undefined;
+    var refused = false;
+    var tries: usize = 0;
+    while (!refused and tries < 4) : (tries += 1) {
+        const said = (try wire.receive(mine, &came, &carried)) orelse continue;
+        if (said.tag == .refused) refused = true;
+    }
+    try std.testing.expect(refused);
+    try std.testing.expectEqual(@as(usize, 0), held.waiting_len);
+}
+
+test "a waiting stream the guest closed does not cost the next one its place" {
+    var name: [96]u8 = undefined;
+    const path = temporary("tidywait", &name);
+
+    var vsock: Vsock = undefined;
+    const ports = [1]u32{1024};
+    untouched(&vsock, &ports);
+    var held = try Server.listen(path);
+    defer held.close(&vsock);
+
+    // Every place taken by a stream the guest has closed. The transport knows none of these, which
+    // is what a handle for a connection that ended looks like.
+    for (0..max_waiting) |each| held.waiting[each] = .{ .index = @intCast(each), .generation = 9 };
+    held.waiting_len = max_waiting;
+
+    held.tidy(&vsock);
+    try std.testing.expectEqual(@as(usize, 0), held.waiting_len);
+}
+
+test "a name the guest gave up reaching for stops holding its place" {
+    var name: [96]u8 = undefined;
+    const path = temporary("tidyreach", &name);
+
+    var vsock: Vsock = undefined;
+    const ports = [1]u32{1024};
+    untouched(&vsock, &ports);
+    var held = try Server.listen(path);
+    defer held.close(&vsock);
+
+    // Every place taken by a question already asked. Being told is what took these out of the
+    // reading loop, so nothing was left to notice that the guest had gone.
+    for (&held.reaching, 0..) |*each, index| {
+        each.* = .{ .used = true, .told = true, .handle = .{ .index = @intCast(index), .generation = 5 } };
+    }
+
+    held.tidy(&vsock);
+    for (&held.reaching) |*each| try std.testing.expect(!each.used);
 }

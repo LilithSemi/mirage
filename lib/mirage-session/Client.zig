@@ -172,6 +172,39 @@ pub const Reaching = struct {
     }
 };
 
+/// How the guest came to go.
+///
+/// Its own names rather than the wire's, because the wire says why anything was refused and only
+/// four of those are ways a guest ends. A caller switches on this and has covered every one.
+pub const Lost = enum {
+    /// The guest powered itself off, which is how work that finished ends.
+    powered_off,
+    /// The guest asked to be started again. Nothing starts it: a session holds one guest, so this
+    /// reaches a caller as a guest that has gone.
+    restarted,
+    /// Whoever holds the session asked for it, so the work was cancelled rather than finished.
+    asked,
+    /// A limit whoever started the guest gave it ran out, either the exits or the seconds.
+    limit_reached,
+    /// The guest or the hypervisor under it failed. What failed is in the runner's own output,
+    /// because a byte on a socket cannot carry a fault.
+    faulted,
+    /// The session went away saying nothing. A runner that was killed looks like this, and so does
+    /// one built before it had anything to say.
+    unsaid,
+
+    fn of(reason: wire.Reason) Lost {
+        return switch (reason) {
+            .powered_off => .powered_off,
+            .restarted => .restarted,
+            .limit_reached => .limit_reached,
+            .was_asked => .asked,
+            .faulted => .faulted,
+            else => .unsaid,
+        };
+    }
+};
+
 /// What a session says about itself and about the guest it holds.
 ///
 /// A value rather than the message it came from, so nothing a caller holds points into a buffer that
@@ -179,8 +212,8 @@ pub const Reaching = struct {
 pub const Event = union(enum) {
     /// The guest is up, and this is its address on the channel.
     up: u32,
-    /// The guest has gone. Nothing more will work on this session.
-    lost,
+    /// The guest has gone, and this is how it went. Nothing more will work on this session.
+    lost: Lost,
     /// The guest is reaching for a name. Answer with `allow` or `refuse`.
     reaching: Reaching,
     /// Something a session said that a caller of this version has no name for. Never anything that
@@ -195,7 +228,7 @@ pub fn take(self: *Client) Error!?Event {
     const frame = wire.receive(self.control, &self.said, &carried) catch |err| switch (err) {
         error.Ended => {
             self.gone = true;
-            return Event.lost;
+            return Event{ .lost = .unsaid };
         },
         error.Unreadable => return Error.Unreadable,
         else => |rest| return rest,
@@ -210,7 +243,7 @@ pub fn take(self: *Client) Error!?Event {
         },
         .lost => {
             self.gone = true;
-            return Event.lost;
+            return Event{ .lost = .of(frame.reason) };
         },
         .reaching => return Event{ .reaching = .of(frame) },
         else => return Event{ .other = frame.tag },
@@ -413,4 +446,25 @@ fn wait(self: *Client, ms: u64) Error!void {
         left -= step;
     }
     return Error.GuestDidNotBoot;
+}
+
+test "a guest that has gone says how it went" {
+    const ends = try socket.pair();
+    defer socket.close(ends[0]);
+    defer socket.close(ends[1]);
+
+    var mine = Client.adopt(ends[1]);
+    try wire.send(ends[0], .{ .tag = .lost, .reason = .limit_reached }, null);
+    const said = (try mine.take()).?;
+    try std.testing.expectEqual(Lost.limit_reached, said.lost);
+}
+
+test "a session that closes without a word still says the guest has gone" {
+    const ends = try socket.pair();
+    defer socket.close(ends[1]);
+
+    var mine = Client.adopt(ends[1]);
+    socket.close(ends[0]);
+    const said = (try mine.take()).?;
+    try std.testing.expectEqual(Lost.unsaid, said.lost);
 }

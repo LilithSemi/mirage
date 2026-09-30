@@ -727,6 +727,15 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
             break :stopped core.Launch.Reason.stopped;
         }
         try out.print("\nthe guest stopped badly: {t}, kvm said {?}\n", .{ err, machine.fault });
+        // Every other CPU stops here too. A fault is not a reason to return while another CPU is
+        // still inside the hypervisor holding pointers into this frame.
+        stopOthers(threads[0..started], &end);
+        // A caller waiting on this session hears the fault. Without this it learns only that the
+        // socket closed, which reads the same as a guest that finished its work.
+        if (held) |one| {
+            one.lost(.faulted);
+            one.close(&channel);
+        }
         return;
     };
 
@@ -737,7 +746,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     // Whoever holds the session learns the guest has gone from a message, so a call already in
     // flight fails rather than waiting for a guest that is not there.
     if (held) |one| {
-        one.lost();
+        one.lost(if (one.asked_stop) .was_asked else host.endingOf(reason));
         one.close(&channel);
     }
 

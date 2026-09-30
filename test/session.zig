@@ -379,3 +379,67 @@ test "a share offered while the guest runs appears, and a withdrawn one is gone"
     const still = try expect(control, &buffer);
     try std.testing.expect(std.mem.indexOf(u8, still, shared_contents[0 .. shared_contents.len - 1]) != null);
 }
+
+test "a guest that powers itself off says so, and is not a fault" {
+    if (options.kernel_path.len == 0) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const at = try workspace(gpa, io, "ending");
+    defer gpa.free(at);
+    defer forget(io, at);
+    const initrd = try initramfs(gpa, io, at);
+    defer gpa.free(initrd);
+    const socket = try std.fmt.allocPrint(gpa, "{s}/control", .{at});
+    defer gpa.free(socket);
+
+    var held = session.Client.start(gpa, io, .{
+        .program = options.mirage_path,
+        .socket = socket,
+        .kernel = options.kernel_path,
+        .initrd = initrd,
+        .port = 1024,
+        .cpus = options.cpus,
+        .boot_ms = 15_000,
+        .console = .{ .file = try console(io, at) },
+    }) catch |err| {
+        std.debug.print("start said {t}\n", .{err});
+        showConsole(io, gpa, at);
+        return err;
+    };
+    defer held.stop();
+    errdefer showConsole(io, gpa, at);
+
+    const stream = try held.channel(1024);
+    defer session.socket.close(stream);
+
+    var buffer: [128]u8 = undefined;
+    _ = try expect(stream, &buffer);
+    try sendAll(stream, "stay\n");
+    _ = try expect(stream, &buffer);
+
+    // Told to stop, this guest leaves its loop and powers itself off. That is work that finished,
+    // and a harness reports it differently from a guest that faulted or ran out of room, so the
+    // difference has to survive a real guest ending rather than only a unit test.
+    try sendAll(stream, "stop\n");
+
+    var went: ?session.Client.Lost = null;
+    var left: u64 = 30_000;
+    while (left > 0 and went == null) {
+        if (try held.take()) |said| switch (said) {
+            .lost => |how| went = how,
+            else => {},
+        };
+        session.socket.waitFor(held.descriptor(), 20);
+        left -= @min(left, 20);
+    }
+
+    try std.testing.expectEqual(session.Client.Lost.powered_off, went orelse {
+        std.debug.print("the guest never said it had gone\n", .{});
+        showConsole(io, gpa, at);
+        return error.TestExpectedEqual;
+    });
+    try std.testing.expect(held.gone);
+}
