@@ -1142,6 +1142,11 @@ fn readdir(self: *Export, into: []u8, head: wire.Header, body: []const u8) usize
     }
     const walker = &(held.walker orelse return self.refuse(into, head, wire.err.badf));
 
+    // Which offer this directory is under, taken once and as a value. A number the guest holds packs
+    // the slot and which use of the slot together, so indexing the table with it walks off the end as
+    // soon as a slot has been used twice, and a pointer would not survive the table growing below.
+    const under_offer = (self.nodeAt(head.nodeid) orelse return self.refuse(into, head, wire.err.noent)).offer;
+
     var room: [4096]u8 = undefined;
     const answer_room = into[wire.Answer.size..];
     const wanted = @min(@as(usize, asked.bytes), answer_room.len);
@@ -1170,7 +1175,7 @@ fn readdir(self: *Export, into: []u8, head: wire.Header, body: []const u8) usize
             continue;
         };
         const under = self.joinUnder(head.nodeid, name) catch break;
-        const nodeid = self.nodeFor(self.nodes.items[@intCast(head.nodeid)].offer, under) catch {
+        const nodeid = self.nodeFor(under_offer, under) catch {
             self.gpa.free(under);
             break;
         };
@@ -2235,4 +2240,61 @@ test "a move between two shares is answered the way a move between filesystems i
     @memcpy(rename_in[wire.Rename.in_size..][0..12], "hello\x00moved\x00");
     const wrote = offered.answer(ask(&request, .rename, work, &rename_in), &answered);
     try std.testing.expectEqual(@as(?i32, wire.err.xdev), refusalIn(answered[0..wrote]));
+}
+
+test "a directory whose slot has been used before is still one the guest can read" {
+    const gpa = std.testing.allocator;
+    var bench = try Bench.open(gpa);
+    defer bench.close();
+
+    var offered = try Export.init(gpa, bench.io);
+    defer offered.deinit();
+    try offered.offer("work", bench.at, true);
+
+    var request: [1024]u8 = undefined;
+    var answered: [8192]u8 = undefined;
+    const work = try nodeOf(&offered, "work", &request, &answered);
+
+    // A slot used once and handed back. What is made next takes that slot with the next use number,
+    // which is what a guest held up for hours does all day.
+    var first_in: [wire.MakeDirectory.in_size + 8]u8 = @splat(0);
+    std.mem.writeInt(u32, first_in[0..4], 0o755, .little);
+    @memcpy(first_in[wire.MakeDirectory.in_size..][0..6], "first\x00");
+    var wrote = offered.answer(ask(&request, .mkdir, work, &first_in), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+    const first = std.mem.readInt(u64, answered[wire.Answer.size..][0..8], .little);
+
+    var forget_in: [8]u8 = @splat(0);
+    std.mem.writeInt(u64, forget_in[0..8], 1, .little);
+    _ = offered.answer(ask(&request, .forget, first, &forget_in), &answered);
+
+    var second_in: [wire.MakeDirectory.in_size + 8]u8 = @splat(0);
+    std.mem.writeInt(u32, second_in[0..4], 0o755, .little);
+    @memcpy(second_in[wire.MakeDirectory.in_size..][0..7], "second\x00");
+    wrote = offered.answer(ask(&request, .mkdir, work, &second_in), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+    const second = std.mem.readInt(u64, answered[wire.Answer.size..][0..8], .little);
+
+    // The number it was given carries a use above the first. Without that this test proves nothing,
+    // because the case is the use being packed into the high half of the number.
+    try std.testing.expect(second >> 32 > 0);
+
+    var create_in: [wire.Create.in_size + 16]u8 = @splat(0);
+    std.mem.writeInt(u32, create_in[0..4], 0o101, .little);
+    std.mem.writeInt(u32, create_in[4..8], 0o100644, .little);
+    @memcpy(create_in[wire.Create.in_size..][0..6], "thing\x00");
+    wrote = offered.answer(ask(&request, .create, second, &create_in), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+
+    var open_in: [8]u8 = @splat(0);
+    wrote = offered.answer(ask(&request, .opendir, second, &open_in), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+    const handle = std.mem.readInt(u64, answered[wire.Answer.size..][0..8], .little);
+
+    var read_in: [wire.Read.in_size]u8 = @splat(0);
+    std.mem.writeInt(u64, read_in[0..8], handle, .little);
+    std.mem.writeInt(u32, read_in[16..20], 4096, .little);
+    wrote = offered.answer(ask(&request, .readdirplus, second, &read_in), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+    try std.testing.expect(std.mem.indexOf(u8, answered[wire.Answer.size..wrote], "thing") != null);
 }
