@@ -2298,3 +2298,97 @@ test "a directory whose slot has been used before is still one the guest can rea
     try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
     try std.testing.expect(std.mem.indexOf(u8, answered[wire.Answer.size..wrote], "thing") != null);
 }
+
+test "a long directory read in small answers works under a slot that has been used before" {
+    const gpa = std.testing.allocator;
+    var bench = try Bench.open(gpa);
+    defer bench.close();
+
+    var offered = try Export.init(gpa, bench.io);
+    defer offered.deinit();
+    try offered.offer("work", bench.at, true);
+
+    var request: [1024]u8 = undefined;
+    var answered: [4096]u8 = undefined;
+    const work = try nodeOf(&offered, "work", &request, &answered);
+
+    // A slot used once and handed back, so what is made next takes it with the next use number.
+    var first_in: [wire.MakeDirectory.in_size + 8]u8 = @splat(0);
+    std.mem.writeInt(u32, first_in[0..4], 0o755, .little);
+    @memcpy(first_in[wire.MakeDirectory.in_size..][0..6], "first\x00");
+    var wrote = offered.answer(ask(&request, .mkdir, work, &first_in), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+    const first = std.mem.readInt(u64, answered[wire.Answer.size..][0..8], .little);
+
+    var forget_in: [8]u8 = @splat(0);
+    std.mem.writeInt(u64, forget_in[0..8], 1, .little);
+    _ = offered.answer(ask(&request, .forget, first, &forget_in), &answered);
+
+    var second_in: [wire.MakeDirectory.in_size + 8]u8 = @splat(0);
+    std.mem.writeInt(u32, second_in[0..4], 0o755, .little);
+    @memcpy(second_in[wire.MakeDirectory.in_size..][0..7], "second\x00");
+    wrote = offered.answer(ask(&request, .mkdir, work, &second_in), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+    const second = std.mem.readInt(u64, answered[wire.Answer.size..][0..8], .little);
+    try std.testing.expect(second >> 32 > 0);
+
+    // More names than one small answer holds. Each one read makes a node, so the table grows while
+    // the walk is going: a pointer into it taken before the walk would be left behind by that.
+    var name: [200]u8 = undefined;
+    for (0..40) |index| {
+        try std.Io.Dir.cwd().writeFile(bench.io, .{
+            .sub_path = try std.fmt.bufPrint(&name, "{s}/second/path-{d}", .{ bench.at, index }),
+            .data = "x",
+        });
+    }
+
+    var open_in: [8]u8 = @splat(0);
+    wrote = offered.answer(ask(&request, .opendir, second, &open_in), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+    const handle = std.mem.readInt(u64, answered[wire.Answer.size..][0..8], .little);
+
+    var seen: std.StringHashMapUnmanaged(u32) = .empty;
+    defer {
+        var walk = seen.keyIterator();
+        while (walk.next()) |key| gpa.free(key.*);
+        seen.deinit(gpa);
+    }
+
+    var offset: u64 = 0;
+    var turns: usize = 0;
+    while (turns < 200) : (turns += 1) {
+        var read_in: [wire.Read.in_size]u8 = @splat(0);
+        std.mem.writeInt(u64, read_in[0..8], handle, .little);
+        std.mem.writeInt(u64, read_in[8..16], offset, .little);
+        std.mem.writeInt(u32, read_in[16..20], 400, .little);
+        wrote = offered.answer(ask(&request, .readdirplus, second, &read_in), &answered);
+        try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+
+        const listing = answered[wire.Answer.size..wrote];
+        if (listing.len == 0) break;
+
+        var at: usize = 0;
+        while (at + wire.Entry.size + wire.DirEntry.header_size <= listing.len) {
+            const after = listing[at + wire.Entry.size ..];
+            const where = std.mem.readInt(u64, after[8..16], .little);
+            const said_len = std.mem.readInt(u32, after[16..20], .little);
+            const text = after[wire.DirEntry.header_size..][0..said_len];
+
+            const found = try seen.getOrPut(gpa, text);
+            if (found.found_existing) {
+                found.value_ptr.* += 1;
+            } else {
+                found.key_ptr.* = try gpa.dupe(u8, text);
+                found.value_ptr.* = 1;
+            }
+            offset = where;
+            at += wire.Entry.size + wire.DirEntry.header_size + std.mem.alignForward(usize, said_len, 8);
+        }
+    }
+
+    // Forty names, every one handed over exactly once, and more than one answer was needed.
+    try std.testing.expectEqual(@as(usize, 40), seen.count());
+    var counted = seen.valueIterator();
+    while (counted.next()) |times| try std.testing.expectEqual(@as(u32, 1), times.*);
+    try std.testing.expect(turns > 1);
+}
