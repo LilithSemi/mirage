@@ -60,6 +60,13 @@ answered: []u8,
 /// the same as an empty one, so what went wrong is counted.
 carried: u64 = 0,
 dropped: u64 = 0,
+/// How often work was found in a ring with no doorbell set for it. A doorbell that goes missing is
+/// a device that would have stopped for good, so this is the number that says whether that happens.
+drained_unrung: u64 = 0,
+/// Messages the protocol wants no answer to, `forget` above all. Counted apart from the ones that
+/// could not be answered, because a guest telling this end to let a name go is work done and not
+/// work lost.
+told: u64 = 0,
 
 /// Initialised in place, never returned by value: the transport points at `config` and `queues`
 /// inside this same struct, and a copy leaves those pointers aimed at the copy that has gone.
@@ -68,11 +75,18 @@ dropped: u64 = 0,
 /// read of the largest size the protocol agrees to will not fit.
 pub fn init(self: *Fs, tag: []const u8, answering: Answering, asked: []u8, answered: []u8) void {
     std.debug.assert(asked.len >= buffer_size and answered.len >= buffer_size);
-    self.asked = asked;
-    self.answered = answered;
-    self.answering = answering;
-    self.carried = 0;
-    self.dropped = 0;
+
+    // Everything at once, so a counter added to this struct later starts where it says it starts.
+    // Setting them one by one leaves a new one holding whatever was in that memory, which reads as a
+    // device that has already done work it has not done.
+    self.* = .{
+        .mmio = undefined,
+        .queues = undefined,
+        .config = undefined,
+        .answering = answering,
+        .asked = asked,
+        .answered = answered,
+    };
 
     @memset(&self.config, 0);
     const named = @min(tag.len, tag_size);
@@ -98,8 +112,17 @@ pub fn service(self: *Fs, intid: u32) Service {
 
 fn askPoll(ctx: *anyopaque, memory: *GuestMemory) Service.Error!bool {
     const self: *Fs = @ptrCast(@alignCast(ctx));
-    if (self.mmio.rang(queue_hiprio)) _ = try self.serve(memory, queue_hiprio);
-    if (self.mmio.rang(queue_request)) _ = try self.serve(memory, queue_request);
+
+    // What is in the ring decides, not only the doorbell about it. A device that drains on the
+    // doorbell alone stops for good if one is ever missed: nothing drains the queue, the driver gets
+    // no completions back, and every task waiting on one parks. The count says whether that ever
+    // really happens, because a guess about a race is not worth a number.
+    for ([2]usize{ queue_hiprio, queue_request }) |which| {
+        const rung = self.mmio.rang(which);
+        const left = self.queues[which].waiting(memory);
+        if (left and !rung) self.drained_unrung += 1;
+        if (rung or left) _ = try self.serve(memory, which);
+    }
     return self.mmio.interrupt_status != 0;
 }
 
@@ -107,6 +130,11 @@ fn askPoll(ctx: *anyopaque, memory: *GuestMemory) Service.Error!bool {
 pub fn serve(self: *Fs, memory: *GuestMemory, which: usize) Error!u32 {
     const queue = &self.queues[which];
     if (!queue.ready) return 0;
+
+    // Cleared before the drain, not after, which is the order `Vsock` already uses. A doorbell rung
+    // while this loop runs belongs to the next pass, and erasing it afterwards would throw away the
+    // one notice that work had arrived.
+    self.mmio.served(which);
 
     var served: u32 = 0;
     while (try queue.next(memory)) |head| {
@@ -127,15 +155,27 @@ pub fn serve(self: *Fs, memory: *GuestMemory, which: usize) Error!u32 {
             asked_len += taking;
         }
 
-        // Whoever answers is given no more room than the guest published, so an answer cannot be
-        // written into memory the guest did not offer.
+        // Whoever answers is given no more room than the guest published, so an answer is sized to
+        // what the guest can take rather than being written and then silently cut short.
+        //
+        // A chain with no writable part at all is a message the protocol wants no answer to, and
+        // `forget` is the one that matters: it still has to reach whoever answers, or the names a
+        // guest has finished with are never let go and the table grows for the whole session.
         const room = @min(room_for_answer, self.answered.len);
-        const wrote = if (asked_len == 0 or room == 0) 0 else self.answering.answer(
+        const wrote = if (asked_len == 0) 0 else self.answering.answer(
             self.answering.ctx,
             self.asked[0..asked_len],
             self.answered[0..room],
         );
-        if (wrote == 0) self.dropped += 1 else self.carried += 1;
+        if (asked_len == 0) {
+            self.dropped += 1;
+        } else if (room == 0) {
+            self.told += 1;
+        } else if (wrote == 0) {
+            self.dropped += 1;
+        } else {
+            self.carried += 1;
+        }
 
         // Scattered back into the parts the driver published, in the order it published them.
         //
@@ -162,7 +202,6 @@ pub fn serve(self: *Fs, memory: *GuestMemory, which: usize) Error!u32 {
     }
 
     if (served > 0) self.mmio.raise();
-    self.mmio.served(which);
     return served;
 }
 
@@ -399,7 +438,8 @@ test "a request with nowhere to put an answer is completed rather than left wait
     var memory = h.memory();
     try testing.expectEqual(@as(u32, 1), try offered.serve(&memory, queue_hiprio));
     try testing.expectEqual(@as(u32, 0), h.written());
-    try testing.expectEqual(@as(u64, 1), offered.dropped);
+    try testing.expectEqual(@as(u64, 1), offered.told);
+    try testing.expectEqual(@as(u64, 0), offered.dropped);
 }
 
 test "the name the guest mounts is in the configuration space" {
@@ -421,4 +461,55 @@ test "a name longer than the configuration space holds is cut rather than overfl
     offered.init("x" ** 100, counter.answering(), &room.asked, &room.answered);
     try testing.expectEqual(@as(u8, 'x'), offered.config[tag_size - 1]);
     try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, offered.config[tag_size..][0..4], .little));
+}
+
+test "work in the ring is served even when no doorbell was left set for it" {
+    var counter: Counter = .{ .said = 32 };
+    var room: Room = undefined;
+    var offered: Fs = undefined;
+    offered.init("store", counter.answering(), &room.asked, &room.answered);
+
+    var h: Harness = .{};
+    h.attach(&offered, queue_request);
+    @memcpy(h.bytes[0x300..][0..5], "hello");
+    h.publish(&.{
+        .{ .addr = ram + 0x300, .len = 5, .writable = false },
+        .{ .addr = ram + 0x400, .len = 64, .writable = true },
+    });
+
+    // No doorbell. Whether one can really be lost is a question about the loop above this, and this
+    // is the answer to a different one: a ring with work in it is drained whatever the flag says, so
+    // a doorbell that did go missing costs a turn rather than the whole mount.
+    try testing.expectEqual(false, offered.mmio.rang(queue_request));
+
+    var memory = h.memory();
+    try testing.expectEqual(true, try offered.service(0).poll(&offered, &memory));
+    try testing.expectEqual(@as(u64, 1), offered.carried);
+    try testing.expectEqual(@as(u64, 1), offered.drained_unrung);
+
+    // And a ring with nothing left in it is not counted as a missed doorbell, or the number would
+    // climb on every quiet turn and mean nothing.
+    _ = try offered.service(0).poll(&offered, &memory);
+    try testing.expectEqual(@as(u64, 1), offered.drained_unrung);
+}
+
+test "a message that published no room for a reply still reaches whoever answers" {
+    var counter: Counter = .{ .said = 0 };
+    var room: Room = undefined;
+    var offered: Fs = undefined;
+    offered.init("store", counter.answering(), &room.asked, &room.answered);
+
+    var h: Harness = .{};
+    h.attach(&offered, queue_request);
+    @memcpy(h.bytes[0x300..][0..8], "forgetme");
+
+    // Readable parts only. The kernel publishes a chain like this for anything it wants no answer
+    // to, and `forget` is the one that matters: a guest that is never told to let a name go is a
+    // table that grows for the life of the session.
+    h.publish(&.{.{ .addr = ram + 0x300, .len = 8, .writable = false }});
+
+    var memory = h.memory();
+    try testing.expectEqual(@as(u32, 1), try offered.serve(&memory, queue_request));
+    try testing.expectEqual(@as(usize, 8), counter.seen);
+    try testing.expectEqual(@as(u64, 0), offered.dropped);
 }

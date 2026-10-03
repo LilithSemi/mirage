@@ -297,6 +297,19 @@ pub fn answer(self: *Export, request: []const u8, into: []u8) usize {
         return 0;
     };
     const body = head.body(request);
+
+    // A relay with no room for an answer is carrying a message the protocol wants none to, and
+    // `forget` is the one that matters: a name the guest has finished with has to be let go here or
+    // the table grows for the whole session. Anything else cannot be answered at all, and saying so
+    // is better than writing into a buffer that is not there.
+    if (into.len < wire.Answer.size) {
+        switch (head.op) {
+            .forget => if (wire.Forget.parse(body)) |count| self.forget(head.nodeid, count),
+            .batch_forget => self.batchForget(body),
+            else => self.refused += 1,
+        }
+        return 0;
+    }
     const room = into[wire.Answer.size..];
 
     return switch (head.op) {

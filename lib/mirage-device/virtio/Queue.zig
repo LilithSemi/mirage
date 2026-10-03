@@ -93,6 +93,17 @@ pub fn next(self: *Queue, memory: *GuestMemory) Error!?u16 {
     return head;
 }
 
+/// Whether the driver has published anything this end has not taken yet.
+///
+/// A doorbell is how a driver says so, and a device that drains only on one stops for good if a
+/// doorbell is ever missed: the ring keeps filling, the driver gets no completions, and every task
+/// waiting on one parks. This is a single read, so a drain can be driven by what is in the ring
+/// rather than by a flag about it.
+pub fn waiting(self: *const Queue, memory: *GuestMemory) bool {
+    if (!self.ready) return false;
+    const published = readU16(memory, self.available + 2) catch return false;
+    return published != self.last_available;
+}
 pub const Walk = struct {
     queue: *const Queue,
     index: u16,

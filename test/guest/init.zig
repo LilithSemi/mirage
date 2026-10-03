@@ -276,6 +276,8 @@ fn writeShare() void {
 
     commitLikeABuild();
     walkLikeAFetch();
+    hammerFromManyTasks();
+    makeTheKernelForget();
 
     // The three a real toolchain needs that a guest reading files does not: a second name for a file,
     // a time it chose, and room to work in. A filesystem missing any of them makes a build that is
@@ -464,6 +466,81 @@ fn walkLikeAFetch() void {
     sayNumber("fetch: measured names", measured);
 }
 
+/// Push the filesystem from several tasks at once, which is what a parallel build does.
+///
+/// Every exercise above runs on one task, so the device is only ever asked for one thing at a time
+/// and a queue that stopped being drained would never show. A compiler on twelve processors submits
+/// continuously from all of them, so that is what this imitates: several tasks, each doing enough
+/// work to keep asking while the others ask.
+fn hammerFromManyTasks() void {
+    const tasks = 8;
+    const rounds = 60;
+
+    var children: [tasks]i32 = @splat(-1);
+    var started: usize = 0;
+    while (started < tasks) : (started += 1) {
+        const made = linux.fork();
+        if (std.posix.errno(made) != .SUCCESS) break;
+        if (made == 0) {
+            // The child. Ask for names and bytes over and over, then go without running anything
+            // the parent would run again.
+            var round: usize = 0;
+            while (round < rounds) : (round += 1) {
+                var name: [96]u8 = undefined;
+                const path = std.fmt.bufPrintZ(&name, "/share/work/.tmp-probe/file-{d}", .{round % 48}) catch break;
+
+                var about: [256]u8 align(8) = @splat(0);
+                _ = linux.syscall5(.statx, @bitCast(@as(isize, linux.AT.FDCWD)), @intFromPtr(path.ptr), 0, 0, @intFromPtr(&about));
+
+                const opened = linux.open(path.ptr, .{}, 0);
+                if (std.posix.errno(opened) == .SUCCESS) {
+                    var bytes: [64]u8 = undefined;
+                    _ = linux.read(@intCast(opened), &bytes, bytes.len);
+                    _ = linux.close(@intCast(opened));
+                }
+            }
+            linux.exit(0);
+        }
+        children[started] = @intCast(made);
+    }
+
+    // Every task is waited for. A task still running when the guest powers off would be work the
+    // device never finished, which is the opposite of what this is meant to prove.
+    var finished: usize = 0;
+    for (children[0..started]) |each| {
+        if (each < 0) continue;
+        var status: u32 = 0;
+        if (std.posix.errno(linux.wait4(each, &status, 0, null)) == .SUCCESS) finished += 1;
+    }
+
+    if (finished == started and started == tasks) {
+        sayNumber("hammer: tasks finished", finished);
+    } else {
+        sayNumber("hammer: tasks that did not finish", started - finished);
+    }
+}
+
+/// Make the kernel let go of the names it is holding, which is what sends a forget.
+///
+/// A guest that runs for a second never forgets anything on its own: the kernel keeps its cache
+/// until something presses on it. A session lasting hours does forget, constantly, so the path has
+/// to be exercised here rather than trusted. Needs `/proc`, which is mounted for this.
+fn makeTheKernelForget() void {
+    _ = linux.mkdir("/proc", 0o755);
+    if (std.posix.errno(linux.mount("none", "/proc", "proc", 0, 0)) != .SUCCESS) {
+        say("forget: no proc\n");
+        return;
+    }
+    const opened = linux.open("/proc/sys/vm/drop_caches", .{ .ACCMODE = .WRONLY }, 0);
+    if (std.posix.errno(opened) != .SUCCESS) {
+        say("forget: cannot ask the kernel to let go\n");
+        return;
+    }
+    const fd: i32 = @intCast(opened);
+    _ = linux.write(fd, "3\n", 2);
+    _ = linux.close(fd);
+    say("forget: asked the kernel to let go\n");
+}
 /// Say a line with a number on the end, for a guest with no formatter to spare.
 fn sayNumber(what: []const u8, number: usize) void {
     var room: [96]u8 = undefined;

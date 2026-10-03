@@ -833,7 +833,11 @@ test "a real linux kernel boots far enough to speak" {
         // What the export refused, printed rather than asserted on, because a guest that reports its
         // own library's name for a number leaves nothing to work from.
         var refusal_room: [fsmod.Export.Refusals.room]fsmod.Export.Refusals.Refusal = undefined;
-        std.debug.print("export refused {d} times\n", .{offered.?.last_refusals.count});
+        std.debug.print("export refused {d} times, nodes let go {d}, table {d}\n", .{
+            offered.?.last_refusals.count,
+            offered.?.let_go_nodes,
+            offered.?.nodes.items.len,
+        });
         for (offered.?.last_refusals.held(&refusal_room)) |each| {
             std.debug.print("  refused {t} with {d} at {d}\n", .{ each.op, each.code, each.at });
         }
