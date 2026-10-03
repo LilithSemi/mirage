@@ -74,6 +74,40 @@ const Node = struct {
     lookups: u64 = 0,
 };
 
+/// What was refused last, so a run says what it answered rather than only how often.
+///
+/// A guest reports whatever its own library made of the number, and a library with no name for one
+/// reports it as unexpected, which leaves whoever is reading nothing to go on. A few of them rather
+/// than one, because the interesting refusal is rarely the last: a mount that ends by refusing a
+/// write on purpose would hide the one that mattered.
+pub const Refusals = struct {
+    pub const room = 8;
+
+    kept: [room]Refusal = @splat(.{}),
+    count: u64 = 0,
+
+    pub const Refusal = struct {
+        op: wire.Op = .init,
+        code: i32 = 0,
+        /// Where in the handler it was decided. Several places answer the same number, and which one
+        /// it was is the difference between a stale handle and a walk that was never started.
+        at: u16 = 0,
+    };
+
+    fn add(self: *Refusals, one: Refusal) void {
+        self.kept[self.count % room] = one;
+        self.count += 1;
+    }
+
+    /// The ones still held, oldest first.
+    pub fn held(self: *const Refusals, into: *[room]Refusal) []const Refusal {
+        const have = @min(self.count, room);
+        const first = self.count - have;
+        for (0..have) |step| into[step] = self.kept[(first + step) % room];
+        return into[0..have];
+    }
+};
+
 const Handle = struct {
     open: ?std.Io.File = null,
     /// Which offer it is under, so taking that back closes this.
@@ -114,6 +148,8 @@ looked_up: u64 = 0,
 named: u64 = 0,
 read_bytes: u64 = 0,
 refused: u64 = 0,
+/// What was refused last, for whoever has to work out why a guest said "unexpected".
+last_refusals: Refusals = .{},
 turned_away: u64 = 0,
 /// Files and directories the guest holds open, and has let go of.
 held: u64 = 0,
@@ -346,7 +382,14 @@ fn statfs(self: *Export, into: []u8, head: wire.Header) usize {
 }
 
 fn refuse(self: *Export, into: []u8, head: wire.Header, code: i32) usize {
+    return self.refuseAt(into, head, code, 0);
+}
+
+/// Refuse, and say where it was decided. The number alone is not enough when several places in one
+/// handler answer it: a line number is what tells a stale handle apart from a walk never started.
+fn refuseAt(self: *Export, into: []u8, head: wire.Header, code: i32, at: u16) usize {
     self.refused += 1;
+    self.last_refusals.add(.{ .op = head.op, .code = code, .at = at });
     return wire.Answer.write(into, head.unique, -code, 0);
 }
 
@@ -639,9 +682,7 @@ fn open(self: *Export, into: []u8, head: wire.Header, body: []const u8, director
     // list of offers, which a read below answers from.
     if (head.nodeid == 1) {
         if (!directory) return self.refuse(into, head, wire.err.isdir);
-        const slot = for (&self.handles, 0..) |*each, index| {
-            if (each.open == null and !each.directory) break .{ each, index };
-        } else return self.refuse(into, head, wire.err.nfile);
+        const slot = self.freeHandle() orelse return self.refuse(into, head, wire.err.nfile);
         slot[0].* = .{ .directory = true };
         self.held += 1;
         return wire.Answer.write(into, head.unique, 0, wire.Open.writeOut(into[wire.Answer.size..], slot[1] + 1));
@@ -662,9 +703,7 @@ fn open(self: *Export, into: []u8, head: wire.Header, body: []const u8, director
     const path = self.pathOf(head.nodeid, null, &room) orelse
         return self.refuse(into, head, wire.err.noent);
 
-    const slot = for (&self.handles, 0..) |*each, index| {
-        if (each.open == null) break .{ each, index };
-    } else return self.refuse(into, head, wire.err.nfile);
+    const slot = self.freeHandle() orelse return self.refuse(into, head, wire.err.nfile);
 
     // A directory is read by name when the read arrives, so nothing is opened for one here beyond
     // saying that it is one. A file is opened read only and stays open until the guest lets go.
@@ -687,6 +726,19 @@ fn open(self: *Export, into: []u8, head: wire.Header, body: []const u8, director
     };
     self.held += 1;
     return wire.Answer.write(into, head.unique, 0, wire.Open.writeOut(into[wire.Answer.size..], slot[1] + 1));
+}
+
+/// A place in the handle table nobody holds, and which number it is.
+///
+/// The test lives here because it is not the obvious one. A directory is held open with no file
+/// opened on this side for it, so asking only whether something is open counts an open directory as
+/// free and hands its number out to the next file. This was written out three times and one of the
+/// three had the second half missing, which cost a guest its directory in the middle of reading it.
+fn freeHandle(self: *Export) ?struct { *Handle, usize } {
+    for (&self.handles, 0..) |*each, index| {
+        if (each.open == null and !each.directory) return .{ each, index };
+    }
+    return null;
 }
 
 fn heldAt(self: *Export, handle: u64) ?*Handle {
@@ -744,9 +796,7 @@ fn create(self: *Export, into: []u8, head: wire.Header, body: []const u8) usize 
     const path = self.pathOf(head.nodeid, asked.name, &room) orelse
         return self.refuse(into, head, wire.err.noent);
 
-    const slot = for (&self.handles, 0..) |*each, index| {
-        if (each.open == null and !each.directory) break .{ each, index };
-    } else return self.refuse(into, head, wire.err.nfile);
+    const slot = self.freeHandle() orelse return self.refuse(into, head, wire.err.nfile);
 
     // Whether it is truncated is the guest's to say: a program that opens for appending means to
     // keep what is there.
@@ -1125,7 +1175,7 @@ fn listOffers(self: *Export, into: []u8, head: wire.Header, asked: wire.Read) us
 /// from holding a cursor the guest could get wrong.
 fn readdir(self: *Export, into: []u8, head: wire.Header, body: []const u8) usize {
     const asked = wire.Read.parse(body) orelse return self.refuse(into, head, wire.err.invalid);
-    const held = self.heldAt(asked.handle) orelse return self.refuse(into, head, wire.err.badf);
+    const held = self.heldAt(asked.handle) orelse return self.refuseAt(into, head, wire.err.badf, 1);
     if (!held.directory) return self.refuse(into, head, wire.err.notdir);
 
     // The directory the guest mounted holds the offers and nothing else. It is short, so one answer
@@ -1135,12 +1185,12 @@ fn readdir(self: *Export, into: []u8, head: wire.Header, body: []const u8) usize
     // A read that asks for something already handed over starts the walk again. The kernel does this
     // when a program rewinds a directory, and only then: reading forwards never comes back here.
     if (asked.offset < held.at) {
-        const one = held.walking orelse return self.refuse(into, head, wire.err.badf);
+        const one = held.walking orelse return self.refuseAt(into, head, wire.err.badf, 2);
         held.walker = one.iterate();
         held.at = 0;
         held.waiting_len = 0;
     }
-    const walker = &(held.walker orelse return self.refuse(into, head, wire.err.badf));
+    const walker = &(held.walker orelse return self.refuseAt(into, head, wire.err.badf, 3));
 
     // Which offer this directory is under, taken once and as a value. A number the guest holds packs
     // the slot and which use of the slot together, so indexing the table with it walks off the end as
@@ -2391,4 +2441,58 @@ test "a long directory read in small answers works under a slot that has been us
     var counted = seen.valueIterator();
     while (counted.next()) |times| try std.testing.expectEqual(@as(u32, 1), times.*);
     try std.testing.expect(turns > 1);
+}
+
+test "a file opened while a directory is open does not take the directory's place" {
+    const gpa = std.testing.allocator;
+    var bench = try Bench.open(gpa);
+    defer bench.close();
+
+    var offered = try Export.init(gpa, bench.io);
+    defer offered.deinit();
+    try offered.offer("store", bench.at, false);
+
+    var request: [512]u8 = undefined;
+    var answered: [8192]u8 = undefined;
+    const store_node = try nodeOf(&offered, "store", &request, &answered);
+
+    var open_in: [8]u8 = @splat(0);
+    var wrote = offered.answer(ask(&request, .opendir, store_node, &open_in), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+    const directory = std.mem.readInt(u64, answered[wire.Answer.size..][0..8], .little);
+
+    // A small answer, so the walk has somewhere left to go when it comes back.
+    var read_in: [wire.Read.in_size]u8 = @splat(0);
+    std.mem.writeInt(u64, read_in[0..8], directory, .little);
+    std.mem.writeInt(u32, read_in[16..20], 200, .little);
+    wrote = offered.answer(ask(&request, .readdirplus, store_node, &read_in), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+    const first = answered[wire.Answer.size..wrote];
+    try std.testing.expect(first.len > 0);
+    const carried = std.mem.readInt(u64, first[wire.Entry.size + 8 ..][0..8], .little);
+
+    // Now a file, which is what a program measuring what it just walked does between reads. A
+    // directory is held open with nothing opened on this side for it, so a search for a free place
+    // that asks only whether anything is open counts it as free and hands it out twice.
+    var hello_room: [16]u8 = undefined;
+    const hello = std.fmt.bufPrint(&hello_room, "hello\x00", .{}) catch unreachable;
+    wrote = offered.answer(ask(&request, .lookup, store_node, hello), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+    const hello_node = std.mem.readInt(u64, answered[wire.Answer.size..][0..8], .little);
+
+    var file_in: [8]u8 = @splat(0);
+    wrote = offered.answer(ask(&request, .open, hello_node, &file_in), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+    const file = std.mem.readInt(u64, answered[wire.Answer.size..][0..8], .little);
+    try std.testing.expect(file != directory);
+
+    var release_in: [24]u8 = @splat(0);
+    std.mem.writeInt(u64, release_in[0..8], file, .little);
+    _ = offered.answer(ask(&request, .release, hello_node, &release_in), &answered);
+
+    // And the walk carries on, because the number the guest is holding still names the directory.
+    std.mem.writeInt(u64, read_in[0..8], directory, .little);
+    std.mem.writeInt(u64, read_in[8..16], carried, .little);
+    wrote = offered.answer(ask(&request, .readdirplus, store_node, &read_in), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
 }

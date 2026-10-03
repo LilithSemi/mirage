@@ -792,6 +792,14 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         if (one.turned_away != 0) {
             try out.print("{d} names would have left a shared directory\n", .{one.turned_away});
         }
+        // What was refused, the last few. A guest reports whatever its own library made of the
+        // number, and a library with no name for one says only that it was unexpected.
+        if (one.last_refusals.count != 0) {
+            var room: [fsmod.Export.Refusals.room]fsmod.Export.Refusals.Refusal = undefined;
+            for (one.last_refusals.held(&room)) |each| {
+                try out.print("share: refused {t} with {d} at {d}\n", .{ each.op, each.code, each.at });
+            }
+        }
         // What the guest finished with. A guest held up for a session makes and forgets files for hours,
         // and a number here that stays at zero while it works means this side is holding all of them.
         if (one.let_go_nodes != 0) {

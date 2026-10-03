@@ -830,6 +830,14 @@ test "a real linux kernel boots far enough to speak" {
         try std.testing.expect(offered.?.read_bytes >= shared_contents.len);
         try std.testing.expectEqual(@as(u64, 0), offered.?.turned_away);
 
+        // What the export refused, printed rather than asserted on, because a guest that reports its
+        // own library's name for a number leaves nothing to work from.
+        var refusal_room: [fsmod.Export.Refusals.room]fsmod.Export.Refusals.Refusal = undefined;
+        std.debug.print("export refused {d} times\n", .{offered.?.last_refusals.count});
+        for (offered.?.last_refusals.held(&refusal_room)) |each| {
+            std.debug.print("  refused {t} with {d} at {d}\n", .{ each.op, each.code, each.at });
+        }
+
         // And it wrote into the share that allows it, which this side can see because the bytes went
         // to a real file rather than into a copy.
         try std.testing.expect(std.mem.indexOf(u8, log, "share: wrote a file") != null);

@@ -275,6 +275,7 @@ fn writeShare() void {
     say("share: made a directory\n");
 
     commitLikeABuild();
+    walkLikeAFetch();
 
     // The three a real toolchain needs that a guest reading files does not: a second name for a file,
     // a time it chose, and room to work in. A filesystem missing any of them makes a build that is
@@ -375,6 +376,104 @@ fn commitLikeABuild() void {
     }
 }
 
+/// Do what a package fetch does: unpack a tree, then walk it to measure what was unpacked.
+///
+/// A recursive listing through coreutils passes where this fails, so the sequence matters: many
+/// files written at mixed modes, then every name opened and measured rather than only counted.
+/// Says the operation and the number when something refuses, because a walk that reports only
+/// failure costs a day working out which call it was.
+fn walkLikeAFetch() void {
+    if (std.posix.errno(linux.mkdir("/share/work/.tmp-probe", 0o755)) != .SUCCESS) {
+        say("fetch: cannot make the temporary directory\n");
+        return;
+    }
+
+    const modes = [3]linux.mode_t{ 0o644, 0o755, 0o600 };
+    var written: usize = 0;
+    while (written < 48) : (written += 1) {
+        var name: [96]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&name, "/share/work/.tmp-probe/file-{d}", .{written}) catch break;
+        const made = linux.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, modes[written % modes.len]);
+        if (std.posix.errno(made) != .SUCCESS) {
+            sayNumber("fetch: creating refused", @intFromEnum(std.posix.errno(made)));
+            return;
+        }
+        const fd: i32 = @intCast(made);
+        _ = linux.write(fd, "some bytes for the measure\n", 27);
+        _ = linux.close(fd);
+    }
+
+    const opened = linux.open("/share/work/.tmp-probe", .{ .DIRECTORY = true }, 0);
+    if (std.posix.errno(opened) != .SUCCESS) {
+        sayNumber("fetch: opening the directory refused", @intFromEnum(std.posix.errno(opened)));
+        return;
+    }
+    const dir: i32 = @intCast(opened);
+    defer _ = linux.close(dir);
+
+    var room: [4096]u8 align(8) = undefined;
+    var measured: usize = 0;
+    while (true) {
+        const got = linux.getdents64(dir, &room, room.len);
+        if (std.posix.errno(got) != .SUCCESS) {
+            sayNumber("fetch: the walk refused", @intFromEnum(std.posix.errno(got)));
+            return;
+        }
+        if (got == 0) break;
+
+        var at: usize = 0;
+        while (at + @sizeOf(linux.dirent64) <= got) {
+            const one: *align(1) const linux.dirent64 = @ptrCast(&room[at]);
+            if (one.reclen == 0) break;
+            at += one.reclen;
+
+            const name: [*:0]const u8 = @ptrCast(&one.name);
+            if (name[0] == '.' and (name[1] == 0 or (name[1] == '.' and name[2] == 0))) continue;
+
+            // What a hash needs: the mode, because an executable bit belongs in it, and the bytes.
+            var about: [256]u8 align(8) = @splat(0);
+            const asked = linux.syscall5(
+                .statx,
+                @bitCast(@as(isize, dir)),
+                @intFromPtr(name),
+                0,
+                0,
+                @intFromPtr(&about),
+            );
+            if (std.posix.errno(asked) != .SUCCESS) {
+                sayNumber("fetch: measuring a name refused", @intFromEnum(std.posix.errno(asked)));
+                return;
+            }
+
+            const file = linux.openat(dir, name, .{}, 0);
+            if (std.posix.errno(file) != .SUCCESS) {
+                sayNumber("fetch: opening a name refused", @intFromEnum(std.posix.errno(file)));
+                return;
+            }
+            var bytes: [64]u8 = undefined;
+            const read = linux.read(@intCast(file), &bytes, bytes.len);
+            _ = linux.close(@intCast(file));
+            if (std.posix.errno(read) != .SUCCESS) {
+                sayNumber("fetch: reading a name refused", @intFromEnum(std.posix.errno(read)));
+                return;
+            }
+            measured += 1;
+        }
+    }
+
+    sayNumber("fetch: measured names", measured);
+}
+
+/// Say a line with a number on the end, for a guest with no formatter to spare.
+fn sayNumber(what: []const u8, number: usize) void {
+    var room: [96]u8 = undefined;
+    const line = std.fmt.bufPrint(&room, "{s} {d}\n", .{ what, number }) catch {
+        say(what);
+        say("\n");
+        return;
+    };
+    say(line);
+}
 /// Read `hello` out of one of the shared directories, named by whoever asked over the channel.
 ///
 /// Opened when asked rather than held open, because the point of asking is to find out whether the
