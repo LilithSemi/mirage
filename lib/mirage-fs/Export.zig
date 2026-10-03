@@ -1027,8 +1027,17 @@ fn moveNodes(self: *Export, which: u32, generation: u32, was: []const u8, now: [
 
         var key_room: [4200]u8 = undefined;
         const key = std.fmt.bufPrint(&key_room, "{d}/{d}/{s}", .{ which, generation, moved }) catch continue;
-        const held = self.gpa.dupe(u8, key) catch continue;
-        self.known.put(self.gpa, held, nodeIdOf(index, node.own)) catch self.gpa.free(held);
+        // A map keeps the key it already holds rather than the one handed to it, so asking before
+        // copying is what stops a copy being made for nothing. The far end of a move is usually a
+        // name the guest has already asked about, which is exactly when there is a key there to keep.
+        const found = self.known.getOrPut(self.gpa, key) catch continue;
+        if (!found.found_existing) {
+            found.key_ptr.* = self.gpa.dupe(u8, key) catch {
+                _ = self.known.remove(key);
+                continue;
+            };
+        }
+        found.value_ptr.* = nodeIdOf(index, node.own);
     }
     self.repointed += 1;
 }
@@ -2495,4 +2504,42 @@ test "a file opened while a directory is open does not take the directory's plac
     std.mem.writeInt(u64, read_in[8..16], carried, .little);
     wrote = offered.answer(ask(&request, .readdirplus, store_node, &read_in), &answered);
     try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+}
+
+test "a name moved onto one the guest has already asked about holds on to nothing" {
+    const gpa = std.testing.allocator;
+    var bench = try Bench.open(gpa);
+    defer bench.close();
+
+    var offered = try Export.init(gpa, bench.io);
+    defer offered.deinit();
+    try offered.offer("work", bench.at, true);
+
+    var request: [1024]u8 = undefined;
+    var answered: [4096]u8 = undefined;
+    const work = try nodeOf(&offered, "work", &request, &answered);
+
+    // Both ends of the move are names this end has been asked about, so both are in the map. That is
+    // the ordinary case for a build: it writes the file it is going to move onto.
+    for ([2][]const u8{ "from\x00", "onto\x00" }) |called| {
+        var create_in: [wire.Create.in_size + 8]u8 = @splat(0);
+        std.mem.writeInt(u32, create_in[0..4], 0o101, .little);
+        std.mem.writeInt(u32, create_in[4..8], 0o100644, .little);
+        @memcpy(create_in[wire.Create.in_size..][0..called.len], called);
+        const wrote = offered.answer(ask(&request, .create, work, &create_in), &answered);
+        try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+    }
+
+    // The move. Its new key is one the map already holds, and a map keeps the key it has rather than
+    // the one handed to it, so the one handed over has to go back.
+    var rename_in: [wire.Rename.in_size + 16]u8 = @splat(0);
+    std.mem.writeInt(u64, rename_in[0..8], work, .little);
+    @memcpy(rename_in[wire.Rename.in_size..][0..10], "from\x00onto\x00");
+    const wrote = offered.answer(ask(&request, .rename, work, &rename_in), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+
+    // And the name the guest now holds still answers, so nothing was traded for the tidying.
+    var room: [160]u8 = undefined;
+    const moved = try std.fmt.bufPrint(&room, "{s}/onto", .{bench.at});
+    _ = try std.Io.Dir.cwd().statFile(bench.io, moved, .{});
 }
