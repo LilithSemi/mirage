@@ -830,6 +830,14 @@ test "a real linux kernel boots far enough to speak" {
         try std.testing.expect(offered.?.read_bytes >= shared_contents.len);
         try std.testing.expectEqual(@as(u64, 0), offered.?.turned_away);
 
+        // The guest asked the kernel to let go of its cached names, so forgets were sent. Both ends
+        // of that path are asserted, and the pair is the evidence rather than either number: a device
+        // that answers a forget correctly and never reaches the release would move the first of these
+        // and leave the second at zero, which is the same bug wearing a reply.
+        try std.testing.expect(std.mem.indexOf(u8, log, "forget: asked the kernel to let go") != null);
+        try std.testing.expect(shared_fs.told > 0);
+        try std.testing.expect(offered.?.let_go_nodes > 0);
+
         // What the export refused, printed rather than asserted on, because a guest that reports its
         // own library's name for a number leaves nothing to work from.
         var refusal_room: [fsmod.Export.Refusals.room]fsmod.Export.Refusals.Refusal = undefined;
