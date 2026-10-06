@@ -29,5 +29,5 @@ test {
     _ = platform;
     _ = registers;
     _ = Register;
-    _ = &enter;
+    _ = @import("mirage-arm64/enter.zig");
 }
