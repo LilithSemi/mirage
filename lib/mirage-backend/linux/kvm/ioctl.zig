@@ -45,6 +45,9 @@ pub const Error = error{
     InvalidArgument,
     NotSupported,
     Interrupted,
+    /// The vCPU was not runnable yet, so KVM_RUN handed it back. An application
+    /// processor that has not had its startup signal reports this until it does.
+    WouldBlock,
     /// The kernel wanted more room than was offered, and said how much it needs.
     TooBig,
     OutOfMemory,
@@ -62,6 +65,7 @@ pub fn call(fd: std.posix.fd_t, req: u32, arg: usize) Error!usize {
         .INVAL => Error.InvalidArgument,
         .NOSYS, .NOTTY, .OPNOTSUPP => Error.NotSupported,
         .INTR => Error.Interrupted,
+        .AGAIN => Error.WouldBlock,
         .@"2BIG" => Error.TooBig,
         .NOMEM => Error.OutOfMemory,
         .BUSY => Error.Busy,

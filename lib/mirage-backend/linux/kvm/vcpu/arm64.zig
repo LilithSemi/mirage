@@ -149,9 +149,10 @@ pub fn getRegister(self: *Vcpu, reg: Backend.Register) Error!u64 {
 
 pub fn run(self: *Vcpu) Error!Backend.Exit {
     _ = ioctl.call(self.fd, comptime ioctl.request(.none, void, nr.run), 0) catch |err| switch (err) {
-        // A signal took the CPU back while the guest was still running. That is a VMM
-        // reaching in, not a fault, and the guest carries on from where it was.
-        error.Interrupted => return .interrupted,
+        // A signal took the CPU back while the guest was still running, or the CPU was
+        // not runnable yet and KVM handed it back. Neither is a fault: the guest carries
+        // on from where it was, or enters once a startup signal makes it runnable.
+        error.Interrupted, error.WouldBlock => return .interrupted,
         else => return err,
     };
     return self.decode();
