@@ -358,7 +358,7 @@ test "a real linux kernel boots far enough to speak" {
             disk = try gpa.alloc(u8, rootfs.len + block + tree.blocks.len);
             @memset(disk, 0);
             @memcpy(disk[0..rootfs.len], rootfs);
-            @memcpy(disk[rootfs.len..][0..512], &@as([512]u8, @bitCast(header)));
+            @memcpy(disk[rootfs.len..][0..512], &std.mem.toBytes(header));
             @memcpy(disk[rootfs.len + block ..], tree.blocks);
 
             // Change one byte of the filesystem superblock after the tree was built over

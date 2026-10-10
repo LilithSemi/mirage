@@ -44,53 +44,18 @@ pub const Built = struct {
     rsdp: u64,
 };
 
-// The FADT is 276 bytes (ACPI 6.x). Layout is fixed by the spec; fields are
-// written by offset using std.mem.writeInt. Asserts below pin every field used.
-const fadt_size: usize = 276;
+const Emitter = almanac.aml.Emitter;
 
-// AML encoding for: Name (_S5, Package (2) { 5, 5 })
-//
-// ACPI spec §20.2.3: NameOp NameString; §20.2.5.4: PackageOp PkgLength
-// NumElements PackageElementList.
-//
-// PkgLength counts itself plus the body that follows it:
-//   body = NumElements(1 byte) + ByteData(2 bytes) + ByteData(2 bytes) = 5 bytes
-//   PkgLength = 1 (self) + 5 (body) = 6
-//
-// The two Byte() elements encode s5_slp_typ for SLP_TYPa and SLP_TYPb.
-const s5_aml = [_]u8{
-    0x08, // NameOp
-    0x5F, 0x53, 0x35, 0x5F, // "_S5_" NameSeg
-    0x12, // PackageOp
-    0x06, // PkgLength = 6 (self + 5 body bytes)
-    0x02, // NumElements = 2
-    almanac.aml.encoding.byte_prefix, s5_slp_typ, // SLP_TYPa = 5
-    almanac.aml.encoding.byte_prefix, s5_slp_typ, // SLP_TYPb = 5
-};
+/// Every system description table starts with the same 36 byte header, which the builder writes.
+const sdt_header_size: usize = 36;
 
-comptime {
-    // PkgLength body: NumElements(1) + 2*ByteData(2 each) = 5; PkgLength = 1+5 = 6.
-    std.debug.assert(s5_aml[6] == 6);
-    std.debug.assert(s5_aml.len == 12);
-}
+/// Room reserved for the DSDT's AML before any of it is written. The length is not known until it
+/// has been, and `endTable` gives back whatever was not used, so this only has to be generous.
+const dsdt_room: usize = 512;
 
-// The Generic Address Structure is 12 bytes. The assert below confirms it.
-comptime {
-    std.debug.assert(@sizeOf(almanac.Gas) == 12);
-    // sleep-control GAS lives at FADT offset 244; sleep-status at 256.
-    // The assertions are on the constants, not on a struct field, because the
-    // FADT body is a raw [276]u8 built field-by-field.
-    std.debug.assert(sleep_control_off == 244);
-    std.debug.assert(sleep_status_off == 256);
-    std.debug.assert(sleep_status_off + @sizeOf(almanac.Gas) <= fadt_size);
-}
-
-// Byte offsets within the 276-byte FADT for the two sleep GAS fields.
-const sleep_control_off: usize = 244;
-const sleep_status_off: usize = 256;
-
-// Bit 20 of the FADT flags field: hardware-reduced ACPI platform.
-const flag_hw_reduced: u32 = 1 << 20;
+/// The register window a TIS chip answers on, and the start method that names it.
+const tis_size: u32 = 0x5000;
+const tis_start_method: u32 = 6;
 
 // These three structs pin sizes via @sizeOf for the raw-offset writer, they are never memcpy'd, so do not fold the offset writes into struct stores and pick up padding.
 // MADT fixed header that follows the 36-byte SDT header: local APIC address
@@ -160,16 +125,6 @@ fn madtBodyLen(cpus: u32) usize {
     return @sizeOf(MadtHeader) + cpus * @sizeOf(LocalApicEntry) + @sizeOf(IoApicEntry);
 }
 
-/// Write a 12-byte GAS into `dst` at `off`. address_space=1 (SystemIO),
-/// bit_width=8, bit_offset=0, access_size=1 (byte), address=port.
-fn writeGas(dst: []u8, off: usize, port: u16) void {
-    dst[off + 0] = 1; // address_space: SystemIO
-    dst[off + 1] = 8; // bit_width
-    dst[off + 2] = 0; // bit_offset
-    dst[off + 3] = 1; // access_size: byte
-    std.mem.writeInt(u64, dst[off + 4 ..][0..8], port, .little);
-}
-
 /// A virtio-mmio device to encode as an ACPI Device object in the DSDT.
 pub const VirtioDevice = struct {
     addr: u64,
@@ -177,334 +132,121 @@ pub const VirtioDevice = struct {
     gsi: u32,
 };
 
-// Fixed body lengths used in emitDevice.
-const mem32_body_len: usize = 9; // info(1) + base(4) + length(4)
-const extirq_body_len: usize = 6; // flags(1) + count(1) + gsi(4)
-const crs_resources_len: usize = 23; // Memory32Fixed + ExtInterrupt + EndTag
+/// The resources a `_CRS` carries, encoded into an AML buffer object.
+///
+/// The buffer's size is written before its contents, so the descriptors go into scratch first to
+/// learn their length. `almanac.resource.encode` lays each one out, which is what keeps the tag
+/// bytes and the little endian widths in one place rather than in this file.
+fn emitCrs(aml: *Emitter, resources: []const almanac.resource.Resource) !void {
+    var scratch: [64]u8 = undefined;
+    var used: usize = 0;
+    for (resources) |each| used += try almanac.resource.encode(scratch[used..], each);
+    used += try almanac.resource.encodeEndTag(scratch[used..]);
 
-// Fixed resource lengths for the TPM TIS device _CRS.
-// Only a Memory32Fixed (12 bytes) + EndTag (2 bytes): no interrupt.
-const tpm_crs_resources_len: usize = 14;
-
-comptime {
-    // Cross-check each length against the field widths it holds, so a wrong
-    // constant trips the assert. A large resource carries a 3-byte header
-    // (tag + u16 length); the EndTag is 2 bytes.
-    std.debug.assert(@sizeOf(u8) + @sizeOf(u32) + @sizeOf(u32) == mem32_body_len);
-    std.debug.assert(@sizeOf(u8) + @sizeOf(u8) + @sizeOf(u32) == extirq_body_len);
-    std.debug.assert(3 + mem32_body_len + 3 + extirq_body_len + 2 == crs_resources_len);
-    std.debug.assert(mem32_body_len == 9);
-    std.debug.assert(tpm_crs_resources_len == 14); // Memory32Fixed(12) + EndTag(2)
+    const frame = try aml.beginNameBuffer("_CRS", used);
+    try aml.raw(scratch[0..used]);
+    try aml.end(frame);
 }
 
-/// Write an ACPI PkgLength for a package whose content (not counting the
-/// PkgLength bytes) is `content_len` bytes. Returns the number of bytes
-/// written: 1 when total < 0x40, 2 otherwise.
-fn writePkgLength(buf: []u8, content_len: usize) usize {
-    const total1 = content_len + 1;
-    if (total1 < 0x40) {
-        buf[0] = @intCast(total1);
-        return 1;
-    }
-    const total2 = content_len + 2;
-    std.debug.assert(total2 < 0x1000);
-    buf[0] = @intCast(0x40 | (total2 & 0x0F));
-    buf[1] = @intCast(total2 >> 4);
-    return 2;
-}
-
-/// Write one Device(VRnn){ _HID "LNRO0005"; _UID index; _CRS ... } into buf.
-/// Returns bytes written.
-fn emitDevice(buf: []u8, index: u8, dev: VirtioDevice) usize {
+/// `Device(VRnn){ _HID "LNRO0005"; _UID nn; _CRS ... }`.
+fn emitDevice(aml: *Emitter, index: u8, dev: VirtioDevice) !void {
     std.debug.assert(index < 100);
     std.debug.assert(dev.addr <= 0xFFFF_FFFF);
 
-    // Resource descriptors (23 bytes total).
-    var resources: [crs_resources_len]u8 = undefined;
-    // Memory32Fixed: tag 0x86, body-length u16 LE = 9, then info + base + length.
-    resources[0] = 0x86;
-    resources[1] = mem32_body_len;
-    resources[2] = 0x00;
-    resources[3] = 0x01; // ReadWrite
-    std.mem.writeInt(u32, resources[4..8], @intCast(dev.addr), .little);
-    std.mem.writeInt(u32, resources[8..12], dev.size, .little);
-    // Extended Interrupt: tag 0x89, body-length u16 LE = 6, flags, count, gsi.
-    resources[12] = 0x89;
-    resources[13] = extirq_body_len;
-    resources[14] = 0x00;
-    resources[15] = 0x01; // Consumer, Level, ActiveHigh, Exclusive
-    resources[16] = 0x01; // interrupt count = 1
-    std.mem.writeInt(u32, resources[17..21], dev.gsi, .little);
-    // EndTag.
-    resources[21] = 0x79;
-    resources[22] = 0x00;
+    var path: [4]u8 = undefined;
+    const named = std.fmt.bufPrint(&path, "VR{d:0>2}", .{index}) catch unreachable;
 
-    // _CRS Name object: NameOp + "_CRS" + BufferOp + PkgLength + BufferSize + resources.
-    // BufferOp PkgLength content = BufferSize(2) + resources(23) = 25; total = 26 = 0x1A.
-    var crs: [32]u8 = undefined;
-    var cp: usize = 0;
-    crs[cp] = 0x08;
-    cp += 1; // NameOp
-    crs[cp] = 0x5F;
-    crs[cp + 1] = 0x43;
-    crs[cp + 2] = 0x52;
-    crs[cp + 3] = 0x53;
-    cp += 4; // _CRS
-    crs[cp] = 0x11;
-    cp += 1; // BufferOp
-    cp += writePkgLength(crs[cp..], 2 + crs_resources_len); // BufferSize(2) + resources(23)
-    crs[cp] = almanac.aml.encoding.byte_prefix;
-    cp += 1;
-    crs[cp] = crs_resources_len;
-    cp += 1; // 0x17 = 23
-    @memcpy(crs[cp .. cp + crs_resources_len], &resources);
-    cp += crs_resources_len;
-    const crs_len = cp;
+    const frame = try aml.beginDevice(named);
+    try aml.name("_HID", .{ .text = "LNRO0005" });
+    try aml.name("_UID", .{ .integer = index });
 
-    // Name(_HID,"LNRO0005"): 08 + _HID + 0D + "LNRO0005" + 00 = 15 bytes.
-    const hid = [15]u8{
-        0x08, // NameOp
-        0x5F, 0x48, 0x49, 0x44, // _HID
-        0x0D, // StringPrefix
-        'L',
-        'N',
-        'R',
-        'O',
-        '0',
-        '0',
-        '0',
-        '5',
-        0x00, // NUL
-    };
-
-    // Name(_UID,n): 08 + _UID + BytePrefix + n = 7 bytes.
-    const uid = [7]u8{
-        0x08, // NameOp
-        0x5F,                             0x55,  0x49, 0x44, // _UID
-        almanac.aml.encoding.byte_prefix, index,
-    };
-
-    // Device = 5B 82 + PkgLength(NameSeg(4) + body) + NameSeg + body.
-    const body_len = hid.len + uid.len + crs_len;
-    const pkg_content = 4 + body_len; // NameSeg(4) + body
-
-    var p: usize = 0;
-    buf[p] = 0x5B;
-    p += 1; // ExtOpPrefix
-    buf[p] = 0x82;
-    p += 1; // DeviceOp
-    p += writePkgLength(buf[p..], pkg_content);
-    buf[p] = 'V';
-    p += 1;
-    buf[p] = 'R';
-    p += 1;
-    buf[p] = '0' + (index / 10);
-    p += 1;
-    buf[p] = '0' + (index % 10);
-    p += 1;
-    @memcpy(buf[p .. p + hid.len], &hid);
-    p += hid.len;
-    @memcpy(buf[p .. p + uid.len], &uid);
-    p += uid.len;
-    @memcpy(buf[p .. p + crs_len], crs[0..crs_len]);
-    p += crs_len;
-    return p;
+    // Held in a local because the descriptor borrows it rather than copying.
+    const interrupts = [_]u32{dev.gsi};
+    try emitCrs(aml, &.{
+        .{ .fixed_memory32 = .{ .info = 1, .base = @intCast(dev.addr), .length = dev.size } },
+        .{ .extended_irq = .{ .flags = 1, .interrupts = &interrupts, .source = "" } },
+    });
+    try aml.end(frame);
 }
 
-/// Write Scope(\_SB_){ <one Device per dev> } into buf. Returns bytes written.
-pub fn emitSystemBus(buf: []u8, devs: []const VirtioDevice) usize {
-    // Encode all devices into a scratch area first to know total length.
-    var scratch: [4096]u8 = undefined;
-    var dev_total: usize = 0;
-    for (devs, 0..) |dev, i| {
-        dev_total += emitDevice(scratch[dev_total..], @intCast(i), dev);
-    }
-
-    // Scope(\_SB_): 10 + PkgLength(over \_SB_ name(5) + devices) + \_SB_(5) + devices
-    const scope_content = 5 + dev_total; // \_SB_(5) + devices
-    var p: usize = 0;
-    buf[p] = 0x10;
-    p += 1; // ScopeOp
-    p += writePkgLength(buf[p..], scope_content);
-    // \_SB_ = root_char + "_SB_" = 5C 5F 53 42 5F
-    buf[p] = 0x5C;
-    p += 1; // root_char '\'
-    buf[p] = 0x5F;
-    buf[p + 1] = 0x53;
-    buf[p + 2] = 0x42;
-    buf[p + 3] = 0x5F;
-    p += 4; // _SB_
-    @memcpy(buf[p .. p + dev_total], scratch[0..dev_total]);
-    p += dev_total;
-    return p;
+/// `Scope(\_SB_){ <one Device per dev> }`.
+pub fn emitSystemBus(aml: *Emitter, devs: []const VirtioDevice) !void {
+    const frame = try aml.beginScope("\\_SB_");
+    for (devs, 0..) |dev, i| try emitDevice(aml, @intCast(i), dev);
+    try aml.end(frame);
 }
 
-/// Write Device(TPM0){ Name(_HID,"MSFT0101") Name(_CRS,...) } into buf.
-/// Returns bytes written. No _UID; _CRS holds only Memory32Fixed + EndTag.
-fn emitTpmDevice(buf: []u8, control: u32) usize {
-    // Resource descriptors: Memory32Fixed(12) + EndTag(2) = 14 bytes.
-    var resources: [tpm_crs_resources_len]u8 = undefined;
-    resources[0] = 0x86; // Memory32Fixed tag
-    resources[1] = mem32_body_len; // body length = 9
-    resources[2] = 0x00; // high byte of u16 body length
-    resources[3] = 0x01; // ReadWrite
-    std.mem.writeInt(u32, resources[4..8], control, .little);
-    std.mem.writeInt(u32, resources[8..12], 0x5000, .little); // TIS size
-    resources[12] = 0x79; // EndTag
-    resources[13] = 0x00;
-
-    // _CRS Name: NameOp + "_CRS" + BufferOp + PkgLength + BufferSize + resources.
-    // BufferPkg content = BufferSize(2) + resources(14) = 16; total1 = 17 < 0x40.
-    var crs: [32]u8 = undefined;
-    var cp: usize = 0;
-    crs[cp] = 0x08;
-    cp += 1; // NameOp
-    crs[cp] = 0x5F;
-    crs[cp + 1] = 0x43;
-    crs[cp + 2] = 0x52;
-    crs[cp + 3] = 0x53;
-    cp += 4; // _CRS
-    crs[cp] = 0x11;
-    cp += 1; // BufferOp
-    cp += writePkgLength(crs[cp..], 2 + tpm_crs_resources_len); // 16
-    crs[cp] = almanac.aml.encoding.byte_prefix;
-    cp += 1;
-    crs[cp] = tpm_crs_resources_len;
-    cp += 1; // 0x0E = 14
-    @memcpy(crs[cp .. cp + tpm_crs_resources_len], &resources);
-    cp += tpm_crs_resources_len;
-    const crs_len = cp;
-
-    // Name(_HID,"MSFT0101"): same encoding as LNRO0005, 15 bytes.
-    const hid = [15]u8{
-        0x08, // NameOp
-        0x5F, 0x48, 0x49, 0x44, // _HID
-        0x0D, // StringPrefix
-        'M',
-        'S',
-        'F',
-        'T',
-        '0',
-        '1',
-        '0',
-        '1',
-        0x00, // NUL
-    };
-
-    // Device body: _HID(15) + _CRS(crs_len). No _UID for TPM0.
-    const body_len = hid.len + crs_len;
-    const pkg_content = 4 + body_len; // NameSeg(4) + body
-
-    var p: usize = 0;
-    buf[p] = 0x5B;
-    p += 1; // ExtOpPrefix
-    buf[p] = 0x82;
-    p += 1; // DeviceOp
-    p += writePkgLength(buf[p..], pkg_content);
-    buf[p] = 'T';
-    p += 1;
-    buf[p] = 'P';
-    p += 1;
-    buf[p] = 'M';
-    p += 1;
-    buf[p] = '0';
-    p += 1;
-    @memcpy(buf[p .. p + hid.len], &hid);
-    p += hid.len;
-    @memcpy(buf[p .. p + crs_len], crs[0..crs_len]);
-    p += crs_len;
-    return p;
+/// `Scope(\_SB_){ Device(TPM0){ _HID "MSFT0101"; _CRS ... } }`.
+///
+/// No `_UID`, and the resources are the control area alone: a TIS chip has no interrupt here.
+pub fn emitTpmScope(aml: *Emitter, control: u32) !void {
+    const scope = try aml.beginScope("\\_SB_");
+    const device = try aml.beginDevice("TPM0");
+    try aml.name("_HID", .{ .text = "MSFT0101" });
+    try emitCrs(aml, &.{
+        .{ .fixed_memory32 = .{ .info = 1, .base = control, .length = tis_size } },
+    });
+    try aml.end(device);
+    try aml.end(scope);
 }
 
-/// Write Scope(\_SB_){ Device(TPM0){...} } into buf. Returns bytes written.
-pub fn emitTpmScope(buf: []u8, control: u32) usize {
-    var scratch: [128]u8 = undefined;
-    const dev_len = emitTpmDevice(&scratch, control);
-
-    // Scope(\_SB_): ScopeOp + PkgLength + \_SB_(5) + device
-    const scope_content = 5 + dev_len;
-    var p: usize = 0;
-    buf[p] = 0x10;
-    p += 1; // ScopeOp
-    p += writePkgLength(buf[p..], scope_content);
-    buf[p] = 0x5C;
-    p += 1; // root_char '\'
-    buf[p] = 0x5F;
-    buf[p + 1] = 0x53;
-    buf[p + 2] = 0x42;
-    buf[p + 3] = 0x5F;
-    p += 4; // _SB_
-    @memcpy(buf[p .. p + dev_len], scratch[0..dev_len]);
-    p += dev_len;
-    return p;
+/// `Name(_S5, Package(2){ 5, 5 })`, which is what a hardware reduced platform powers off through.
+///
+/// The two elements are SLP_TYPa and SLP_TYPb.
+fn emitSleepState(aml: *Emitter) !void {
+    const frame = try aml.beginNamePackage("_S5_", 2);
+    try aml.integer(s5_slp_typ);
+    try aml.integer(s5_slp_typ);
+    try aml.end(frame);
 }
 
 /// Build an RSDP, XSDT, hardware-reduced FADT, and DSDT carrying _S5 into
 /// `buf` at guest physical address `base_phys`. Returns the bytes written and
 /// the RSDP's physical address as the Builder placed it.
+/// Write the guest's AML into `into`, and say how long it came out.
+///
+/// The emitter can fail nine structural ways, all of which mean this module built AML that does not
+/// hold together: unbalanced containers, a bad name, a package too long. None of them is a condition
+/// a caller can do anything about, so they arrive as one error rather than nine. Running out of room
+/// stays its own error, because that one a caller fixes by giving a bigger buffer.
+fn emitAml(into: []u8, opts: Options) error{ OutOfSpace, BadAml }!usize {
+    var aml = Emitter.init(into);
+    const body = emit: {
+        emitSleepState(&aml) catch |err| break :emit err;
+        if (opts.virtio.len > 0) emitSystemBus(&aml, opts.virtio) catch |err| break :emit err;
+        if (opts.tpm) |t| emitTpmScope(&aml, @intCast(t.control)) catch |err| break :emit err;
+        break :emit aml.finish();
+    } catch |err| switch (err) {
+        error.OutOfSpace => return error.OutOfSpace,
+        else => return error.BadAml,
+    };
+    return body.len;
+}
+
 pub fn build(buf: []u8, base_phys: u64, opts: Options) !Built {
     var b = almanac.Builder.init(buf, base_phys);
 
-    // The DSDT is placed before the FADT so its physical address is known when
-    // the FADT's DSDT and X_DSDT fields are written. The DSDT is referenced
-    // only by the FADT and is never listed in the XSDT (ACPI rule).
+    // The DSDT is placed before the FADT so its address is known when the FADT names it. It is
+    // referenced only by the FADT and never listed in the XSDT, which is an ACPI rule.
     //
-    // Body = s5_aml ++ emitSystemBus(virtio)? ++ emitTpmScope(control)?
-    // When neither virtio nor tpm, use s5_aml directly (byte-identical).
+    // Reserved generously and then cut back, because AML's length is not known until it has been
+    // written. `endTable` rewrites the length, stamps the checksum, and hands the unused tail back.
     const dsdt_phys = dsdt: {
-        if (opts.virtio.len == 0 and opts.tpm == null) {
-            break :dsdt try b.addTable("DSDT", &s5_aml, 2);
-        }
-        var body: [512]u8 = undefined;
-        @memcpy(body[0..s5_aml.len], &s5_aml);
-        var total = s5_aml.len;
-        if (opts.virtio.len > 0) {
-            total += emitSystemBus(body[total..], opts.virtio);
-        }
-        if (opts.tpm) |t| {
-            total += emitTpmScope(body[total..], @intCast(t.control));
-        }
-        std.debug.assert(total <= body.len);
-        break :dsdt try b.addTable("DSDT", body[0..total], 2);
+        const table = try b.beginTable("DSDT", sdt_header_size + dsdt_room, 2);
+        const used = try emitAml(table[sdt_header_size..], opts);
+        // `used` came from the slice this reserved, so the length is in range by construction.
+        // Mapped rather than asserted, because a panic in a library is the caller's problem.
+        break :dsdt b.endTable(table, sdt_header_size + used) catch return error.BadAml;
     };
 
-    // Build the FADT body by hand because almanac's fadt() helper does not set
-    // the sleep-control/status registers.
-    var fadt_bytes: [fadt_size]u8 = @splat(0);
-
-    // SDT header (36 bytes): signature, length, revision, checksum (0 for now),
-    // OEM id, OEM table id, OEM revision, creator id, creator revision.
-    @memcpy(fadt_bytes[0..4], "FACP");
-    std.mem.writeInt(u32, fadt_bytes[4..8], fadt_size, .little);
-    fadt_bytes[8] = 6; // ACPI revision 6
-    fadt_bytes[9] = 0; // checksum placeholder
-
-    // These OEM / creator values mirror almanac.Builder's defaults so read-back agrees, a coupling.
-    @memcpy(fadt_bytes[10..16], "MIDSTL");
-    @memcpy(fadt_bytes[16..24], "ALMANAC ");
-    std.mem.writeInt(u32, fadt_bytes[24..28], 1, .little);
-    @memcpy(fadt_bytes[28..32], "ALMA");
-    std.mem.writeInt(u32, fadt_bytes[32..36], 1, .little);
-
-    // DSDT (32-bit, offset 40) and X_DSDT (64-bit, offset 140) point at the
-    // DSDT placed above.
-    std.mem.writeInt(u32, fadt_bytes[40..44], @truncate(dsdt_phys), .little);
-    std.mem.writeInt(u64, fadt_bytes[140..148], dsdt_phys, .little);
-
-    // Flags at offset 112: set HW_REDUCED_ACPI.
-    std.mem.writeInt(u32, fadt_bytes[112..116], flag_hw_reduced, .little);
-
-    // Minor version at offset 131 = 1 (ACPI 6.1+).
-    fadt_bytes[131] = 1;
-
-    // Sleep-control GAS at offset 244, sleep-status GAS at offset 256.
-    writeGas(&fadt_bytes, sleep_control_off, sleep_port);
-    writeGas(&fadt_bytes, sleep_status_off, sleep_port);
-
-    // Stamp the checksum into byte 9 (the SDT header checksum slot).
-    fadt_bytes[9] = almanac.checksum.compute(&fadt_bytes);
-
-    const fadt_phys = try b.addRaw(&fadt_bytes);
+    // Hardware reduced, so the sleep registers are the only way this guest powers itself off: the
+    // PM1 legacy blocks are not there to fall back to.
+    const fadt_phys = try b.fadt(.{
+        .dsdt_phys = dsdt_phys,
+        .hw_reduced = true,
+        .sleep_control_reg = .at(.system_io, 8, sleep_port),
+        .sleep_status_reg = .at(.system_io, 8, sleep_port),
+    });
 
     // Build the MADT body into a stack buffer sized for the cpu count. The
     // xAPIC id is one byte, so 256 is the ceiling; cpus is VMM config, so a
@@ -526,25 +268,16 @@ pub fn build(buf: []u8, base_phys: u64, opts: Options) !Built {
     xsdt_entries[n] = madt_phys;
     n += 1;
     if (opts.tpm) |t| {
-        // The TPM2 table, hand-built to the TCG2 layout the kernel reads the event log from: the log
-        // fields sit at offset 64 (after a 12-byte start-method area), for a 76-byte table. almanac's
-        // tpm2() places them at 52, which the kernel's tpm_read_log_acpi does not read.
-        var tpm2_bytes: [76]u8 = @splat(0);
-        @memcpy(tpm2_bytes[0..4], "TPM2");
-        std.mem.writeInt(u32, tpm2_bytes[4..8], 76, .little);
-        tpm2_bytes[8] = 4; // revision
-        @memcpy(tpm2_bytes[10..16], "MIDSTL");
-        @memcpy(tpm2_bytes[16..24], "ALMANAC ");
-        std.mem.writeInt(u32, tpm2_bytes[24..28], 1, .little);
-        @memcpy(tpm2_bytes[28..32], "ALMA");
-        std.mem.writeInt(u32, tpm2_bytes[32..36], 1, .little);
-        std.mem.writeInt(u64, tpm2_bytes[40..48], t.control, .little); // control address
-        std.mem.writeInt(u32, tpm2_bytes[48..52], 6, .little); // start method: TIS
-        // 52..64 start-method-specific parameters stay zero for TIS.
-        std.mem.writeInt(u32, tpm2_bytes[64..68], t.log_len, .little); // log_area_minimum_length
-        std.mem.writeInt(u64, tpm2_bytes[68..76], t.log_addr, .little); // log_area_start_address
-        tpm2_bytes[9] = almanac.checksum.compute(&tpm2_bytes);
-        const tpm2_phys = try b.addRaw(&tpm2_bytes);
+        // Revision 4, which is the layout the kernel reads the event log from: a 76 byte table with
+        // the log fields after the start method parameters. Asking for the revision is what selects
+        // that, rather than this file knowing the offsets.
+        const tpm2_phys = try b.tpm2(.{
+            .revision = 4,
+            .control_address = t.control,
+            .start_method = tis_start_method,
+            .log_area_length = t.log_len,
+            .log_area_start = t.log_addr,
+        });
         xsdt_entries[n] = tpm2_phys;
         n += 1;
     }
@@ -553,6 +286,29 @@ pub fn build(buf: []u8, base_phys: u64, opts: Options) !Built {
     const rsdp = try b.rsdp(xsdt_phys);
 
     return .{ .bytes = b.finish(), .rsdp = rsdp };
+}
+
+/// How long the AML is when nothing but the sleep state is in it. `NameOp` and the four byte name,
+/// then `PackageOp`, its length and element count, then two one byte elements with their prefixes:
+/// 1 + 4 + 1 + 1 + 1 + 4. Asserted by the tests below, so extra AML appearing cannot go unnoticed.
+const s5_body_len: u32 = 12;
+
+/// Read an AML integer written in its shortest form, and say how many bytes it took.
+///
+/// Zero and one have opcodes of their own, so a reader that expects a prefixed byte for every small
+/// number is reading an encoding choice rather than a value. Used by the tests below.
+fn smallInteger(bytes: []const u8) ?struct { value: u64, len: usize } {
+    if (bytes.len == 0) return null;
+    return switch (bytes[0]) {
+        0x00 => .{ .value = 0, .len = 1 }, // ZeroOp
+        0x01 => .{ .value = 1, .len = 1 }, // OneOp
+        0xFF => .{ .value = 0xFF, .len = 1 }, // OnesOp
+        almanac.aml.encoding.byte_prefix => if (bytes.len >= 2)
+            .{ .value = bytes[1], .len = 2 }
+        else
+            null,
+        else => null,
+    };
 }
 
 test "the madt describes the cpu and the ioapic" {
@@ -610,13 +366,13 @@ test "the fadt names the sleep port" {
     const tabs = try Tables.init(.{ .offset = offset }, built.rsdp);
     const fadt = (try tabs.findAs(almanac.Fadt)).?;
 
-    // SLEEP_CONTROL_REG is at FADT byte offset 244.
-    const gas_bytes = fadt.bytes[sleep_control_off .. sleep_control_off + @sizeOf(almanac.Gas)];
-    const g = almanac.Gas.fromBytes(gas_bytes);
+    // Read through the accessor rather than at byte 244. A test that reads the offset this file
+    // wrote cannot notice the two drifting apart, which is how the same class of bug lived in
+    // almanac's TPM2 reader. The accessor gates on the table's length, so too short reads as absent.
+    const g = fadt.sleepControlRegister().?;
     try testing.expectEqual(@as(u8, 1), g.address_space); // SystemIO
     try testing.expectEqual(sleep_port, @as(u16, @intCast(g.address)));
 }
-
 test "the dsdt carries an s5 package the fadt points at" {
     var buf: [4096]u8 align(16) = undefined;
     const base: u64 = 0x80000;
@@ -633,7 +389,7 @@ test "the dsdt carries an s5 package the fadt points at" {
 
     // Read the DSDT bytes via the offset mapper and spot-check the _S5 AML.
     // The DSDT begins with a 36-byte SDT header; the AML body follows.
-    const dsdt_total = 36 + s5_aml.len;
+    const dsdt_total = 36 + s5_body_len;
     const dsdt_bytes = (almanac.OffsetMapper{ .offset = offset }).slice(dsdt_addr, dsdt_total);
     // Verify signature "DSDT" in the header.
     try std.testing.expect(std.mem.eql(u8, dsdt_bytes[0..4], "DSDT"));
@@ -653,10 +409,11 @@ test "the dsdt carries an s5 package the fadt points at" {
 test "an aml device object decodes back to its resources" {
     const dev = VirtioDevice{ .addr = 0xd0000200, .size = 0x200, .gsi = 17 };
     var buf: [256]u8 = undefined;
-    const len = emitSystemBus(&buf, &.{dev});
+    var emitter = Emitter.init(&buf);
+    try emitSystemBus(&emitter, &.{dev});
+    const aml = try emitter.finish();
 
     // Scan the emitted bytes for the Device opcode (5B 82) to locate VR00.
-    const aml = buf[0..len];
     var device_off: ?usize = null;
     var i: usize = 0;
     while (i + 1 < aml.len) : (i += 1) {
@@ -696,11 +453,13 @@ test "an aml device object decodes back to its resources" {
             found_hid = true;
             body_pos = str_end + 1;
         } else if (ns.segments.len == 1 and std.mem.eql(u8, &ns.segments[0], "_UID")) {
-            // BytePrefix + n
-            try std.testing.expect(aml[value_off] == almanac.aml.encoding.byte_prefix);
-            try testing.expectEqual(@as(u8, 0), aml[value_off + 1]);
+            // AML writes small integers in their shortest form, so zero is `ZeroOp` and one is
+            // `OneOp` rather than a prefixed byte. Read the value rather than the byte, or this
+            // asserts an encoding choice instead of the number it stands for.
+            const read = smallInteger(aml[value_off..]).?;
+            try testing.expectEqual(@as(u64, 0), read.value);
             found_uid = true;
-            body_pos = value_off + 2;
+            body_pos = value_off + read.len;
         } else if (ns.segments.len == 1 and std.mem.eql(u8, &ns.segments[0], "_CRS")) {
             // BufferOp(0x11) + PkgLength + BufferSize + resource bytes.
             const buf_op_off = value_off;
@@ -739,7 +498,7 @@ test "the dsdt carries a virtio-mmio device when one is given" {
     var buf: [4096]u8 align(16) = undefined;
     const base: u64 = 0x80000;
 
-    // Assert that empty virtio yields a DSDT body length equal to s5_aml.len.
+    // Assert that empty virtio yields a DSDT body length equal to the sleep state alone.
     const empty_built = try build(&buf, base, .{});
     const Tables = almanac.TablesGeneric(almanac.OffsetMapper);
     const offset: u64 = @intFromPtr(&buf) -% base;
@@ -747,9 +506,9 @@ test "the dsdt carries a virtio-mmio device when one is given" {
         const tabs = try Tables.init(.{ .offset = offset }, empty_built.rsdp);
         const fadt = (try tabs.findAs(almanac.Fadt)).?;
         const dsdt_addr = fadt.preferredDsdt();
-        const dsdt_bytes = (almanac.OffsetMapper{ .offset = offset }).slice(dsdt_addr, 36 + s5_aml.len + 1);
+        const dsdt_bytes = (almanac.OffsetMapper{ .offset = offset }).slice(dsdt_addr, 36 + s5_body_len + 1);
         const body_len = std.mem.readInt(u32, dsdt_bytes[4..8], .little) - 36;
-        try testing.expectEqual(@as(u32, s5_aml.len), body_len);
+        try testing.expectEqual(@as(u32, s5_body_len), body_len);
     }
 
     // Build with one virtio device.
@@ -801,7 +560,9 @@ test "the dsdt carries a virtio-mmio device when one is given" {
             found_hid = true;
             body_pos = str_end + 1;
         } else if (ns.segments.len == 1 and std.mem.eql(u8, &ns.segments[0], "_UID")) {
-            body_pos = value_off + 2;
+            // Shortest form again, so zero is one byte and not two. Advancing by a fixed two here
+            // walked past the next object and the loop gave up before reaching `_CRS`.
+            body_pos = value_off + smallInteger(aml_body[value_off..]).?.len;
         } else if (ns.segments.len == 1 and std.mem.eql(u8, &ns.segments[0], "_CRS")) {
             const buf_op_off = value_off;
             try std.testing.expect(aml_body[buf_op_off] == 0x11);
@@ -982,15 +743,15 @@ test "the dsdt names the tpm as an msft0101 device" {
         try std.testing.expect(found_msft);
     }
 
-    // Build with neither: DSDT body == s5_aml exactly.
+    // Build with neither: DSDT body is the sleep state alone.
     const built3 = try build(&buf, base, .{});
     {
         const tabs = try Tables.init(.{ .offset = offset }, built3.rsdp);
         const fadt = (try tabs.findAs(almanac.Fadt)).?;
         const dsdt_addr = fadt.preferredDsdt();
-        const dsdt_bytes = (almanac.OffsetMapper{ .offset = offset }).slice(dsdt_addr, 36 + s5_aml.len);
+        const dsdt_bytes = (almanac.OffsetMapper{ .offset = offset }).slice(dsdt_addr, 36 + s5_body_len);
         const body_len = std.mem.readInt(u32, dsdt_bytes[4..8], .little) - 36;
-        try testing.expectEqual(@as(u32, s5_aml.len), body_len);
+        try testing.expectEqual(@as(u32, s5_body_len), body_len);
     }
 }
 

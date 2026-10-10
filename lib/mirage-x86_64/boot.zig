@@ -14,7 +14,7 @@ const Manifest = attest.Manifest;
 const acpi = @import("mirage-acpi");
 const platform = @import("platform.zig");
 
-pub const Error = error{ TooSmall, NotABzImage, UnsupportedProtocol, No64BitEntry, CmdlineTooLong, TooManyRegions, InitrdTooLarge, OutOfSpace } || GuestMemory.Error;
+pub const Error = error{ TooSmall, NotABzImage, UnsupportedProtocol, No64BitEntry, CmdlineTooLong, TooManyRegions, InitrdTooLarge, OutOfSpace, BadAml } || GuestMemory.Error;
 
 /// The fields the boot path needs, laid out exactly as the spec places them
 /// starting at file offset 0x1f1.  Offsets in comments are relative to 0x1f1.
