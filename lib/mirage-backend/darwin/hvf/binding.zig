@@ -123,10 +123,12 @@ pub const Api = struct {
         const handle = dlopen(library, resolve_now) orelse return Error.NoHypervisor;
 
         var api: Api = undefined;
-        inline for (@typeInfo(Api).@"struct".fields) |field| {
+        const info = @typeInfo(Api).@"struct";
+        // Names and types are parallel lists rather than one list of fields.
+        inline for (info.field_names, info.field_types) |name, Field| {
             // Every field is named for its symbol with the `hv_` prefix removed, so
             // the two cannot drift apart.
-            @field(api, field.name) = try find(handle, field.type, "hv_" ++ field.name);
+            @field(api, name) = try find(handle, Field, "hv_" ++ name);
         }
         return api;
     }

@@ -32,7 +32,7 @@ pub fn request(comptime dir: Dir, comptime T: type, comptime nr: u8) u32 {
     comptime {
         if (size > size_mask) @compileError("ioctl argument is too large for the size field");
     }
-    return (@as(u32, @intFromEnum(dir)) << dir_shift) |
+    return (@as(u32, @backingInt(dir)) << dir_shift) |
         (@as(u32, size) << size_shift) |
         (@as(u32, driver) << type_shift) |
         @as(u32, nr);

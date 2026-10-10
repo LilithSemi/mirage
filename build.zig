@@ -19,15 +19,11 @@ pub fn build(b: *std.Build) void {
     const dtree = b.dependency("dtree", .{
         .target = target,
         .optimize = optimize,
-        .@"no-tests" = true,
-        .@"no-docs" = true,
     }).module("dtree");
 
     const almanac = b.dependency("almanac", .{
         .target = target,
         .optimize = optimize,
-        .@"no-tests" = true,
-        .@"no-docs" = true,
     }).module("almanac");
 
     // Which kernel the gates boot and how many cpus they give the guest. Declared once: a word a
@@ -258,11 +254,15 @@ pub fn build(b: *std.Build) void {
         // the same two processes a harness would rather than a loop of its own.
         const session_options = b.addOptions();
         session_options.addOption([]const u8, "kernel_path", kernel_path);
-        // Where the runner is. A gate that runs on this machine finds it where it was installed; one
-        // built here and run somewhere else is told, because the path it would find is this machine's.
-        const runner_path = b.option([]const u8, "runner", "Where the runner is, for a gate run elsewhere") orelse
-            b.getInstallPath(.bin, "mirage");
-        session_options.addOption([]const u8, "mirage_path", runner_path);
+        // Where the runner is. A gate built here and run on another machine is told, because no path
+        // this one can compute means anything there. Otherwise it is the binary this build emits,
+        // which brings its own dependency with it: the gate needs no install, and cannot be handed a
+        // binary something else installed over the top of.
+        if (b.option([]const u8, "runner", "Where the runner is, for a gate run elsewhere")) |given| {
+            session_options.addOption([]const u8, "mirage_path", given);
+        } else {
+            session_options.addOptionPath("mirage_path", mirage.getEmittedBin());
+        }
         // The same option the boot gate uses, so one number covers both. A session with more than one
         // cpu is the interesting case: every cpu runs the loop that pumps the session, and they share it.
         session_options.addOption(u32, "cpus", cpus);
@@ -288,7 +288,6 @@ pub fn build(b: *std.Build) void {
         });
         const session_tests = b.addTest(.{ .name = "session", .root_module = session_module });
         const session_gate = b.step("test-session", "Hold a guest up for another program");
-        session_gate.dependOn(b.getInstallStep());
         session_gate.dependOn(&b.addRunArtifact(session_tests).step);
     }
 
@@ -575,7 +574,7 @@ const Adder = struct {
             self.test_step.dependOn(&run.step);
         } else {
             // `-fno-emit-bin`. The analysis is the check.
-            tests.generated_bin = null;
+            tests.generated_bin = .none;
             self.test_step.dependOn(&tests.step);
         }
 

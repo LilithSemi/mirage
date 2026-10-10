@@ -898,7 +898,7 @@ fn setattr(self: *Export, into: []u8, head: wire.Header, body: []const u8) usize
             return self.refuse(into, head, wire.errnoFor(failure));
         defer file.close(self.io);
         // Only the bits that say who may read and write, because that is all a mode means here.
-        file.setPermissions(self.io, @enumFromInt(asked.mode & 0o777)) catch {};
+        file.setPermissions(self.io, @fromBackingInt(@intCast(asked.mode & 0o777))) catch {};
     }
 
     const attr = self.attrOf(path, self.mayWrite(head.nodeid)) orelse
@@ -924,7 +924,7 @@ fn makeDirectory(self: *Export, into: []u8, head: wire.Header, body: []const u8)
     var room: [4096]u8 = undefined;
     const path = self.pathOf(head.nodeid, asked.name, &room) orelse
         return self.refuse(into, head, wire.err.noent);
-    std.Io.Dir.createDirAbsolute(self.io, path, @enumFromInt(asked.mode & 0o777)) catch |failure|
+    std.Io.Dir.createDirAbsolute(self.io, path, @fromBackingInt(@intCast(asked.mode & 0o777))) catch |failure|
         return self.refuse(into, head, wire.errnoFor(failure));
 
     const attr = self.attrOf(path, self.mayWrite(head.nodeid)) orelse
@@ -1267,7 +1267,7 @@ fn ask(into: []u8, op: wire.Op, nodeid: u64, body: []const u8) []const u8 {
     @memset(into[0..wire.Header.size], 0);
     const total = wire.Header.size + body.len;
     std.mem.writeInt(u32, into[0..4], @intCast(total), .little);
-    std.mem.writeInt(u32, into[4..8], @intFromEnum(op), .little);
+    std.mem.writeInt(u32, into[4..8], @backingInt(op), .little);
     std.mem.writeInt(u64, into[8..16], 1, .little);
     std.mem.writeInt(u64, into[16..24], nodeid, .little);
     @memcpy(into[wire.Header.size..][0..body.len], body);
@@ -1464,8 +1464,9 @@ test "nothing a guest sends can change what is exported" {
 
     // Every way of changing something is refused the way a read only mount refuses it, so the guest's
     // own kernel reports it as the filesystem being read only rather than as a fault.
+    const long_name: [64]u8 = @splat('x');
     for ([_]wire.Op{ .write, .setattr, .create }) |op| {
-        const wrote = offered.answer(ask(&request, op, try nodeOf(&offered, "store", &request, &answered), "x" ** 64), &answered);
+        const wrote = offered.answer(ask(&request, op, try nodeOf(&offered, "store", &request, &answered), &long_name), &answered);
         try std.testing.expectEqual(@as(?i32, wire.err.rofs), refusalIn(answered[0..wrote]));
     }
 

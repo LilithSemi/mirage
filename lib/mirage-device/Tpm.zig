@@ -249,13 +249,13 @@ fn read(ctx: *anyopaque, offset: u64, size: Bus.Size) u64 {
             // A driver often reads the status and the burst count as one word, so the count sits
             // where the specification puts it: in the two bytes above the status.
             const status: u32 = self.statusByte();
-            if (@intFromEnum(size) >= 4) break :blk status | (@as(u32, self.burst()) << 8);
+            if (@backingInt(size) >= 4) break :blk status | (@as(u32, self.burst()) << 8);
             break :blk status;
         },
         reg.burst_count => self.burst() & 0xff,
         reg.burst_count + 1 => self.burst() >> 8,
         reg.interface_capability => capability,
-        reg.data_fifo, reg.extended_fifo => self.take(@intFromEnum(size)),
+        reg.data_fifo, reg.extended_fifo => self.take(@backingInt(size)),
         reg.vendor => vendor_id,
         reg.revision => revision_id,
         reg.int_enable, reg.int_status, reg.int_vector => 0,
@@ -306,7 +306,7 @@ fn write(ctx: *anyopaque, offset: u64, size: Bus.Size, value: u64) void {
             }
         },
         reg.status => self.command(@truncate(value)),
-        reg.data_fifo, reg.extended_fifo => self.put(value, @intFromEnum(size)),
+        reg.data_fifo, reg.extended_fifo => self.put(value, @backingInt(size)),
         else => {},
     }
 }

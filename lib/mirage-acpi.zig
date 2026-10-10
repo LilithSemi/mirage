@@ -243,12 +243,20 @@ fn emitDevice(buf: []u8, index: u8, dev: VirtioDevice) usize {
     // BufferOp PkgLength content = BufferSize(2) + resources(23) = 25; total = 26 = 0x1A.
     var crs: [32]u8 = undefined;
     var cp: usize = 0;
-    crs[cp] = 0x08; cp += 1; // NameOp
-    crs[cp] = 0x5F; crs[cp + 1] = 0x43; crs[cp + 2] = 0x52; crs[cp + 3] = 0x53; cp += 4; // _CRS
-    crs[cp] = 0x11; cp += 1; // BufferOp
+    crs[cp] = 0x08;
+    cp += 1; // NameOp
+    crs[cp] = 0x5F;
+    crs[cp + 1] = 0x43;
+    crs[cp + 2] = 0x52;
+    crs[cp + 3] = 0x53;
+    cp += 4; // _CRS
+    crs[cp] = 0x11;
+    cp += 1; // BufferOp
     cp += writePkgLength(crs[cp..], 2 + crs_resources_len); // BufferSize(2) + resources(23)
-    crs[cp] = almanac.aml.encoding.byte_prefix; cp += 1;
-    crs[cp] = crs_resources_len; cp += 1; // 0x17 = 23
+    crs[cp] = almanac.aml.encoding.byte_prefix;
+    cp += 1;
+    crs[cp] = crs_resources_len;
+    cp += 1; // 0x17 = 23
     @memcpy(crs[cp .. cp + crs_resources_len], &resources);
     cp += crs_resources_len;
     const crs_len = cp;
@@ -258,16 +266,22 @@ fn emitDevice(buf: []u8, index: u8, dev: VirtioDevice) usize {
         0x08, // NameOp
         0x5F, 0x48, 0x49, 0x44, // _HID
         0x0D, // StringPrefix
-        'L', 'N', 'R', 'O', '0', '0', '0', '5',
+        'L',
+        'N',
+        'R',
+        'O',
+        '0',
+        '0',
+        '0',
+        '5',
         0x00, // NUL
     };
 
     // Name(_UID,n): 08 + _UID + BytePrefix + n = 7 bytes.
     const uid = [7]u8{
         0x08, // NameOp
-        0x5F, 0x55, 0x49, 0x44, // _UID
-        almanac.aml.encoding.byte_prefix,
-        index,
+        0x5F,                             0x55,  0x49, 0x44, // _UID
+        almanac.aml.encoding.byte_prefix, index,
     };
 
     // Device = 5B 82 + PkgLength(NameSeg(4) + body) + NameSeg + body.
@@ -275,16 +289,25 @@ fn emitDevice(buf: []u8, index: u8, dev: VirtioDevice) usize {
     const pkg_content = 4 + body_len; // NameSeg(4) + body
 
     var p: usize = 0;
-    buf[p] = 0x5B; p += 1; // ExtOpPrefix
-    buf[p] = 0x82; p += 1; // DeviceOp
+    buf[p] = 0x5B;
+    p += 1; // ExtOpPrefix
+    buf[p] = 0x82;
+    p += 1; // DeviceOp
     p += writePkgLength(buf[p..], pkg_content);
-    buf[p] = 'V'; p += 1;
-    buf[p] = 'R'; p += 1;
-    buf[p] = '0' + (index / 10); p += 1;
-    buf[p] = '0' + (index % 10); p += 1;
-    @memcpy(buf[p .. p + hid.len], &hid); p += hid.len;
-    @memcpy(buf[p .. p + uid.len], &uid); p += uid.len;
-    @memcpy(buf[p .. p + crs_len], crs[0..crs_len]); p += crs_len;
+    buf[p] = 'V';
+    p += 1;
+    buf[p] = 'R';
+    p += 1;
+    buf[p] = '0' + (index / 10);
+    p += 1;
+    buf[p] = '0' + (index % 10);
+    p += 1;
+    @memcpy(buf[p .. p + hid.len], &hid);
+    p += hid.len;
+    @memcpy(buf[p .. p + uid.len], &uid);
+    p += uid.len;
+    @memcpy(buf[p .. p + crs_len], crs[0..crs_len]);
+    p += crs_len;
     return p;
 }
 
@@ -300,12 +323,19 @@ pub fn emitSystemBus(buf: []u8, devs: []const VirtioDevice) usize {
     // Scope(\_SB_): 10 + PkgLength(over \_SB_ name(5) + devices) + \_SB_(5) + devices
     const scope_content = 5 + dev_total; // \_SB_(5) + devices
     var p: usize = 0;
-    buf[p] = 0x10; p += 1; // ScopeOp
+    buf[p] = 0x10;
+    p += 1; // ScopeOp
     p += writePkgLength(buf[p..], scope_content);
     // \_SB_ = root_char + "_SB_" = 5C 5F 53 42 5F
-    buf[p] = 0x5C; p += 1; // root_char '\'
-    buf[p] = 0x5F; buf[p+1] = 0x53; buf[p+2] = 0x42; buf[p+3] = 0x5F; p += 4; // _SB_
-    @memcpy(buf[p..p+dev_total], scratch[0..dev_total]); p += dev_total;
+    buf[p] = 0x5C;
+    p += 1; // root_char '\'
+    buf[p] = 0x5F;
+    buf[p + 1] = 0x53;
+    buf[p + 2] = 0x42;
+    buf[p + 3] = 0x5F;
+    p += 4; // _SB_
+    @memcpy(buf[p .. p + dev_total], scratch[0..dev_total]);
+    p += dev_total;
     return p;
 }
 
@@ -327,12 +357,20 @@ fn emitTpmDevice(buf: []u8, control: u32) usize {
     // BufferPkg content = BufferSize(2) + resources(14) = 16; total1 = 17 < 0x40.
     var crs: [32]u8 = undefined;
     var cp: usize = 0;
-    crs[cp] = 0x08; cp += 1; // NameOp
-    crs[cp] = 0x5F; crs[cp + 1] = 0x43; crs[cp + 2] = 0x52; crs[cp + 3] = 0x53; cp += 4; // _CRS
-    crs[cp] = 0x11; cp += 1; // BufferOp
+    crs[cp] = 0x08;
+    cp += 1; // NameOp
+    crs[cp] = 0x5F;
+    crs[cp + 1] = 0x43;
+    crs[cp + 2] = 0x52;
+    crs[cp + 3] = 0x53;
+    cp += 4; // _CRS
+    crs[cp] = 0x11;
+    cp += 1; // BufferOp
     cp += writePkgLength(crs[cp..], 2 + tpm_crs_resources_len); // 16
-    crs[cp] = almanac.aml.encoding.byte_prefix; cp += 1;
-    crs[cp] = tpm_crs_resources_len; cp += 1; // 0x0E = 14
+    crs[cp] = almanac.aml.encoding.byte_prefix;
+    cp += 1;
+    crs[cp] = tpm_crs_resources_len;
+    cp += 1; // 0x0E = 14
     @memcpy(crs[cp .. cp + tpm_crs_resources_len], &resources);
     cp += tpm_crs_resources_len;
     const crs_len = cp;
@@ -342,7 +380,14 @@ fn emitTpmDevice(buf: []u8, control: u32) usize {
         0x08, // NameOp
         0x5F, 0x48, 0x49, 0x44, // _HID
         0x0D, // StringPrefix
-        'M', 'S', 'F', 'T', '0', '1', '0', '1',
+        'M',
+        'S',
+        'F',
+        'T',
+        '0',
+        '1',
+        '0',
+        '1',
         0x00, // NUL
     };
 
@@ -351,15 +396,23 @@ fn emitTpmDevice(buf: []u8, control: u32) usize {
     const pkg_content = 4 + body_len; // NameSeg(4) + body
 
     var p: usize = 0;
-    buf[p] = 0x5B; p += 1; // ExtOpPrefix
-    buf[p] = 0x82; p += 1; // DeviceOp
+    buf[p] = 0x5B;
+    p += 1; // ExtOpPrefix
+    buf[p] = 0x82;
+    p += 1; // DeviceOp
     p += writePkgLength(buf[p..], pkg_content);
-    buf[p] = 'T'; p += 1;
-    buf[p] = 'P'; p += 1;
-    buf[p] = 'M'; p += 1;
-    buf[p] = '0'; p += 1;
-    @memcpy(buf[p .. p + hid.len], &hid); p += hid.len;
-    @memcpy(buf[p .. p + crs_len], crs[0..crs_len]); p += crs_len;
+    buf[p] = 'T';
+    p += 1;
+    buf[p] = 'P';
+    p += 1;
+    buf[p] = 'M';
+    p += 1;
+    buf[p] = '0';
+    p += 1;
+    @memcpy(buf[p .. p + hid.len], &hid);
+    p += hid.len;
+    @memcpy(buf[p .. p + crs_len], crs[0..crs_len]);
+    p += crs_len;
     return p;
 }
 
@@ -371,11 +424,18 @@ pub fn emitTpmScope(buf: []u8, control: u32) usize {
     // Scope(\_SB_): ScopeOp + PkgLength + \_SB_(5) + device
     const scope_content = 5 + dev_len;
     var p: usize = 0;
-    buf[p] = 0x10; p += 1; // ScopeOp
+    buf[p] = 0x10;
+    p += 1; // ScopeOp
     p += writePkgLength(buf[p..], scope_content);
-    buf[p] = 0x5C; p += 1; // root_char '\'
-    buf[p] = 0x5F; buf[p + 1] = 0x53; buf[p + 2] = 0x42; buf[p + 3] = 0x5F; p += 4; // _SB_
-    @memcpy(buf[p .. p + dev_len], scratch[0..dev_len]); p += dev_len;
+    buf[p] = 0x5C;
+    p += 1; // root_char '\'
+    buf[p] = 0x5F;
+    buf[p + 1] = 0x53;
+    buf[p + 2] = 0x42;
+    buf[p + 3] = 0x5F;
+    p += 4; // _SB_
+    @memcpy(buf[p .. p + dev_len], scratch[0..dev_len]);
+    p += dev_len;
     return p;
 }
 
@@ -410,7 +470,7 @@ pub fn build(buf: []u8, base_phys: u64, opts: Options) !Built {
 
     // Build the FADT body by hand because almanac's fadt() helper does not set
     // the sleep-control/status registers.
-    var fadt_bytes = [_]u8{0} ** fadt_size;
+    var fadt_bytes: [fadt_size]u8 = @splat(0);
 
     // SDT header (36 bytes): signature, length, revision, checksum (0 for now),
     // OEM id, OEM table id, OEM revision, creator id, creator revision.
@@ -453,7 +513,7 @@ pub fn build(buf: []u8, base_phys: u64, opts: Options) !Built {
     const madt_max_cpus: u32 = 256;
     std.debug.assert(opts.cpus <= madt_max_cpus);
     const madt_max_body = @sizeOf(MadtHeader) + madt_max_cpus * @sizeOf(LocalApicEntry) + @sizeOf(IoApicEntry);
-    var madt_body_buf = [_]u8{0} ** madt_max_body;
+    var madt_body_buf: [madt_max_body]u8 = @splat(0);
     const madt_body = madt_body_buf[0..madtBodyLen(opts.cpus)];
     writeMadtBody(madt_body, opts.cpus);
     const madt_phys = try b.addTable("APIC", madt_body, 4);
@@ -461,13 +521,15 @@ pub fn build(buf: []u8, base_phys: u64, opts: Options) !Built {
     // Build the XSDT entry list. Max 3: FADT, MADT, and optionally TPM2.
     var xsdt_entries: [3]u64 = undefined;
     var n: usize = 0;
-    xsdt_entries[n] = fadt_phys; n += 1;
-    xsdt_entries[n] = madt_phys; n += 1;
+    xsdt_entries[n] = fadt_phys;
+    n += 1;
+    xsdt_entries[n] = madt_phys;
+    n += 1;
     if (opts.tpm) |t| {
         // The TPM2 table, hand-built to the TCG2 layout the kernel reads the event log from: the log
         // fields sit at offset 64 (after a 12-byte start-method area), for a 76-byte table. almanac's
         // tpm2() places them at 52, which the kernel's tpm_read_log_acpi does not read.
-        var tpm2_bytes = [_]u8{0} ** 76;
+        var tpm2_bytes: [76]u8 = @splat(0);
         @memcpy(tpm2_bytes[0..4], "TPM2");
         std.mem.writeInt(u32, tpm2_bytes[4..8], 76, .little);
         tpm2_bytes[8] = 4; // revision
@@ -483,7 +545,8 @@ pub fn build(buf: []u8, base_phys: u64, opts: Options) !Built {
         std.mem.writeInt(u64, tpm2_bytes[68..76], t.log_addr, .little); // log_area_start_address
         tpm2_bytes[9] = almanac.checksum.compute(&tpm2_bytes);
         const tpm2_phys = try b.addRaw(&tpm2_bytes);
-        xsdt_entries[n] = tpm2_phys; n += 1;
+        xsdt_entries[n] = tpm2_phys;
+        n += 1;
     }
 
     const xsdt_phys = try b.xsdt(xsdt_entries[0..n]);

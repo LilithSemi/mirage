@@ -131,7 +131,7 @@ fn armTicks(interval_ms: isize) void {
         .usec = @rem(interval_ms, 1000) * std.time.us_per_ms,
     };
     const val: itimerval = .{ .it_interval = every, .it_value = every };
-    _ = linux.syscall3(.setitimer, @bitCast(@as(isize, @intFromEnum(linux.ITIMER.REAL))), @intFromPtr(&val), 0);
+    _ = linux.syscall3(.setitimer, @bitCast(@as(isize, @backingInt(linux.ITIMER.REAL))), @intFromPtr(&val), 0);
 }
 
 /// Map the kernel this machine booted, or nothing when the path is unset or cannot be read.
@@ -1488,10 +1488,10 @@ fn spawnSwtpm(dir_z: [*:0]const u8, swtpm_z: [*:0]const u8, state_arg: [*:0]cons
     if (@as(isize, @bitCast(pid)) < 0) return null;
     if (pid == 0) {
         const argv = [_:null]?[*:0]const u8{
-            swtpm_z,     "socket",     "--tpm2",
-            "--tpmstate", state_arg,   "--server",
-            server_arg,  "--ctrl",     ctrl_arg,
-            "--flags",   "not-need-init,startup-clear",
+            swtpm_z,      "socket",                      "--tpm2",
+            "--tpmstate", state_arg,                     "--server",
+            server_arg,   "--ctrl",                      ctrl_arg,
+            "--flags",    "not-need-init,startup-clear",
         };
         const envp = [_:null]?[*:0]const u8{};
         _ = linux.execve(swtpm_z, &argv, &envp);

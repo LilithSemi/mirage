@@ -169,7 +169,7 @@ pub fn write(parts: Parts, out: []u8) Error!usize {
     std.mem.writeInt(u32, out[at..][0..4], version, .little);
     at += 4;
     // The tag is self-consistent within one build; snapshots only move between identical builds.
-    std.mem.writeInt(u16, out[at..][0..2], @intFromEnum(builtin.cpu.arch), .little);
+    std.mem.writeInt(u16, out[at..][0..2], @backingInt(builtin.cpu.arch), .little);
     at += 2;
     std.mem.writeInt(u64, out[at..][0..8], parts.ram_base, .little);
     at += 8;
@@ -392,7 +392,7 @@ test "a snapshot made under another architecture is refused by name" {
     var buffer: [512]u8 = undefined;
     const used = try write(parts, &buffer);
     // Overwrite the arch tag with a tag from a foreign architecture.
-    std.mem.writeInt(u16, buffer[arch_offset..][0..2], @intFromEnum(other), .little);
+    std.mem.writeInt(u16, buffer[arch_offset..][0..2], @backingInt(other), .little);
 
     var queues: [max_queues]QueueState = undefined;
     try testing.expectError(Error.ForeignArchitecture, parse(buffer[0..used], &queues));

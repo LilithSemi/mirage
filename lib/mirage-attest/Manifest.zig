@@ -66,7 +66,7 @@ pub fn seal(self: *Manifest) void {
 pub fn root(self: *const Manifest) [digest_length]u8 {
     var hash: Sha384 = .init(.{});
     for (self.entries.items) |entry| {
-        hash.update(&std.mem.toBytes(std.mem.nativeToLittle(u16, @intFromEnum(entry.tag))));
+        hash.update(&std.mem.toBytes(std.mem.nativeToLittle(u16, @backingInt(entry.tag))));
         hash.update(&entry.digest);
     }
     var out: [digest_length]u8 = undefined;

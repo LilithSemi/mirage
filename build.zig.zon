@@ -1,14 +1,15 @@
 .{
     .name = .mirage,
-    .version = "0.16.0",
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .dtree = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/dtree.git#6ddd53fc04c7480c40557903766c4e8903cd8139",
-            .hash = "dtree-0.1.0-76to8CvlAAD18WmH5ygUHdUtrI3XMYabapbwt1qe2bn1",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/dtree.git#63fe0a7292ca2df829bc3d66d86291416c657cd7",
+            .hash = "dtree-0.1.0-76to8F7kAAD-G7jPybrgZuWwvRQV8SmMXQilS86JCIpA",
         },
         .almanac = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/almanac.git#d2f7eab8fe7c1ec2d6e6e4d6363c60275fa363fd",
-            .hash = "almanac-0.1.0-9SzmcDvHBACa842eo4EKst73ItgkAcNlkpO45Ob4Kiib",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/almanac.git#70e5ea998a320c441cfd7b68c71d94888d246551",
+            .hash = "almanac-0.1.0-9SzmcJ8pBgC05r2UQazhuVhCuMRbSS_zhnYSEJmrcqG4",
         },
     },
     .paths = .{""},

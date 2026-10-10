@@ -102,7 +102,7 @@ pub const Packet = struct {
             .kind = std.mem.readInt(u16, bytes[28..30], .little),
             // The operation comes from the guest, so one this device has no name for
             // stays a number rather than becoming an invalid enum.
-            .op = @enumFromInt(std.mem.readInt(u16, bytes[30..32], .little)),
+            .op = @fromBackingInt(@intCast(std.mem.readInt(u16, bytes[30..32], .little))),
             .flags = std.mem.readInt(u32, bytes[32..36], .little),
             .buf_alloc = std.mem.readInt(u32, bytes[36..40], .little),
             .fwd_cnt = std.mem.readInt(u32, bytes[40..44], .little),
@@ -116,7 +116,7 @@ pub const Packet = struct {
         std.mem.writeInt(u32, bytes[20..24], self.dst_port, .little);
         std.mem.writeInt(u32, bytes[24..28], self.len, .little);
         std.mem.writeInt(u16, bytes[28..30], self.kind, .little);
-        std.mem.writeInt(u16, bytes[30..32], @intFromEnum(self.op), .little);
+        std.mem.writeInt(u16, bytes[30..32], @backingInt(self.op), .little);
         std.mem.writeInt(u32, bytes[32..36], self.flags, .little);
         std.mem.writeInt(u32, bytes[36..40], self.buf_alloc, .little);
         std.mem.writeInt(u32, bytes[40..44], self.fwd_cnt, .little);
@@ -1016,7 +1016,7 @@ test "an operation this device has no name for is dropped rather than guessed at
     _ = fixture.received();
 
     var packet = request();
-    packet.op = @enumFromInt(0x4141);
+    packet.op = @fromBackingInt(@intCast(0x4141));
     try fixture.send(packet, &.{});
     _ = try fixture.vsock.serve(&fixture.memory);
 

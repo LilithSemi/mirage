@@ -127,7 +127,7 @@ fn armTicks(interval_ms: isize) void {
         .nsec = @rem(interval_ms, 1000) * std.time.us_per_ms,
     };
     const spec: linux.itimerspec = .{ .it_interval = every, .it_value = every };
-    _ = linux.setitimer(@intFromEnum(linux.ITIMER.REAL), &spec, null);
+    _ = linux.setitimer(@backingInt(linux.ITIMER.REAL), &spec, null);
 }
 
 /// The lock the CPUs of one guest share. A spin lock, because it is held only long enough to serve

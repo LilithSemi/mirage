@@ -63,7 +63,7 @@ pub const Report = struct {
 };
 
 fn extension(fd: std.posix.fd_t, cap: Cap) ioctl.Error!usize {
-    return ioctl.call(fd, comptime ioctl.request(.none, void, nr.check_extension), @intFromEnum(cap));
+    return ioctl.call(fd, comptime ioctl.request(.none, void, nr.check_extension), @backingInt(cap));
 }
 
 /// Create guest memory of one page with these flags, and report the file descriptor.

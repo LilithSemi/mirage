@@ -312,7 +312,7 @@ pub fn buildBootParams(
 }
 
 test "a valid 64-bit bzImage header parses" {
-    var img = [_]u8{0} ** 2048;
+    var img: [2048]u8 = @splat(0);
     img[0x1f1] = 4; // setup_sects
     std.mem.writeInt(u16, img[0x1fe..][0..2], 0xaa55, .little); // boot_flag
     std.mem.writeInt(u32, img[0x202..][0..4], 0x53726448, .little); // "HdrS"
@@ -324,12 +324,12 @@ test "a valid 64-bit bzImage header parses" {
 }
 
 test "a header without HdrS is refused" {
-    var img = [_]u8{0} ** 2048;
+    var img: [2048]u8 = @splat(0);
     try testing.expectError(error.NotABzImage, parse(&img));
 }
 
 test "an old protocol or no 64-bit entry is refused" {
-    var img = [_]u8{0} ** 2048;
+    var img: [2048]u8 = @splat(0);
     std.mem.writeInt(u32, img[0x202..][0..4], 0x53726448, .little);
     std.mem.writeInt(u16, img[0x206..][0..2], 0x020a, .little); // 2.10, too old
     try testing.expectError(error.UnsupportedProtocol, parse(&img));
@@ -804,7 +804,7 @@ test "a launch places the protected mode kernel and names the zero page" {
     var manifest: Manifest = .{};
     defer manifest.deinit(gpa);
 
-    var img = [_]u8{0} ** 4096;
+    var img: [4096]u8 = @splat(0);
     img[0x1f1] = 4; // setup_sects, so the protected mode half starts at (4 + 1) * 512
     std.mem.writeInt(u16, img[0x1fe..][0..2], 0xaa55, .little);
     std.mem.writeInt(u32, img[0x202..][0..4], 0x53726448, .little); // "HdrS"
@@ -993,7 +993,7 @@ test "x86 boot reserves a measurement log and names it in the tpm2 table" {
     var memory: GuestMemory = .{ .regions = &regions };
 
     // Minimal valid bzImage header.
-    var img = [_]u8{0} ** 4096;
+    var img: [4096]u8 = @splat(0);
     img[0x1f1] = 4;
     std.mem.writeInt(u16, img[0x1fe..][0..2], 0xaa55, .little);
     std.mem.writeInt(u32, img[0x202..][0..4], 0x53726448, .little);
@@ -1032,10 +1032,13 @@ test "x86 boot reserves a measurement log and names it in the tpm2 table" {
     const tabs = try Tables.init(.{ .offset = offset }, rsdp_addr);
     const tpm2 = (try tabs.findAs(@import("almanac").Tpm2)).?;
 
-    // The TPM2 table must name log_base and the correct log length. The log fields are read at the
-    // TCG2 offsets the kernel uses (64 and 68), not almanac's 52/56.
-    try testing.expectEqual(@as(u32, @intCast(expected_log_len)), std.mem.readInt(u32, tpm2.bytes[64..68], .little));
-    try testing.expectEqual(@as(u64, log_base), std.mem.readInt(u64, tpm2.bytes[68..76], .little));
+    // The TPM2 table must name log_base and the correct log length. Read through the accessors
+    // rather than at byte offsets: a test that reads bytes it wrote, at offsets it chose, cannot
+    // notice the two drifting apart. The accessors gate on the table's length, so a table too short
+    // to hold these reads as absent rather than as whatever is in those bytes. TCG revision 4 puts
+    // them at 64 and 68, which is the cross-check if either side ever moves.
+    try testing.expectEqual(@as(?u32, @intCast(expected_log_len)), tpm2.logAreaLength());
+    try testing.expectEqual(@as(?u64, log_base), tpm2.logAreaStart());
     try testing.expectEqual(@as(u64, 0xfed4_0000), tpm2.controlAddress());
 
     // An e820 entry of type 2 (reserved) must cover [log_base, log_base+log_len).
@@ -1080,7 +1083,7 @@ test "x86 boot with tpm=false produces no tpm2 table and null log" {
     var regions = [_]GuestMemory.Region{.{ .gpa = ram_base, .len = backing.len, .backing = .{ .shared = backing } }};
     var memory: GuestMemory = .{ .regions = &regions };
 
-    var img = [_]u8{0} ** 4096;
+    var img: [4096]u8 = @splat(0);
     img[0x1f1] = 4;
     std.mem.writeInt(u16, img[0x1fe..][0..2], 0xaa55, .little);
     std.mem.writeInt(u32, img[0x202..][0..4], 0x53726448, .little);

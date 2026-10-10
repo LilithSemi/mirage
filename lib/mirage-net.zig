@@ -106,7 +106,7 @@ pub const Ethernet = struct {
             .source = frame[6..12].*,
             // The two bytes come from the guest, so one this code has no name for stays a
             // number rather than becoming an invalid enum.
-            .kind = @enumFromInt(std.mem.readInt(u16, frame[12..14], .big)),
+            .kind = @fromBackingInt(@intCast(std.mem.readInt(u16, frame[12..14], .big))),
         };
     }
 
@@ -120,7 +120,7 @@ pub const Ethernet = struct {
         if (into.len < header_size) return Error.TooShort;
         @memcpy(into[0..6], &self.destination);
         @memcpy(into[6..12], &self.source);
-        std.mem.writeInt(u16, into[12..14], @intFromEnum(self.kind), .big);
+        std.mem.writeInt(u16, into[12..14], @backingInt(self.kind), .big);
         return header_size;
     }
 };
@@ -147,11 +147,11 @@ pub const Arp = struct {
         // Only ethernet and only IP version four. Anything else is a packet this code would
         // read the wrong fields out of.
         if (std.mem.readInt(u16, packet[0..2], .big) != hardware_ethernet) return Error.Unsupported;
-        if (std.mem.readInt(u16, packet[2..4], .big) != @intFromEnum(EtherType.ip4)) return Error.Unsupported;
+        if (std.mem.readInt(u16, packet[2..4], .big) != @backingInt(EtherType.ip4)) return Error.Unsupported;
         if (packet[4] != 6 or packet[5] != 4) return Error.Unsupported;
 
         return .{
-            .operation = @enumFromInt(std.mem.readInt(u16, packet[6..8], .big)),
+            .operation = @fromBackingInt(@intCast(std.mem.readInt(u16, packet[6..8], .big))),
             .sender_mac = packet[8..14].*,
             .sender_ip = packet[14..18].*,
             .target_mac = packet[18..24].*,
@@ -162,10 +162,10 @@ pub const Arp = struct {
     pub fn write(self: Arp, into: []u8) Error!usize {
         if (into.len < packet_size) return Error.TooShort;
         std.mem.writeInt(u16, into[0..2], hardware_ethernet, .big);
-        std.mem.writeInt(u16, into[2..4], @intFromEnum(EtherType.ip4), .big);
+        std.mem.writeInt(u16, into[2..4], @backingInt(EtherType.ip4), .big);
         into[4] = 6;
         into[5] = 4;
-        std.mem.writeInt(u16, into[6..8], @intFromEnum(self.operation), .big);
+        std.mem.writeInt(u16, into[6..8], @backingInt(self.operation), .big);
         @memcpy(into[8..14], &self.sender_mac);
         @memcpy(into[14..18], &self.sender_ip);
         @memcpy(into[18..24], &self.target_mac);
@@ -213,7 +213,7 @@ pub const Ip4Header = struct {
         return .{
             .source = packet[12..16].*,
             .destination = packet[16..20].*,
-            .protocol = @enumFromInt(packet[9]),
+            .protocol = @fromBackingInt(@intCast(packet[9])),
             .header_size = size,
             .payload_size = total - size,
             .identification = std.mem.readInt(u16, packet[4..6], .big),
@@ -235,7 +235,7 @@ pub const Ip4Header = struct {
         // Do not fragment, which is honest for a link that carries a whole frame or none.
         std.mem.writeInt(u16, into[6..8], 0x4000, .big);
         into[8] = self.time_to_live;
-        into[9] = @intFromEnum(self.protocol);
+        into[9] = @backingInt(self.protocol);
         @memcpy(into[12..16], &self.source);
         @memcpy(into[16..20], &self.destination);
 
@@ -318,7 +318,7 @@ test "an ethernet type this code has no name for stays a number" {
     // A guest can put anything here. Turning it into an enum this code has no member for
     // would be undefined behaviour rather than an unknown protocol.
     const parsed = try Ethernet.parse(&frame);
-    try testing.expectEqual(@as(u16, 0x1234), @intFromEnum(parsed.kind));
+    try testing.expectEqual(@as(u16, 0x1234), @backingInt(parsed.kind));
 }
 
 test "an address resolution request goes out and comes back the same" {
@@ -507,7 +507,7 @@ pub const Udp = struct {
         @memcpy(pseudo[0..4], &from);
         @memcpy(pseudo[4..8], &to);
         pseudo[8] = 0;
-        pseudo[9] = @intFromEnum(Protocol.udp);
+        pseudo[9] = @backingInt(Protocol.udp);
         std.mem.writeInt(u16, pseudo[10..12], @intCast(total), .big);
 
         const sum = checksum(&.{ &pseudo, into[0..total] });
@@ -594,7 +594,7 @@ pub const Tcp = struct {
         @memcpy(pseudo[0..4], &from);
         @memcpy(pseudo[4..8], &to);
         pseudo[8] = 0;
-        pseudo[9] = @intFromEnum(Protocol.tcp);
+        pseudo[9] = @backingInt(Protocol.tcp);
         std.mem.writeInt(u16, pseudo[10..12], @intCast(total), .big);
 
         std.mem.writeInt(u16, into[16..18], checksum(&.{ &pseudo, into[0..total] }), .big);
@@ -939,7 +939,7 @@ test "a frame from the guest comes out framed for the helper" {
 test "a frame is refused when the queue for the helper is full" {
     var relay: Relay = .{};
 
-    const frame = [_]u8{'x'} ** 1024;
+    const frame: [1024]u8 = @splat('x');
     var count: usize = 0;
     while (relay.send(&frame)) count += 1;
 

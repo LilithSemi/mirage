@@ -230,24 +230,32 @@ test "a guest prints through the backend interface, not through kvm directly" {
     // that needs a tool outside the build. Each snippet stores two bytes to the uart and
     // spins, so two exits come back and the loop never reaches the last instruction.
     const entry, const code, const spins = switch (builtin.cpu.arch) {
-        .aarch64 => .{ Backend.Register.pc, &[_]u8{
-            0x01, 0x20, 0xa1, 0xd2, // movz x1, #0x0900, lsl #16   x1 = the uart
-            0x00, 0x0d, 0x80, 0x52, // movz w0, #0x68              'h'
-            0x20, 0x00, 0x00, 0xb9, // str  w0, [x1]
-            0x20, 0x0d, 0x80, 0x52, // movz w0, #0x69              'i'
-            0x20, 0x00, 0x00, 0xb9, // str  w0, [x1]
-            0x00, 0x00, 0x00, 0x14, // b    .
-        }, true },
+        .aarch64 => .{
+            Backend.Register.pc,
+            &[_]u8{
+                0x01, 0x20, 0xa1, 0xd2, // movz x1, #0x0900, lsl #16   x1 = the uart
+                0x00, 0x0d, 0x80, 0x52, // movz w0, #0x68              'h'
+                0x20, 0x00, 0x00, 0xb9, // str  w0, [x1]
+                0x20, 0x0d, 0x80, 0x52, // movz w0, #0x69              'i'
+                0x20, 0x00, 0x00, 0xb9, // str  w0, [x1]
+                0x00, 0x00, 0x00, 0x14, // b    .
+            },
+            true,
+        },
         // The x86 backend cannot run a guest yet, so this never executes. The snippet is
         // named so the arch seam compiles; the real run arrives with the x86 vCPU.
-        .x86_64 => .{ Backend.Register.rip, &[_]u8{
-            0xba, 0x00, 0x00, 0x00, 0x09, // mov edx, 0x09000000   the uart
-            0xb0, 0x68, //                  mov al, 'h'
-            0x88, 0x02, //                  mov [edx], al
-            0xb0, 0x69, //                  mov al, 'i'
-            0x88, 0x02, //                  mov [edx], al
-            0xeb, 0xfe, //                  jmp .
-        }, false },
+        .x86_64 => .{
+            Backend.Register.rip,
+            &[_]u8{
+                0xba, 0x00, 0x00, 0x00, 0x09, // mov edx, 0x09000000   the uart
+                0xb0, 0x68, //                  mov al, 'h'
+                0x88, 0x02, //                  mov [edx], al
+                0xb0, 0x69, //                  mov al, 'i'
+                0x88, 0x02, //                  mov [edx], al
+                0xeb, 0xfe, //                  jmp .
+            },
+            false,
+        },
         else => @compileError("this test runs on aarch64 and x86_64"),
     };
     // The real x86 run loop is not written, so this proves only that the seam compiles.

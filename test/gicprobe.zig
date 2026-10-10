@@ -42,7 +42,7 @@ pub fn main() void {
         const exit = hv.run(id) catch |e| {
             const raw = machine.vcpus[id].exit;
             say("step {d}: {t}, reason {d}, class 0x{x}, syndrome 0x{x}", .{
-                step,                                    e,                      @intFromEnum(raw.reason),
+                step,                                    e,                      @backingInt(raw.reason),
                 arm64.esr.class(raw.exception.syndrome), raw.exception.syndrome,
             });
             return;

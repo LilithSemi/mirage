@@ -52,7 +52,7 @@ pub const Header = extern struct {
     }
 
     pub fn pageSize(self: Header) PageSize {
-        return @enumFromInt(@as(u2, @truncate(self.flags >> 1)));
+        return @fromBackingInt(@intCast(@as(u2, @truncate(self.flags >> 1))));
     }
 
     /// Bit 3. A kernel that sets it sits at any 2MB aligned address. One that does
@@ -643,7 +643,10 @@ test "firmware is placed where it was built to run and measured as firmware" {
     var manifest: Manifest = .{};
     defer manifest.deinit(gpa);
 
-    const image = [_]u8{ 0x11, 0x22, 0x33, 0x44 } ** 16;
+    // Sixteen copies of a four byte pattern. `@splat` fills with one value, so the pattern is the
+    // value and the result is flattened.
+    const pattern: [16][4]u8 = @splat(.{ 0x11, 0x22, 0x33, 0x44 });
+    const image: [64]u8 = @bitCast(pattern);
     const layout = try prepare(gpa, &memory, &manifest, .{
         .kind = .{ .firmware = .{ .at = flash_at, .len = flash.len } },
         .kernel = &image,
@@ -681,7 +684,7 @@ test "firmware larger than the window it was given is refused" {
     defer manifest.deinit(gpa);
 
     // A window smaller than the image. Writing it anyway would run past the end of what was mapped.
-    const image = [_]u8{0xaa} ** 128;
+    const image: [128]u8 = @splat(0xaa);
     try testing.expectError(PrepareError.NoRoom, prepare(gpa, &memory, &manifest, .{
         .kind = .{ .firmware = .{ .at = 0x1000_0000, .len = 64 } },
         .kernel = &image,

@@ -163,7 +163,7 @@ fn seal(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []const [
     defer gpa.free(sealed);
     @memset(sealed, 0);
     @memcpy(sealed[0..rootfs.len], rootfs);
-    @memcpy(sealed[rootfs.len..][0..512], &@as([512]u8, @bitCast(header)));
+    @memcpy(sealed[rootfs.len..][0..512], &std.mem.toBytes(header));
     @memcpy(sealed[rootfs.len + block ..], tree.blocks);
 
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = args[1], .data = sealed });

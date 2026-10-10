@@ -82,7 +82,7 @@ pub const Header = struct {
         if (said < size or said > bytes.len) return null;
         return .{
             .len = said,
-            .op = @enumFromInt(std.mem.readInt(u32, bytes[4..8], .little)),
+            .op = @fromBackingInt(@intCast(std.mem.readInt(u32, bytes[4..8], .little))),
             .unique = std.mem.readInt(u64, bytes[8..16], .little),
             .nodeid = std.mem.readInt(u64, bytes[16..24], .little),
             .uid = std.mem.readInt(u32, bytes[24..28], .little),
@@ -394,7 +394,7 @@ test "a header shorter than itself is not a message" {
 test "a header says what it is about" {
     var bytes: [Header.size + 8]u8 = @splat(0);
     std.mem.writeInt(u32, bytes[0..4], bytes.len, .little);
-    std.mem.writeInt(u32, bytes[4..8], @intFromEnum(Op.lookup), .little);
+    std.mem.writeInt(u32, bytes[4..8], @backingInt(Op.lookup), .little);
     std.mem.writeInt(u64, bytes[8..16], 0x1234, .little);
     std.mem.writeInt(u64, bytes[16..24], 1, .little);
 
@@ -411,7 +411,7 @@ test "an operation nobody named stays a number" {
     std.mem.writeInt(u32, bytes[4..8], 9999, .little);
     const head = Header.parse(&bytes).?;
     try std.testing.expect(head.op != .lookup);
-    try std.testing.expectEqual(@as(u32, 9999), @intFromEnum(head.op));
+    try std.testing.expectEqual(@as(u32, 9999), @backingInt(head.op));
 }
 
 test "an answer carries its own length and the number it answers" {

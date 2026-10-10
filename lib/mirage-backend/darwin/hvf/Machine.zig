@@ -248,7 +248,7 @@ fn exception(self: *Machine, target: *Vcpu) Backend.Error!?Backend.Exit {
             // Register 31 is the zero register, not a general one, so a store from
             // it writes zero rather than whatever x31 would have held.
             if (abort.register != 31) {
-                const result = self.api.vcpu_get_reg(target.id, @enumFromInt(abort.register), &value);
+                const result = self.api.vcpu_get_reg(target.id, @fromBackingInt(@intCast(abort.register)), &value);
                 if (result != hv.success) return self.record(result);
             }
 
@@ -264,7 +264,7 @@ fn exception(self: *Machine, target: *Vcpu) Backend.Error!?Backend.Exit {
             if (!reg.debug()) return Backend.Error.HypervisorFault;
 
             if (!reg.write and reg.transfer != 31) {
-                const zeroed = self.api.vcpu_set_reg(target.id, @enumFromInt(reg.transfer), 0);
+                const zeroed = self.api.vcpu_set_reg(target.id, @fromBackingInt(@intCast(reg.transfer)), 0);
                 if (zeroed != hv.success) return self.record(zeroed);
             }
 
@@ -277,7 +277,7 @@ fn exception(self: *Machine, target: *Vcpu) Backend.Error!?Backend.Exit {
             // PSCI arrives this way. The function is in x0 and the arguments follow.
             var args: [4]u64 = @splat(0);
             for (0..4) |index| {
-                const result = self.api.vcpu_get_reg(target.id, @enumFromInt(index), &args[index]);
+                const result = self.api.vcpu_get_reg(target.id, @fromBackingInt(@intCast(index)), &args[index]);
                 if (result != hv.success) return self.record(result);
             }
             // `hvc` already moved the program counter, so it is not advanced here.
@@ -309,7 +309,7 @@ fn completeMmioRead(ctx: *anyopaque, id: Backend.VcpuId, value: u64) Backend.Err
     target.pending = null;
 
     if (into != 31) {
-        const result = self.api.vcpu_set_reg(target.id, @enumFromInt(into), value);
+        const result = self.api.vcpu_set_reg(target.id, @fromBackingInt(@intCast(into)), value);
         if (result != hv.success) return self.record(result);
     }
     return self.advance(target);

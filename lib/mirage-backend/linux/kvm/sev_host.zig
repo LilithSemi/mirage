@@ -67,7 +67,7 @@ pub const Error = error{
 };
 
 fn issueCmd(sev_fd: std.posix.fd_t, cmd: Cmd, data: u64) Error!void {
-    var envelope: SevIssueCmd = .{ .cmd = @intFromEnum(cmd), .data = data, .err = 0 };
+    var envelope: SevIssueCmd = .{ .cmd = @backingInt(cmd), .data = data, .err = 0 };
     const rc = linux.ioctl(sev_fd, issue_cmd_request, @intFromPtr(&envelope));
     if (envelope.err != 0) return Error.SevFirmwareError;
     return switch (std.posix.errno(rc)) {

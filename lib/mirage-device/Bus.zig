@@ -35,7 +35,7 @@ const Found = struct {
 fn find(self: *Bus, gpa: u64, size: Size) ?Found {
     // Both the address and the width come from the guest. Unchecked arithmetic wraps
     // and then passes a bounds test it should have failed.
-    const end = std.math.add(u64, gpa, @intFromEnum(size)) catch return null;
+    const end = std.math.add(u64, gpa, @backingInt(size)) catch return null;
 
     for (self.devices) |*owner| {
         if (gpa < owner.base) continue;

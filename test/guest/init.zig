@@ -404,10 +404,10 @@ fn walkLikeAFetch() void {
     var written: usize = 0;
     while (written < 48) : (written += 1) {
         var name: [96]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&name, "/share/work/.tmp-probe/file-{d}", .{written}) catch break;
+        const path = std.fmt.bufPrintSentinel(&name, "/share/work/.tmp-probe/file-{d}", .{written}, 0) catch break;
         const made = linux.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, modes[written % modes.len]);
         if (std.posix.errno(made) != .SUCCESS) {
-            sayNumber("fetch: creating refused", @intFromEnum(std.posix.errno(made)));
+            sayNumber("fetch: creating refused", @backingInt(std.posix.errno(made)));
             return;
         }
         const fd: i32 = @intCast(made);
@@ -417,7 +417,7 @@ fn walkLikeAFetch() void {
 
     const opened = linux.open("/share/work/.tmp-probe", .{ .DIRECTORY = true }, 0);
     if (std.posix.errno(opened) != .SUCCESS) {
-        sayNumber("fetch: opening the directory refused", @intFromEnum(std.posix.errno(opened)));
+        sayNumber("fetch: opening the directory refused", @backingInt(std.posix.errno(opened)));
         return;
     }
     const dir: i32 = @intCast(opened);
@@ -428,7 +428,7 @@ fn walkLikeAFetch() void {
     while (true) {
         const got = linux.getdents64(dir, &room, room.len);
         if (std.posix.errno(got) != .SUCCESS) {
-            sayNumber("fetch: the walk refused", @intFromEnum(std.posix.errno(got)));
+            sayNumber("fetch: the walk refused", @backingInt(std.posix.errno(got)));
             return;
         }
         if (got == 0) break;
@@ -453,20 +453,20 @@ fn walkLikeAFetch() void {
                 @intFromPtr(&about),
             );
             if (std.posix.errno(asked) != .SUCCESS) {
-                sayNumber("fetch: measuring a name refused", @intFromEnum(std.posix.errno(asked)));
+                sayNumber("fetch: measuring a name refused", @backingInt(std.posix.errno(asked)));
                 return;
             }
 
             const file = linux.openat(dir, name, .{}, 0);
             if (std.posix.errno(file) != .SUCCESS) {
-                sayNumber("fetch: opening a name refused", @intFromEnum(std.posix.errno(file)));
+                sayNumber("fetch: opening a name refused", @backingInt(std.posix.errno(file)));
                 return;
             }
             var bytes: [64]u8 = undefined;
             const read = linux.read(@intCast(file), &bytes, bytes.len);
             _ = linux.close(@intCast(file));
             if (std.posix.errno(read) != .SUCCESS) {
-                sayNumber("fetch: reading a name refused", @intFromEnum(std.posix.errno(read)));
+                sayNumber("fetch: reading a name refused", @backingInt(std.posix.errno(read)));
                 return;
             }
             measured += 1;
@@ -497,7 +497,7 @@ fn hammerFromManyTasks() void {
             var round: usize = 0;
             while (round < rounds) : (round += 1) {
                 var name: [96]u8 = undefined;
-                const path = std.fmt.bufPrintZ(&name, "/share/work/.tmp-probe/file-{d}", .{round % 48}) catch break;
+                const path = std.fmt.bufPrintSentinel(&name, "/share/work/.tmp-probe/file-{d}", .{round % 48}, 0) catch break;
 
                 var about: [256]u8 align(8) = @splat(0);
                 _ = linux.syscall5(.statx, @bitCast(@as(isize, linux.AT.FDCWD)), @intFromPtr(path.ptr), 0, 0, @intFromPtr(&about));
@@ -519,7 +519,7 @@ fn hammerFromManyTasks() void {
     var finished: usize = 0;
     for (children[0..started]) |each| {
         if (each < 0) continue;
-        var status: u32 = 0;
+        var status: i32 = 0;
         if (std.posix.errno(linux.wait4(each, &status, 0, null)) == .SUCCESS) finished += 1;
     }
 
@@ -567,7 +567,7 @@ fn sayNumber(what: []const u8, number: usize) void {
 /// directory is there now: one offered for a piece of work is gone when that work is over.
 fn readShare(name: []const u8, into: []u8) usize {
     var room: [256]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&room, "/share/{s}/hello", .{name}) catch return 0;
+    const path = std.fmt.bufPrintSentinel(&room, "/share/{s}/hello", .{name}, 0) catch return 0;
     const opened = linux.open(path.ptr, .{}, 0);
     if (std.posix.errno(opened) != .SUCCESS) return 0;
     const fd: i32 = @intCast(opened);

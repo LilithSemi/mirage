@@ -357,7 +357,7 @@ pub const Superblock = extern struct {
     /// Read a header that came off a disk. Every field in it was written by whoever made
     /// the image, so each one is checked rather than believed.
     pub fn parse(bytes: *const [512]u8) ParseError!Superblock {
-        const self: Superblock = @bitCast(bytes.*);
+        const self = std.mem.bytesToValue(Superblock, bytes);
         if (!std.mem.eql(u8, &self.signature, magic)) return ParseError.NotVerity;
         if (self.version != format_version) return ParseError.UnknownVersion;
         if (self.hash_type != hash_type_regular) return ParseError.Unsupported;
@@ -383,7 +383,7 @@ test "the header this writes is the header veritysetup writes" {
 
     const uuid = [16]u8{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
     const header: Superblock = .init(tree, "\xb1\x20\x90\x35\x6b\x21\x89\x54", uuid);
-    const bytes: [512]u8 = @bitCast(header);
+    const bytes = std.mem.toBytes(header);
 
     const expected = [_]u8{
         'v',  'e',  'r',  'i',  't',  'y',  0,    0,
@@ -412,7 +412,7 @@ test "a header goes out and comes back the same" {
     defer tree.deinit(gpa);
 
     const header: Superblock = .init(tree, "pepper", @splat(7));
-    const bytes: [512]u8 = @bitCast(header);
+    const bytes = std.mem.toBytes(header);
     const back = try Superblock.parse(&bytes);
 
     try testing.expectEqual(@as(u64, 3), back.data_blocks);

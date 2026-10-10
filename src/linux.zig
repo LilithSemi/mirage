@@ -143,7 +143,7 @@ fn armTicks(milliseconds: isize) void {
         .nsec = @rem(milliseconds, 1000) * std.time.us_per_ms,
     };
     const spec: std.os.linux.itimerspec = .{ .it_interval = every, .it_value = every };
-    _ = std.os.linux.setitimer(@intFromEnum(std.os.linux.ITIMER.REAL), &spec, null);
+    _ = std.os.linux.setitimer(@backingInt(std.os.linux.ITIMER.REAL), &spec, null);
 }
 
 /// Bring every other CPU out of the hypervisor and wait for it to stop.

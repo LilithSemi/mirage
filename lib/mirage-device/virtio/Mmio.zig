@@ -154,7 +154,7 @@ fn read(ctx: *anyopaque, offset: u64, size: Bus.Size) u64 {
     // 64 bit field in one go must not get only half of it.
     if (offset >= reg.config) {
         const at = offset - reg.config;
-        const width = @intFromEnum(size);
+        const width = @backingInt(size);
         if (at + width > self.config.len) return 0;
         var value: u64 = 0;
         for (0..width) |index| {
@@ -198,7 +198,7 @@ fn write(ctx: *anyopaque, offset: u64, size: Bus.Size, value: u64) void {
         const from = self.config_writable_from orelse return;
         const at = offset - reg.config;
         if (at < from) return;
-        const width = @intFromEnum(size);
+        const width = @backingInt(size);
         if (at + width > self.config.len) return;
         for (0..width) |index| {
             self.config[@intCast(at + index)] = @truncate(value >> @intCast(index * 8));

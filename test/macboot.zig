@@ -513,7 +513,7 @@ pub fn main() void {
 
     // The CPUs the guest starts itself, each on a thread of its own. Each makes its own CPU, because the
     // framework binds one to the thread that created it, and then waits until the guest asks for it.
-    var cpu_exits = [_]u64{0} ** device.Gicv2.max_cpus;
+    var cpu_exits: [device.Gicv2.max_cpus]u64 = @splat(0);
     const shared: Shared = .{ .machine = &machine, .bus = &bus, .gic = &gic, .exits = &cpu_exits };
     var threads: [device.Gicv2.max_cpus]std.Thread = undefined;
     var started: usize = 0;
@@ -588,7 +588,7 @@ pub fn main() void {
             const raw = machine.vcpus[id].exit;
             say("\nrun failed after {d} exits: {t}, framework returned {?}", .{ exits, err, machine.fault });
             say("  reason {d}, class 0x{x}, syndrome 0x{x}, address 0x{x}", .{
-                @intFromEnum(raw.reason),
+                @backingInt(raw.reason),
                 arm64.esr.class(raw.exception.syndrome),
                 raw.exception.syndrome,
                 raw.exception.physical_address,

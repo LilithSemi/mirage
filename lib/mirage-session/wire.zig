@@ -119,8 +119,8 @@ pub const Frame = struct {
 
     pub fn encode(self: Frame) [size]u8 {
         var bytes: [size]u8 = @splat(0);
-        bytes[0] = @intFromEnum(self.tag);
-        bytes[1] = @intFromEnum(self.reason);
+        bytes[0] = @backingInt(self.tag);
+        bytes[1] = @backingInt(self.reason);
         std.mem.writeInt(u16, bytes[2..4], self.port, .little);
         std.mem.writeInt(u32, bytes[4..8], self.value, .little);
         // A name longer than the room kept for it is cut rather than refused here. Whoever built
@@ -135,8 +135,8 @@ pub const Frame = struct {
     pub fn decode(bytes: *const [size]u8) Frame {
         const carried = @min(std.mem.readInt(u16, bytes[8..10], .little), max_text);
         return .{
-            .tag = @enumFromInt(bytes[0]),
-            .reason = @enumFromInt(bytes[1]),
+            .tag = @fromBackingInt(@intCast(bytes[0])),
+            .reason = @fromBackingInt(@intCast(bytes[1])),
             .port = std.mem.readInt(u16, bytes[2..4], .little),
             .value = std.mem.readInt(u32, bytes[4..8], .little),
             .text = bytes[header_size..][0..carried],
@@ -267,7 +267,7 @@ test "a tag nobody named stays a number" {
     bytes[0] = 200;
     const back = Frame.decode(&bytes);
     try std.testing.expect(back.tag != .up);
-    try std.testing.expectEqual(@as(u8, 200), @intFromEnum(back.tag));
+    try std.testing.expectEqual(@as(u8, 200), @backingInt(back.tag));
 }
 
 test "a message goes over a socket and a descriptor goes with it" {

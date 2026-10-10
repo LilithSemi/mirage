@@ -458,7 +458,8 @@ test "a name longer than the configuration space holds is cut rather than overfl
     var counter: Counter = .{};
     var room: Room = undefined;
     var offered: Fs = undefined;
-    offered.init("x" ** 100, counter.answering(), &room.asked, &room.answered);
+    const long_tag: [100]u8 = @splat('x');
+    offered.init(&long_tag, counter.answering(), &room.asked, &room.answered);
     try testing.expectEqual(@as(u8, 'x'), offered.config[tag_size - 1]);
     try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, offered.config[tag_size..][0..4], .little));
 }

@@ -118,7 +118,7 @@ pub fn main() void {
     const outcome = hv.run(id) catch |err| {
         const raw = machine.vcpus[id].exit;
         say("third exit: reason {d}, syndrome 0x{x}, class 0x{x}, address 0x{x}", .{
-            @intFromEnum(raw.reason),
+            @backingInt(raw.reason),
             raw.exception.syndrome,
             arm64.esr.class(raw.exception.syndrome),
             raw.exception.physical_address,

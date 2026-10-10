@@ -61,7 +61,7 @@ fn armTicks(interval_ms: isize) void {
     // Microseconds, whatever the field is called. See the comment in `test/boot.zig`.
     const every: linux.timespec = .{ .sec = 0, .nsec = interval_ms * std.time.us_per_ms };
     const spec: linux.itimerspec = .{ .it_interval = every, .it_value = every };
-    _ = linux.setitimer(@intFromEnum(linux.ITIMER.REAL), &spec, null);
+    _ = linux.setitimer(@backingInt(linux.ITIMER.REAL), &spec, null);
 }
 
 fn nowMs() i64 {
