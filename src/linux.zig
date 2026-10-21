@@ -966,6 +966,27 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         try out.print("\nthe guest stopped: {t}\n", .{reason});
     }
 
+    // Where firmware put each region, which is the only account of whether it enumerated the bus
+    // at all. A bridge nothing looked at reads as no regions placed and no slots asked about.
+    if (options.pci) {
+        try out.print("pci: {d} reads of a slot with nothing in it, {d} that reached no handler\n", .{
+            bridge.unclaimed,
+            bridge.unanswered,
+        });
+        for (0..device.PciHost.max_regions) |each| {
+            if (bridge.baseOf(0, each)) |at| {
+                try out.print("pci: region {d} placed at {x}\n", .{ each, at });
+            }
+        }
+        if (options.glacier) {
+            try out.print("pci: the rom was read {d} times, the card ran {d} transfers and {d} accesses strayed\n", .{
+                bridge.rom_reads,
+                gpu.transfers,
+                gpu.strayed,
+            });
+        }
+    }
+
     // A device that asked for an interrupt the kernel refused is why a guest waits
     // forever, so say so rather than leaving it to be guessed at.
     if (offered) |one| {

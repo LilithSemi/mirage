@@ -125,6 +125,9 @@ state: [max_functions]State = @splat(.{}),
 unclaimed: u64 = 0,
 /// Accesses that found a region whose function declared nobody to answer them.
 unanswered: u64 = 0,
+/// Reads of an expansion rom. Firmware reads one only when it means to run it, so this is how a
+/// run says whether the image was dispatched at all.
+rom_reads: u64 = 0,
 
 pub const State = struct {
     command: u16 = 0,
@@ -588,7 +591,10 @@ fn windowRead(self: *PciHost, address: u64, size: Bus.Size) u64 {
         return absent >> @intCast(64 - bytes * 8);
     };
 
-    if (hit.rom) return self.romRead(hit.slot, hit.within, size);
+    if (hit.rom) {
+        self.rom_reads += 1;
+        return self.romRead(hit.slot, hit.within, size);
+    }
 
     const one = self.functions[hit.slot].?;
     const answers = one.handler orelse {
