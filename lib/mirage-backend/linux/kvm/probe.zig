@@ -213,6 +213,18 @@ test "guest memory asked to be mappable can be mapped" {
     };
     if (!report.guest_memfd) return error.SkipZigTest;
 
+    // Having `guest_memfd` is not having the flag. The capability arrived for guests whose memory
+    // the host cannot read, years before the flag that asks for memory it can, so a kernel answers
+    // yes to one and no to the other. The mask of flags it takes is a capability of its own.
+    //
+    // A kernel that does not offer the flag cannot be asked to honour it, so there is nothing to
+    // prove here. It must not have mapped the memory either: if it did, this mask is not what says
+    // whether the flag exists and this gate is reading the wrong answer.
+    if (report.guest_memfd_flags & flag_mmap == 0) {
+        try std.testing.expect(!report.shared_allows_mapping);
+        return error.SkipZigTest;
+    }
+
     // The control. Without it, a refusal above proves only that the flag is
     // unsupported, not that it means anything.
     try std.testing.expect(report.shared_allows_mapping);
