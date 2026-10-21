@@ -92,6 +92,11 @@ pub const SysReg = enum(u16) {
     /// Which CPU this is, as the guest reads it. A guest asks the power interface to start a CPU by this
     /// number, so it has to be the number the device tree promised for that CPU.
     mpidr_el1 = 0xc005,
+    /// The syndrome and the address of the last exception the guest took to itself. A guest that
+    /// faults inside its own handler never leaves the hypervisor, so these two are the only
+    /// account of what it was doing.
+    esr_el1 = 0xc290,
+    far_el1 = 0xc300,
     _,
 };
 

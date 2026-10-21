@@ -382,6 +382,9 @@ fn prepareFirmware(
         .share = config.share,
         .tpm = config.tpm,
         .pci = config.pci,
+        // Firmware reads this device before it reaches any of its own code, so a machine that
+        // starts firmware has one and a machine that starts a kernel does not.
+        .fw_cfg = true,
     };
 
     // What this launch measures, in order. One list, so what goes into the length and what goes into

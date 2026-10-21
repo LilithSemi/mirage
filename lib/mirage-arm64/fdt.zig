@@ -87,6 +87,12 @@ pub const fs_intid = 32 + fs_irq;
 pub const tpm_base = 0x0c00_0000;
 pub const tpm_size = 0x5000;
 
+/// Where the firmware configuration device sits, at the address a machine of this shape has always
+/// put it. Firmware looks for it by name in this tree and gives up on the device if the window is
+/// not two eight byte quantities.
+pub const fw_cfg_base = 0x0902_0000;
+pub const fw_cfg_size = 0x10;
+
 /// Where pci config space sits, and how much of it one bus needs. An address inside the window
 /// names a bus, a device, a function and a register, so one bus of thirty two devices with eight
 /// functions each needs a megabyte. The bridge holds one bus.
@@ -149,6 +155,9 @@ pub const Config = struct {
     share: bool = false,
     /// Whether the machine has a security chip.
     tpm: bool = false,
+    /// Whether the machine has the firmware configuration device. A kernel needs nothing from it,
+    /// and firmware does not boot without it.
+    fw_cfg: bool = false,
     /// Whether the machine has a pci host bridge. A tree that names one the VMM did not build
     /// sends firmware to enumerate a window that answers nothing.
     pci: bool = false,
@@ -359,6 +368,15 @@ pub fn build(gpa: std.mem.Allocator, config: Config) ![]u8 {
             try builder.propU64("linux,sml-base", where.start);
             try builder.propU32("linux,sml-size", @intCast(where.end - where.start));
         }
+        try builder.endNode();
+    }
+
+    if (config.fw_cfg) {
+        try builder.beginNode(try std.fmt.bufPrint(&name, "fw-cfg@{x}", .{fw_cfg_base}));
+        // What firmware matches on. It reads the window as the data register at the base and the
+        // selector eight bytes after it, so the length here is the whole of both and no more.
+        try builder.propString("compatible", "qemu,fw-cfg-mmio");
+        try builder.propCells("reg", &cells(fw_cfg_base, fw_cfg_size));
         try builder.endNode();
     }
 
@@ -844,4 +862,43 @@ test "the windows the tree names are the ones the bus is given" {
     try std.testing.expect(ecam_base + ecam_size <= pci_memory_base);
     try std.testing.expect(pci_memory_base + pci_memory_size <= 0x4000_0000);
     try std.testing.expect(pci_memory64_base > 0xFFFF_FFFF);
+}
+
+test "firmware is told where the configuration device is" {
+    const gpa = testing.allocator();
+    const blob = try build(gpa, .{
+        .ram_base = 0x4000_0000,
+        .ram_size = 0x0800_0000,
+        .cpus = 1,
+        .cmdline = "",
+        .uart_base = 0x0900_0000,
+        .fw_cfg = true,
+    });
+    defer gpa.free(blob);
+
+    const tree = try read(gpa, blob);
+    defer tree.deinit();
+
+    // The name firmware matches on, and a window of exactly two eight byte quantities: it reads
+    // the second as the length and looks for a third register beyond this one if it is larger.
+    const compatible = try tree.find(&.{ "", "fw-cfg@9020000", "compatible" });
+    try testing.expectEqualSlices(u8, "qemu,fw-cfg-mmio\x00", compatible);
+
+    const reg = try tree.find(&.{ "", "fw-cfg@9020000", "reg" });
+    try testing.expectEqual(@as(usize, 16), reg.len);
+    try testing.expectEqual(@as(u64, fw_cfg_base), std.mem.readInt(u64, reg[0..8], .big));
+    try testing.expectEqual(@as(u64, fw_cfg_size), std.mem.readInt(u64, reg[8..16], .big));
+}
+
+test "a guest that boots a kernel is told of no configuration device" {
+    const gpa = testing.allocator();
+    const blob = try build(gpa, sample);
+    defer gpa.free(blob);
+
+    const tree = try read(gpa, blob);
+    defer tree.deinit();
+
+    // A kernel asks it nothing, and a tree that named a window the bus does not carry would send
+    // whatever did ask to read all ones.
+    try testing.expectError(error.NotFound, tree.find(&.{ "", "fw-cfg@9020000", "compatible" }));
 }

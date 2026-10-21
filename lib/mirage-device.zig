@@ -65,6 +65,7 @@ pub const Uart16550 = @import("mirage-device/Uart16550.zig");
 pub const Tpm = @import("mirage-device/Tpm.zig");
 pub const PciHost = @import("mirage-device/PciHost.zig");
 pub const Glacier = @import("mirage-device/Glacier.zig");
+pub const FwCfg = @import("mirage-device/FwCfg.zig");
 pub const virtio = struct {
     pub const Queue = @import("mirage-device/virtio/Queue.zig");
     pub const Mmio = @import("mirage-device/virtio/Mmio.zig");
@@ -84,6 +85,7 @@ test {
     _ = Tpm;
     _ = PciHost;
     _ = Glacier;
+    _ = FwCfg;
     _ = virtio.Queue;
     _ = virtio.Mmio;
     _ = virtio.Block;

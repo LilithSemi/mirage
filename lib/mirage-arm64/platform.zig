@@ -19,6 +19,7 @@ pub const Device = struct {
 pub const serial: Device = .{ .addr = 0x0900_0000, .intid = fdt.uart_intid };
 pub const fs: Device = .{ .addr = fdt.fs_base, .intid = fdt.fs_intid };
 pub const tpm: Device = .{ .addr = fdt.tpm_base, .intid = 0 };
+pub const fw_cfg: Device = .{ .addr = fdt.fw_cfg_base, .intid = 0 };
 pub const virtio: Device = .{ .addr = fdt.virtio_base, .intid = fdt.virtio_intid };
 pub const vsock: Device = .{ .addr = fdt.vsock_base, .intid = fdt.vsock_intid };
 pub const balloon: Device = .{ .addr = fdt.balloon_base, .intid = fdt.balloon_intid };

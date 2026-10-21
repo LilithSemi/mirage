@@ -77,6 +77,15 @@ fn coreReg(comptime byte_offset: u64) u64 {
     return reg_arm64 | reg_size_u64 | reg_arm_core | (byte_offset / 4);
 }
 
+const reg_arm_sysreg: u64 = 0x0013 << 16;
+
+/// A system register is named the way the `mrs` instruction names it, by its five encoding
+/// fields. The shifts are KVM's, from `KVM_REG_ARM64_SYSREG_*_SHIFT`.
+fn sysReg(comptime op0: u64, comptime op1: u64, comptime crn: u64, comptime crm: u64, comptime op2: u64) u64 {
+    return reg_arm64 | reg_size_u64 | reg_arm_sysreg |
+        (op0 << 14) | (op1 << 11) | (crn << 7) | (crm << 3) | op2;
+}
+
 fn registerId(reg: Backend.Register) u64 {
     return switch (reg) {
         .x0 => comptime coreReg(0),
@@ -84,6 +93,8 @@ fn registerId(reg: Backend.Register) u64 {
         .x2 => comptime coreReg(16),
         .x3 => comptime coreReg(24),
         .pc => comptime coreReg(31 * 8 + 8),
+        .esr => comptime sysReg(3, 0, 5, 2, 0),
+        .far => comptime sysReg(3, 0, 6, 0, 0),
     };
 }
 

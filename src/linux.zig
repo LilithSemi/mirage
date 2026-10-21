@@ -30,6 +30,31 @@ const usage = Options.usage;
 /// it, so this one is written before the guest runs and never from inside.
 const launch_register = 0;
 
+/// Where a guest that never came back was, and what it last faulted on.
+///
+/// A guest that faults inside itself never leaves the hypervisor: the exception is taken to its own
+/// handler, and if that handler spins then the only account of it is in the registers. The syndrome
+/// is not cleared between exceptions, so it reads as the last one whether or not that is why the
+/// guest stopped, which is why this says "last" rather than "the".
+fn sayWhereItWas(out: *std.Io.Writer, hv: backend.Backend, id: backend.Backend.VcpuId) !void {
+    if (@import("builtin").cpu.arch != .aarch64) return;
+
+    const pc = hv.getRegister(id, .pc) catch return;
+    const esr = hv.getRegister(id, .esr) catch return;
+    const far = hv.getRegister(id, .far) catch return;
+    if (esr == 0) {
+        try out.print("cpu 0 was at {x}, having taken no exception\n", .{pc});
+        return;
+    }
+
+    try out.print("cpu 0 was at {x}, last exception class {x} syndrome {x} at {x}\n", .{
+        pc,
+        arch.esr.class(esr),
+        esr,
+        far,
+    });
+}
+
 /// Where firmware is placed. A machine like this one has its read only memory at the bottom of the
 /// address space, and firmware built for one starts there.
 const firmware_base = 0x0;
@@ -641,6 +666,11 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         attached.addServed(shared_fs.device(platform.fs.addr), shared_fs.service(platform.fs.intid));
     }
     if (options.tpm != null) attached.add(chip.device(platform.tpm.addr));
+
+    // Firmware reads this before it reaches any of its own code. A guest booting a kernel is told
+    // of no such device and is given none.
+    var settings: device.FwCfg = .{};
+    if (options.firmware != null) attached.add(settings.device(platform.fw_cfg.addr));
     // Config space says where a region is and the windows are the regions, so all three belong to
     // one bridge. They are separate devices on the bus because they are separate spaces.
     var bridge: device.PciHost = .{};
@@ -911,6 +941,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         // `stopped` says the loop ended, not why. A guest that ran out of time and one
         // that was asked to stop look the same from inside the loop.
         try out.print("\nthe guest ran out of time after {?d} seconds\n", .{options.seconds});
+        try sayWhereItWas(out, hv, ids[0]);
     } else {
         try out.print("\nthe guest stopped: {t}\n", .{reason});
     }
