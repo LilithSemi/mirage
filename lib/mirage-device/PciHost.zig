@@ -65,6 +65,11 @@ pub const Function = struct {
     regions: [max_regions]Region = @splat(.{}),
     /// Size of the expansion rom, or zero for none.
     rom_size: u32 = 0,
+    /// Who answers reads and writes inside this function's regions. A function with none is declared
+    /// but answers nothing, which is useful for proving enumeration alone.
+    handler: ?Regions = null,
+    /// The expansion rom image, served inside the rom region. May be shorter than `rom_size`.
+    rom: []const u8 = &.{},
     /// Whether to report a message signalled interrupt capability.
     ///
     /// The card this was built for advertises one while every interrupt line is tied off, so it can
@@ -82,6 +87,11 @@ state: [max_functions]State = @splat(.{}),
 /// Reads and writes that named no function. A guest is allowed to be wrong, so these are counted
 /// rather than refused loudly.
 unclaimed: u64 = 0,
+/// Accesses that found a region whose function declared nobody to answer them.
+unanswered: u64 = 0,
+/// Where the memory window sits, remembered when it is handed out so an access can be turned back
+/// into the address the guest used.
+window_at: u64 = 0,
 
 pub const State = struct {
     command: u16 = 0,
@@ -336,6 +346,132 @@ const rom_enable: u32 = 1;
 /// The one bit of the message control word a guest may set here, which is the enable.
 const msi_control_writable: u32 = 1;
 
+/// Whoever answers reads and writes inside a function's regions.
+///
+/// The bridge decodes which region an address fell in and hands on the offset within it, so a
+/// device models its registers and never learns where firmware put them.
+pub const Regions = struct {
+    ctx: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        read: *const fn (ctx: *anyopaque, region: usize, offset: u64, size: Bus.Size) u64,
+        write: *const fn (ctx: *anyopaque, region: usize, offset: u64, size: Bus.Size, value: u64) void,
+    };
+};
+
+/// Command bit one, memory space enable. A function whose guest has not set it does not answer in
+/// the memory window at all, which is what lets firmware size a region without the half placed
+/// region replying from wherever it used to sit.
+const memory_enable: u16 = 1 << 1;
+
+/// The memory window the bridge decodes, anchored where the device tree says it is.
+///
+/// Separate from the config window because they are different spaces: config says where a region
+/// is, and this is the region. Both belong to the bridge, so the bridge is the one thing that knows
+/// where firmware put what.
+pub fn window(self: *PciHost, at: u64, len: u64) Bus.Device {
+    self.window_at = at;
+    return .{
+        .base = at,
+        .len = len,
+        .ctx = self,
+        .vtable = &.{ .read = PciHost.windowRead, .write = PciHost.windowWrite },
+    };
+}
+
+/// Which function and region owns an address, and how far into it the address is.
+const Hit = struct {
+    slot: usize,
+    region: usize,
+    within: u64,
+    /// Set when the address fell in the expansion rom rather than a region.
+    rom: bool = false,
+};
+
+fn decode(self: *const PciHost, address: u64, size: Bus.Size) ?Hit {
+    const bytes: u64 = @backingInt(size);
+    const end = std.math.add(u64, address, bytes) catch return null;
+
+    for (self.functions, 0..) |each, slot| {
+        const one = each orelse continue;
+        if (self.state[slot].command & memory_enable == 0) continue;
+
+        var region: usize = 0;
+        while (region < max_regions) : (region += 1) {
+            if (one.regions[region].size == 0) continue;
+            const base = self.baseOf(slot, region) orelse continue;
+            if (address < base) continue;
+            if (end > base + one.regions[region].size) continue;
+            return .{ .slot = slot, .region = region, .within = address - base };
+        }
+
+        if (one.rom_size != 0 and self.state[slot].rom_base & rom_enable != 0) {
+            const base = self.state[slot].rom_base & ~@as(u32, rom_enable);
+            if (base != 0 and address >= base and end <= @as(u64, base) + one.rom_size) {
+                return .{ .slot = slot, .region = 0, .within = address - base, .rom = true };
+            }
+        }
+    }
+    return null;
+}
+
+fn windowRead(ctx: *anyopaque, offset: u64, size: Bus.Size) u64 {
+    const self: *PciHost = @ptrCast(@alignCast(ctx));
+    const bytes: u64 = @backingInt(size);
+    const address = self.window_at + offset;
+
+    const hit = self.decode(address, size) orelse {
+        self.unclaimed += 1;
+        return absent >> @intCast(64 - bytes * 8);
+    };
+
+    if (hit.rom) return self.romRead(hit.slot, hit.within, size);
+
+    const one = self.functions[hit.slot].?;
+    const answers = one.handler orelse {
+        self.unanswered += 1;
+        return 0;
+    };
+    return answers.vtable.read(answers.ctx, hit.region, hit.within, size);
+}
+
+/// Bytes of the expansion rom, or zero past the end of the image.
+///
+/// A rom region is as large as the function declared and the image inside it may be shorter, so the
+/// tail reads as zero rather than as whatever is next in host memory.
+fn romRead(self: *const PciHost, slot: usize, within: u64, size: Bus.Size) u64 {
+    const image = self.functions[slot].?.rom;
+    const bytes: u64 = @backingInt(size);
+
+    var value: u64 = 0;
+    var taken: u64 = 0;
+    while (taken < bytes) : (taken += 1) {
+        const at = within + taken;
+        const byte: u64 = if (at < image.len) image[@intCast(at)] else 0;
+        value |= byte << @intCast(taken * 8);
+    }
+    return value;
+}
+
+fn windowWrite(ctx: *anyopaque, offset: u64, size: Bus.Size, value: u64) void {
+    const self: *PciHost = @ptrCast(@alignCast(ctx));
+    const address = self.window_at + offset;
+
+    const hit = self.decode(address, size) orelse {
+        self.unclaimed += 1;
+        return;
+    };
+    // A rom is read only. A guest writing into one is allowed to be wrong.
+    if (hit.rom) return;
+
+    const one = self.functions[hit.slot].?;
+    const answers = one.handler orelse {
+        self.unanswered += 1;
+        return;
+    };
+    answers.vtable.write(answers.ctx, hit.region, hit.within, size, value);
+}
 /// The identity and region sizes of the card this bridge was first built for, taken from the
 /// generated hardware rather than chosen here. The two sizing answers below are the values that
 /// appear in the generated register transfer level for `chenega_v1_ax7203`, so a change to the
@@ -542,4 +678,149 @@ test "the interrupt capability is reported only when the caller asks for it" {
     // the real card does today: a capability it advertises and does not honour.
     one.vtable.write(one.ctx, ecam(2, 0, 0x40), .word, 0x0001_0000);
     try testing.expectEqual(@as(u64, 1), one.vtable.read(one.ctx, ecam(2, 0, 0x42), .half));
+}
+
+/// A device that remembers the last access it was given, so a test can say which region the bridge
+/// decoded and how far into it the address fell.
+const Spy = struct {
+    region: usize = 0,
+    offset: u64 = 0,
+    wrote: u64 = 0,
+    reads: usize = 0,
+    writes: usize = 0,
+
+    fn regions(self: *Spy) Regions {
+        return .{ .ctx = self, .vtable = &.{ .read = Spy.read, .write = Spy.write } };
+    }
+
+    fn read(ctx: *anyopaque, region: usize, offset: u64, _: Bus.Size) u64 {
+        const self: *Spy = @ptrCast(@alignCast(ctx));
+        self.region = region;
+        self.offset = offset;
+        self.reads += 1;
+        return 0x48444d41;
+    }
+
+    fn write(ctx: *anyopaque, region: usize, offset: u64, _: Bus.Size, value: u64) void {
+        const self: *Spy = @ptrCast(@alignCast(ctx));
+        self.region = region;
+        self.offset = offset;
+        self.wrote = value;
+        self.writes += 1;
+    }
+};
+
+const window_base: u64 = 0x1000_0000;
+
+test "a region answers nothing until the guest enables memory space" {
+    var spy: Spy = .{};
+    var host: PciHost = .{};
+    var card = glacier;
+    card.handler = spy.regions();
+    try testing.expectEqual(true, host.add(card));
+
+    var config = host.device(0);
+    var memory = host.window(window_base, 0x1000_0000);
+    config.vtable.write(config.ctx, ecam(1, 0, 0x10), .word, @intCast(window_base));
+
+    // Placed but not enabled. Firmware sizes regions with decode off, so a region that answered
+    // here would reply from wherever it last sat.
+    try testing.expectEqual(@as(u64, 0xFFFF_FFFF), memory.vtable.read(memory.ctx, 0, .word));
+    try testing.expectEqual(@as(usize, 0), spy.reads);
+
+    config.vtable.write(config.ctx, ecam(1, 0, 0x04), .half, 0x02);
+    try testing.expectEqual(@as(u64, 0x48444d41), memory.vtable.read(memory.ctx, 0, .word));
+    try testing.expectEqual(@as(usize, 1), spy.reads);
+}
+
+test "the bridge says which region an address fell in and how far into it" {
+    var spy: Spy = .{};
+    var host: PciHost = .{};
+    var card = wide_card;
+    card.handler = spy.regions();
+    try testing.expectEqual(true, host.add(card));
+
+    var config = host.device(0);
+    var memory = host.window(window_base, 0x1000_0000);
+
+    // Region zero at the bottom of the window, region two a megabyte up.
+    config.vtable.write(config.ctx, ecam(1, 0, 0x10), .word, @intCast(window_base));
+    config.vtable.write(config.ctx, ecam(1, 0, 0x18), .word, @intCast(window_base + 0x40_0000));
+    config.vtable.write(config.ctx, ecam(1, 0, 0x1c), .word, 0);
+    config.vtable.write(config.ctx, ecam(1, 0, 0x04), .half, 0x02);
+
+    _ = memory.vtable.read(memory.ctx, 0x24, .word);
+    try testing.expectEqual(@as(usize, 0), spy.region);
+    try testing.expectEqual(@as(u64, 0x24), spy.offset);
+
+    _ = memory.vtable.read(memory.ctx, 0x40_0000 + 0x1000, .word);
+    try testing.expectEqual(@as(usize, 2), spy.region);
+    try testing.expectEqual(@as(u64, 0x1000), spy.offset);
+
+    memory.vtable.write(memory.ctx, 0x08, .word, 0xdeadbeef);
+    try testing.expectEqual(@as(usize, 0), spy.region);
+    try testing.expectEqual(@as(u64, 0xdeadbeef), spy.wrote);
+}
+
+test "an address inside the window that no region covers reads all ones" {
+    var spy: Spy = .{};
+    var host: PciHost = .{};
+    var card = glacier;
+    card.handler = spy.regions();
+    try testing.expectEqual(true, host.add(card));
+
+    var config = host.device(0);
+    var memory = host.window(window_base, 0x1000_0000);
+    config.vtable.write(config.ctx, ecam(1, 0, 0x10), .word, @intCast(window_base));
+    config.vtable.write(config.ctx, ecam(1, 0, 0x04), .half, 0x02);
+
+    // Past the end of the four kilobyte region, so nothing owns it.
+    try testing.expectEqual(@as(u64, 0xFFFF_FFFF), memory.vtable.read(memory.ctx, 0x1_0000, .word));
+    try testing.expectEqual(@as(usize, 0), spy.reads);
+    try testing.expectEqual(@as(u64, 1), host.unclaimed);
+
+    // And an access that would run off the end of a region is not half served.
+    try testing.expectEqual(@as(u64, 0xFFFF_FFFF_FFFF_FFFF), memory.vtable.read(memory.ctx, 0xFFC, .double));
+}
+
+test "the rom answers only when both enables are set, and its tail is zero" {
+    const image = [_]u8{ 0x55, 0xaa, 0x40, 0x00 };
+    var host: PciHost = .{};
+    var card = glacier;
+    card.rom = &image;
+    try testing.expectEqual(true, host.add(card));
+
+    var config = host.device(0);
+    var memory = host.window(window_base, 0x1000_0000);
+    const rom_at: u64 = window_base + 0x80_0000;
+    config.vtable.write(config.ctx, ecam(1, 0, 0x30), .word, @intCast(rom_at));
+    config.vtable.write(config.ctx, ecam(1, 0, 0x04), .half, 0x02);
+
+    // Memory space is on but the rom's own enable is not, so firmware sees nothing yet.
+    try testing.expectEqual(@as(u64, 0xFFFF_FFFF), memory.vtable.read(memory.ctx, 0x80_0000, .word));
+
+    config.vtable.write(config.ctx, ecam(1, 0, 0x30), .word, @intCast(rom_at | rom_enable));
+    // The signature a firmware looks for before it believes there is an image at all.
+    try testing.expectEqual(@as(u64, 0xaa55), memory.vtable.read(memory.ctx, 0x80_0000, .half));
+
+    // The region is as large as the card declared and the image is four bytes, so the rest reads as
+    // zero rather than as whatever follows the image in host memory.
+    try testing.expectEqual(@as(u64, 0), memory.vtable.read(memory.ctx, 0x80_0000 + 0x1000, .word));
+
+    // A rom is read only, and a guest writing to one changes nothing.
+    memory.vtable.write(memory.ctx, 0x80_0000, .half, 0);
+    try testing.expectEqual(@as(u64, 0xaa55), memory.vtable.read(memory.ctx, 0x80_0000, .half));
+}
+
+test "a declared function with nobody to answer is counted rather than guessed at" {
+    var host: PciHost = .{};
+    try testing.expectEqual(true, host.add(glacier));
+
+    var config = host.device(0);
+    var memory = host.window(window_base, 0x1000_0000);
+    config.vtable.write(config.ctx, ecam(1, 0, 0x10), .word, @intCast(window_base));
+    config.vtable.write(config.ctx, ecam(1, 0, 0x04), .half, 0x02);
+
+    try testing.expectEqual(@as(u64, 0), memory.vtable.read(memory.ctx, 0, .word));
+    try testing.expectEqual(@as(u64, 1), host.unanswered);
 }
