@@ -24,6 +24,27 @@ pub const vsock: Device = .{ .addr = fdt.vsock_base, .intid = fdt.vsock_intid };
 pub const balloon: Device = .{ .addr = fdt.balloon_base, .intid = fdt.balloon_intid };
 pub const net: Device = .{ .addr = fdt.net_base, .intid = fdt.net_intid };
 
+/// One window a region may be placed in.
+pub const Window = struct {
+    at: u64,
+    len: u64,
+};
+
+/// Where a pci host bridge sits: config space, and the windows it decodes. The addresses are the
+/// ones the device tree names, so the bus the guest reads and the tree it was given cannot
+/// disagree. A narrow region goes in the low window, a wide one may go in either.
+pub const Bridge = struct {
+    ecam: u64,
+    memory: Window,
+    memory64: Window,
+};
+
+pub const pci: ?Bridge = .{
+    .ecam = fdt.ecam_base,
+    .memory = .{ .at = fdt.pci_memory_base, .len = fdt.pci_memory_size },
+    .memory64 = .{ .at = fdt.pci_memory64_base, .len = fdt.pci_memory64_size },
+};
+
 /// Whether the guest's serial port is reached through an I/O port rather than memory. arm
 /// has no port space, so every device is memory mapped and the run loop needs no port bus.
 pub const serial_is_port = false;

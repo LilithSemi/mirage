@@ -321,6 +321,11 @@ pub fn build(b: *std.Build) void {
         // is what makes it a gate that can always run, unlike the one that needs passt.
         const nat_on = b.option(bool, "nat", "Give the guest a network of this vmm's own") orelse false;
         boot_options.addOption(bool, "nat", nat_on);
+        // A pci host bridge with nothing behind it. The guest enumerates an empty bus, which is what
+        // says the config window, the two memory windows and the tree all agree. Needs a kernel with
+        // the generic host bridge driver built in, which the small kernel here does not have.
+        const pci_on = b.option(bool, "pci", "Give the guest a pci host bridge") orelse false;
+        boot_options.addOption(bool, "pci", pci_on);
         // Whether the guest is offered a directory on this machine to mount. Needs a kernel with the
         // filesystem driver built in, which the default kernel here does not have.
         boot_options.addOption(bool, "share", share_on);

@@ -639,6 +639,9 @@ pub const Config = struct {
     net: bool = false,
     share: bool = false,
     tpm: bool = false,
+    /// Whether the guest is told it has a pci host bridge. Nothing here describes one yet, so a
+    /// runner that asks for one is refused before it reaches this.
+    pci: bool = false,
     ram_base: u64,
     ram_size: u64,
     cpus: u32,

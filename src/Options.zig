@@ -36,6 +36,7 @@ pub const usage =
     \\  --firmware-room <mb>  how much room to give it, 64 by default
     \\  --root-hash <hex>     the hash tree root of the root filesystem, measured by name
     \\  --tpm <path>          a socket a security chip is listening on
+    \\  --pci yes             give the guest a pci host bridge
     \\  --share <name>=<dir>  offer that directory under that name, read only
     \\  --share <n>=<dir>:write  offer it and let the guest change what is in it
     \\  --session <path>      hold the guest up for whoever connects here
@@ -101,6 +102,9 @@ root_hash: ?[]const u8 = null,
 /// A socket a program implementing the chip's commands is listening on. Whoever starts a guest
 /// starts that program, the same way it starts the network helper.
 tpm: ?[]const u8 = null,
+/// Whether the guest is given a pci host bridge. Nothing sits behind it yet, so a guest with one
+/// enumerates an empty bus, which is what says the window and the tree agree.
+pci: bool = false,
 /// Directories on this machine the guest is offered, each under a name. The guest mounts one
 /// filesystem and sees a name for each of them, which is what lets the set change while it runs.
 shares: [max_shares]Share = @splat(.{}),
@@ -190,6 +194,8 @@ pub fn parse(args: []const [:0]const u8) !Options {
             options.cpus = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, name, "--tpm")) {
             options.tpm = value;
+        } else if (std.mem.eql(u8, name, "--pci")) {
+            options.pci = std.mem.eql(u8, value, "yes");
         } else if (std.mem.eql(u8, name, "--root-hash")) {
             options.root_hash = value;
         } else if (std.mem.eql(u8, name, "--firmware-at")) {

@@ -105,7 +105,7 @@ pub fn hostResolver(io: std.Io, gpa: std.mem.Allocator) netmod.Ip4 {
 /// here and not something a guest can cause, so it asserts.
 pub const Attached = struct {
     /// More than this file has devices to put in them, so adding one needs no arithmetic.
-    const room = 8;
+    const room = 12;
 
     devices: [room]device.Device = undefined,
     services: [room]device.Service = undefined,

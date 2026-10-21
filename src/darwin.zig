@@ -254,6 +254,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         .vsock = options.vsock != null,
         .net = options.nat,
         .tpm = options.tpm != null,
+        .pci = options.pci,
         .share = options.share_count > 0,
     });
     const ready_at = std.Io.Clock.awake.now(io).nanoseconds;
@@ -369,6 +370,16 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         attached.addServed(shared_fs.device(arm64.fdt.fs_base), shared_fs.service(arm64.fdt.fs_intid));
     }
     if (options.tpm != null) attached.add(chip.device(arm64.fdt.tpm_base));
+    // Config space says where a region is and the windows are the regions, so all three belong to
+    // one bridge. They are separate devices on the bus because they are separate spaces.
+    var bridge: device.PciHost = .{};
+    var bridge_memory: device.PciHost.Window = .{ .host = &bridge, .at = arm64.fdt.pci_memory_base };
+    var bridge_memory64: device.PciHost.Window = .{ .host = &bridge, .at = arm64.fdt.pci_memory64_base };
+    if (options.pci) {
+        attached.add(bridge.device(arm64.fdt.ecam_base));
+        attached.add(bridge_memory.device(arm64.fdt.pci_memory_size));
+        attached.add(bridge_memory64.device(arm64.fdt.pci_memory64_size));
+    }
     if (disk != null) {
         attached.addServed(block.device(arm64.fdt.virtio_base), block.service(arm64.fdt.virtio_intid));
     }

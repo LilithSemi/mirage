@@ -53,6 +53,10 @@ const net_on = net_socket.len > 0;
 /// beside this test, which is what lets it be a gate that always runs.
 const nat_on = options.nat;
 
+/// Whether the guest is given a pci host bridge with nothing behind it. Needs a kernel with the
+/// generic host bridge driver built in, so it is a gate of its own.
+const pci_on = options.pci;
+
 /// Whether the guest is offered a directory on this machine to mount. Needs a kernel with the
 /// filesystem driver built in, so it is a gate of its own rather than part of every boot.
 const share_on = options.share;
@@ -417,6 +421,7 @@ test "a real linux kernel boots far enough to speak" {
         .balloon = balloon_on,
         .net = net_on or nat_on,
         .tpm = chip_on,
+        .pci = pci_on,
         .share = share_on,
     });
 
@@ -527,7 +532,14 @@ test "a real linux kernel boots far enough to speak" {
         shared_fs.init(fsmod.Export.tag, .{ .ctx = &offered.?, .answer = answerShare }, share_asked, share_answered);
     }
 
-    var devices: [7]device.Device = undefined;
+    // A bridge is three devices on the bus for one bridge: config space, the window below four
+    // gigabytes and the window above it. All three or none, because config space says where a
+    // region is and the windows are where it answers.
+    var bridge: device.PciHost = .{};
+    var bridge_memory: device.PciHost.Window = .{ .host = &bridge, .at = arm64.fdt.pci_memory_base };
+    var bridge_memory64: device.PciHost.Window = .{ .host = &bridge, .at = arm64.fdt.pci_memory64_base };
+
+    var devices: [10]device.Device = undefined;
     var services: [5]device.Service = undefined;
     devices[0] = serial.device(uart_base);
     devices[1] = block.device(arm64.fdt.virtio_base);
@@ -562,6 +574,12 @@ test "a real linux kernel boots far enough to speak" {
         // The chip answers reads and writes only, so it goes on the bus and needs no service.
         devices[on_bus] = chip.device(arm64.fdt.tpm_base);
         on_bus += 1;
+    }
+    if (pci_on) {
+        devices[on_bus] = bridge.device(arm64.fdt.ecam_base);
+        devices[on_bus + 1] = bridge_memory.device(arm64.fdt.pci_memory_size);
+        devices[on_bus + 2] = bridge_memory64.device(arm64.fdt.pci_memory64_size);
+        on_bus += 3;
     }
     var bus: device.Bus = .{ .devices = devices[0..on_bus] };
 
@@ -1002,6 +1020,21 @@ test "a real linux kernel boots far enough to speak" {
         try std.testing.expect(std.mem.indexOf(u8, log, "Unable to mount root fs") != null);
         try std.testing.expect(std.mem.indexOf(u8, log, "mirage guest is alive") == null);
         try std.testing.expect(std.mem.indexOf(u8, log, "Mounted root (erofs filesystem)") == null);
+    }
+
+    if (pci_on) {
+        // The kernel read the tree, bound its generic host bridge driver to the node, and walked
+        // config space. The ranges it prints are the ones the tree named, so a window the bus does
+        // not carry would appear here and answer nothing.
+        try std.testing.expect(std.mem.indexOf(u8, log, "PCI host bridge to bus 0000:00") != null);
+        try std.testing.expect(std.mem.indexOf(u8, log, "ECAM at [mem 0x30000000-0x300fffff]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, log, "MEM 0x0038000000..0x003fffffff") != null);
+
+        // And it read the window rather than only the tree. The bus is empty, so every slot it
+        // asked about named no function: that count is the enumeration itself, and it stays zero
+        // if the kernel never reached the window the tree sent it to.
+        try std.testing.expect(bridge.unclaimed > 0);
+        try std.testing.expectEqual(@as(u64, 0), bridge.unanswered);
     }
 
     try std.testing.expectEqual(@as(u64, 0), bus.unmapped);

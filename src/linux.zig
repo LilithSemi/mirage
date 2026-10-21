@@ -244,6 +244,10 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         return;
     };
     if (try options.complain(out, arch.platform.cpusThatFit(ram_base))) return;
+    if (options.pci and arch.platform.pci == null) {
+        try out.writeAll("a pci bridge on this architecture is not described to a guest yet\n");
+        return;
+    }
 
     // A harness starts a guest for every session, so where the time goes before the guest
     // runs matters as much as how fast the guest boots.
@@ -434,6 +438,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         .balloon = options.limit != null,
         .net = options.net != null or options.nat,
         .tpm = options.tpm != null,
+        .pci = options.pci,
         .share = options.share_count > 0,
     };
 
@@ -630,6 +635,24 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         attached.addServed(shared_fs.device(platform.fs.addr), shared_fs.service(platform.fs.intid));
     }
     if (options.tpm != null) attached.add(chip.device(platform.tpm.addr));
+    // Config space says where a region is and the windows are the regions, so all three belong to
+    // one bridge. They are separate devices on the bus because they are separate spaces.
+    var bridge: device.PciHost = .{};
+    var bridge_memory: device.PciHost.Window = .{
+        .host = &bridge,
+        .at = if (platform.pci) |each| each.memory.at else 0,
+    };
+    var bridge_memory64: device.PciHost.Window = .{
+        .host = &bridge,
+        .at = if (platform.pci) |each| each.memory64.at else 0,
+    };
+    if (options.pci) {
+        if (platform.pci) |each| {
+            attached.add(bridge.device(each.ecam));
+            attached.add(bridge_memory.device(each.memory.len));
+            attached.add(bridge_memory64.device(each.memory64.len));
+        }
+    }
     if (disk != null) {
         attached.addServed(block.device(platform.virtio.addr), block.service(platform.virtio.intid));
     }

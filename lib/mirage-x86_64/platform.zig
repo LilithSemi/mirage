@@ -45,6 +45,23 @@ pub const tpm: Device = .{ .addr = 0xfed4_0000, .intid = 0 };
 /// it on a port, so the run loop gives the serial a port bus rather than the memory one.
 pub const serial_is_port = true;
 
+/// One window a region may be placed in.
+pub const Window = struct {
+    at: u64,
+    len: u64,
+};
+
+/// Where a pci host bridge sits. There is none here: a guest on this architecture learns of one
+/// from the ACPI memory mapped config space table, which this VMM does not write, and a bridge no
+/// guest is told about is a window nothing ever reads.
+pub const Bridge = struct {
+    ecam: u64,
+    memory: Window,
+    memory64: Window,
+};
+
+pub const pci: ?Bridge = null;
+
 const testing = @import("mirage-testing");
 const std = @import("std");
 

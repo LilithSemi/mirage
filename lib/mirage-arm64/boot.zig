@@ -150,6 +150,8 @@ pub const Config = struct {
     share: bool = false,
     /// Whether the guest is told it has a security chip.
     tpm: bool = false,
+    /// Whether the guest is told it has a pci host bridge.
+    pci: bool = false,
     ram_base: u64,
     ram_size: u64,
     cpus: u32,
@@ -244,6 +246,7 @@ pub fn prepare(
         .net = config.net,
         .share = config.share,
         .tpm = config.tpm,
+        .pci = config.pci,
     };
 
     // A guest with a chip is given the list of measurements to go with it, because a register says
@@ -378,6 +381,7 @@ fn prepareFirmware(
         .net = config.net,
         .share = config.share,
         .tpm = config.tpm,
+        .pci = config.pci,
     };
 
     // What this launch measures, in order. One list, so what goes into the length and what goes into
