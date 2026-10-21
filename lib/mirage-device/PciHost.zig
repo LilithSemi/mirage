@@ -135,6 +135,9 @@ pub const State = struct {
     /// two writes and the guest may make them in either order.
     bases: [max_regions]u32 = @splat(0),
     rom_base: u32 = 0,
+    /// How many times each base address register was read. A driver reads one to learn where
+    /// firmware put its region, so this says which regions anything went looking for.
+    base_reads: [max_regions]u64 = @splat(0),
     /// What the guest wrote to the message signalled interrupt capability, kept so a read gives
     /// back what was written. Nothing here ever sends a message, and the address is where one
     /// would go when something does.
@@ -284,12 +287,13 @@ fn kindBits(each: Region) u32 {
 }
 
 /// One dword of a function's config space.
-fn word(self: *const PciHost, slot: usize, reg: u64) u32 {
+fn word(self: *PciHost, slot: usize, reg: u64) u32 {
     const one = self.functions[slot].?;
     const held = self.state[slot];
 
     if (reg >= 0x10 and reg < 0x10 + max_regions * 4) {
         const index = (reg - 0x10) / 4;
+        self.state[slot].base_reads[index] += 1;
         return switch (roleOf(one, index)) {
             .none => 0,
             .low => |owner| held.bases[index] | kindBits(one.regions[owner]),

@@ -230,6 +230,20 @@ transfers: u64 = 0,
 /// counted rather than refused loudly.
 strayed: u64 = 0,
 
+/// Reads of the device table, and of the word that says it is a table at all. A driver that read
+/// nothing here and worked anyway was using addresses it was built with rather than the ones this
+/// card reports, which is passing for the wrong reason.
+table_reads: u64 = 0,
+table_found: u64 = 0,
+/// Writes to a display's mode select. Only a driver that has published a frame buffer and been
+/// asked to use it writes this, so it separates a driver that refused from one that was never
+/// called.
+mode_selects: u64 = 0,
+/// Bytes written into the frame buffer, and bytes written into the aperture outside it. The first
+/// is pixels. The second is a driver painting where it should not, which nothing is expected to do.
+painted: u64 = 0,
+outside: u64 = 0,
+
 /// What the bridge puts in config space for this card.
 pub fn function(self: *Glacier, at: PciHost.Address) PciHost.Function {
     var one: PciHost.Function = .{
@@ -390,7 +404,7 @@ fn statusWord(self: *const Glacier) u32 {
     return value;
 }
 
-fn registerWord(self: *const Glacier, at: u64) u32 {
+fn registerWord(self: *Glacier, at: u64) u32 {
     if (at >= table_at) return self.tableWord(at - table_at);
     return switch (at) {
         reg.id => id,
@@ -411,6 +425,13 @@ fn read(ctx: *anyopaque, region: usize, offset: u64, size: Bus.Size) u64 {
     const self: *Glacier = @ptrCast(@alignCast(ctx));
     if (region == window_region) return self.windowRead(offset, size);
     if (region != 0) return 0;
+
+    // One access, however many bytes it takes. A driver reads the table to learn where the rest of
+    // the card is, and one that read nothing here was built with addresses of its own.
+    if (offset >= table_at) {
+        self.table_reads += 1;
+        if (offset == table_at and self.entryCount() != 0) self.table_found += 1;
+    }
 
     // A driver reads whole words and firmware reads whatever it likes, so an access of any width
     // at any offset is assembled from the words it covers.
@@ -499,10 +520,33 @@ fn fabricRead(self: *Glacier, at: u64) ?u32 {
 /// Returns whether the write landed. A write into the display block reaches a register rather than
 /// memory, and nothing here changes a mode, so it is taken and dropped.
 fn fabricWrite(self: *Glacier, at: u64, value: u32) bool {
-    if (self.displayWord(at) != null) return true;
+    if (self.displayWord(at) != null) {
+        // The one register in the block a driver writes. Firmware asks for a mode through the
+        // protocol the driver published, and this is the only way that ask reaches the card.
+        if (self.display != null and at == self.display_at + displays_at + 0x08) {
+            self.mode_selects += 1;
+        }
+        return true;
+    }
+
     const word = self.memoryWord(at) orelse return false;
     std.mem.writeInt(u32, word, value, .little);
     return true;
+}
+
+/// Where bytes of fabric landed: in the frame buffer, or in the aperture around it. Counted by the
+/// caller rather than inside the write, because the window writes a byte at a time while the engine
+/// writes a word, and both have to come to the same number of bytes.
+fn landed(self: *Glacier, at: u64, bytes: u64) void {
+    const shown = self.display orelse return;
+    const needed = @as(u64, shown.pitch) * shown.height;
+    if (at >= shown.framebuffer and at < shown.framebuffer + needed) {
+        self.painted += bytes;
+        return;
+    }
+
+    const each = self.aperture orelse return;
+    if (at >= each.at and at < each.at + each.len) self.outside += bytes;
 }
 
 fn move(self: *Glacier) void {
@@ -551,6 +595,7 @@ fn move(self: *Glacier) void {
                 self.failure = .fabric;
                 return;
             }
+            self.landed(local, 4);
             self.data = word;
         }
         // Counted as each word lands, so a transfer that stopped half way says how far it got.
@@ -609,7 +654,7 @@ fn windowWrite(self: *Glacier, offset: u64, size: Bus.Size, value: u64) void {
         };
         const byte: u32 = @intCast((value >> @intCast(taken * 8)) & 0xff);
         const mask = @as(u32, 0xff) << (shift * 8);
-        _ = self.fabricWrite(at, (whole & ~mask) | (byte << (shift * 8)));
+        if (self.fabricWrite(at, (whole & ~mask) | (byte << (shift * 8)))) self.landed(whole_at, 1);
     }
 }
 
@@ -1051,4 +1096,61 @@ test "an address at the top of the address space is refused rather than wrapped"
 
     try testing.expectEqual(@backingInt(Failure.fabric), peek(&low, reg.error_code));
     try testing.expectEqual(@as(u32, 0), peek(&low, reg.completed));
+}
+
+test "the card says how far a driver got with it" {
+    var fixture: Fixture = .{};
+    var one = fixture.card();
+    const block = Fixture.fabric_at + 0x20_0000;
+    one.aperture = .{ .at = Fixture.fabric_at, .len = 0x20_0000 };
+    one.display = prototype_display;
+    one.display_at = block;
+
+    // Nothing has been asked of it yet, so every one of these says nothing happened.
+    try testing.expectEqual(@as(u64, 0), one.table_reads);
+    try testing.expectEqual(@as(u64, 0), one.mode_selects);
+    try testing.expectEqual(@as(u64, 0), one.painted);
+
+    // A driver that reads the table and finds the word that names it was given the addresses this
+    // card reports. One that read nothing and worked anyway was built with addresses of its own,
+    // which is passing for the wrong reason.
+    try testing.expectEqual(table_id, peek(&one, table_at));
+    try testing.expectEqual(@as(u64, 1), one.table_found);
+    try std.testing.expect(one.table_reads > 0);
+
+    // The mode select, which only firmware asking the driver for a mode reaches.
+    var handler = one.regions();
+    _ = through(&one, &fixture, block + displays_at + 0x08);
+    try testing.expectEqual(@as(u64, 0), one.mode_selects);
+    put(&one, reg.host_low, Fixture.host_at);
+    put(&one, reg.local_low, @truncate(block + displays_at + 0x08));
+    put(&one, reg.length, 1);
+    put(&one, reg.control, control_start);
+    try testing.expectEqual(@as(u64, 1), one.mode_selects);
+
+    // Pixels: bytes inside the frame buffer, and bytes in the aperture outside it. A mode small
+    // enough to see both sides of the boundary, since a whole screen of the real one is more
+    // fabric than this fixture has.
+    var small = prototype_display;
+    small.width = 4;
+    small.height = 2;
+    small.pitch = 16;
+    one.display = small;
+
+    const screen = @as(u64, small.pitch) * small.height;
+    handler.vtable.write(handler.ctx, window_region, 0, .word, 0x00ff_00ff);
+    try testing.expectEqual(@as(u64, 4), one.painted);
+    try testing.expectEqual(@as(u64, 0), one.outside);
+
+    // One word past the last row, which is the aperture and not the screen. A driver painting
+    // here is painting where it should not.
+    handler.vtable.write(handler.ctx, window_region, screen, .word, 0);
+    try testing.expectEqual(@as(u64, 4), one.painted);
+    try testing.expectEqual(@as(u64, 4), one.outside);
+
+    // And the last word of the screen is still the screen, so the boundary is where the rows end
+    // and not a word either side of it.
+    handler.vtable.write(handler.ctx, window_region, screen - 4, .word, 0);
+    try testing.expectEqual(@as(u64, 8), one.painted);
+    try testing.expectEqual(@as(u64, 4), one.outside);
 }

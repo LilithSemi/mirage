@@ -984,6 +984,21 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
                 gpu.transfers,
                 gpu.strayed,
             });
+            // How far the driver got, in the order it gets there: the table it reads the card out
+            // of, the region it asks firmware where it put, the mode firmware asked it for, and
+            // the pixels it painted.
+            try out.print("glacier: {d} reads of the device table, {d} of them finding it\n", .{
+                gpu.table_reads,
+                gpu.table_found,
+            });
+            try out.print("glacier: the aperture register was read {d} times, {d} modes were asked for\n", .{
+                bridge.state[0].base_reads[device.Glacier.window_region],
+                gpu.mode_selects,
+            });
+            try out.print("glacier: {d} bytes painted into the frame buffer, {d} elsewhere in the aperture\n", .{
+                gpu.painted,
+                gpu.outside,
+            });
         }
     }
 
