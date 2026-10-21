@@ -1294,6 +1294,7 @@ const Bench = struct {
     io: std.Io,
     threaded: *std.Io.Threaded,
     at: []const u8,
+    room: std.testing.TmpDir,
     gpa: std.mem.Allocator,
 
     fn open(gpa: std.mem.Allocator) !Bench {
@@ -1301,13 +1302,20 @@ const Bench = struct {
         threaded.* = .init(gpa, .{});
         const io = threaded.io();
 
-        var room: [128]u8 = undefined;
-        const at = try gpa.dupe(u8, std.fmt.bufPrint(&room, "/tmp/mirage-export-test-{d}", .{std.os.linux.getpid()}) catch unreachable);
-        const cwd: std.Io.Dir = .cwd();
-        cwd.deleteTree(io, at) catch {};
-        try cwd.createDir(io, at, .default_dir);
+        // The directory the test runner gives, which sits under the build's own cache rather than
+        // anywhere shared. A fixed path under a system temporary directory is two tests colliding
+        // on a machine somebody else is using, and a build sandbox may not let it be written at
+        // all. An export serves absolute paths, so the open directory is asked where it is.
+        var room = std.testing.tmpDir(.{});
+        errdefer room.cleanup();
 
-        var name: [256]u8 = undefined;
+        var full: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const len = try room.dir.realPath(io, &full);
+        const at = try gpa.dupe(u8, full[0..len]);
+        errdefer gpa.free(at);
+
+        var name: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const cwd: std.Io.Dir = .cwd();
         try cwd.writeFile(io, .{
             .sub_path = std.fmt.bufPrint(&name, "{s}/hello", .{at}) catch unreachable,
             .data = "a store path's contents\n",
@@ -1319,11 +1327,11 @@ const Bench = struct {
         });
         try cwd.symLink(io, "hello", std.fmt.bufPrint(&name, "{s}/link", .{at}) catch unreachable, .{});
 
-        return .{ .io = io, .threaded = threaded, .at = at, .gpa = gpa };
+        return .{ .io = io, .threaded = threaded, .at = at, .room = room, .gpa = gpa };
     }
 
     fn close(self: *Bench) void {
-        std.Io.Dir.cwd().deleteTree(self.io, self.at) catch {};
+        self.room.cleanup();
         self.gpa.free(self.at);
         self.threaded.deinit();
         self.gpa.destroy(self.threaded);

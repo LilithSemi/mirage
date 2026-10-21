@@ -539,8 +539,10 @@ fn untouched(vsock: *Vsock, ports: []const u32) void {
     vsock.init(3, ports);
 }
 
+/// A name nothing else is using. The thread rather than the process, because the linux call for a
+/// process id is a syscall number another kernel does not have.
 fn temporary(what: []const u8, into: []u8) []const u8 {
-    return std.fmt.bufPrint(into, "/tmp/mirage-session-test-{d}-{s}", .{ std.os.linux.getpid(), what }) catch unreachable;
+    return std.fmt.bufPrint(into, "/tmp/mirage-session-test-{d}-{s}", .{ std.Thread.getCurrentId(), what }) catch unreachable;
 }
 
 test "a stream asked for before the guest opened one is refused rather than waited for" {
