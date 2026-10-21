@@ -374,18 +374,23 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     // one bridge. They are separate devices on the bus because they are separate spaces.
     // The card's own memory: the window the guest reaches directly, and a page past it for the
     // block that describes the display.
-    const fabric = if (options.glacier)
+    // The card the caller asked for, if they asked for one. A name and its settings, read where
+    // the device is made rather than turned into fields of its own.
+    const wanted = options.asked("glacier-pci");
+    const wanted_rom = if (wanted) |each| each.romFile() else null;
+
+    const fabric = if (wanted != null)
         try gpa.alloc(u8, device.Glacier.prototype_fabric_size)
     else
         @as([]u8, &.{});
-    defer if (options.glacier) gpa.free(fabric);
-    if (options.glacier) @memset(fabric, 0);
+    defer if (wanted != null) gpa.free(fabric);
+    if (wanted != null) @memset(fabric, 0);
 
-    const option_rom: []const u8 = if (options.glacier_rom) |path|
+    const option_rom: []const u8 = if (wanted_rom) |path|
         try cwd.readFileAlloc(io, path, gpa, file_limit)
     else
         &.{};
-    defer if (options.glacier_rom != null) gpa.free(@constCast(option_rom));
+    defer if (wanted_rom != null) gpa.free(@constCast(option_rom));
 
     var gpu: device.Glacier = .{
         .memory = &memory,
@@ -399,12 +404,12 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         .display_at = device.Glacier.prototype_display_at,
         .rom = option_rom,
     };
-    if (options.glacier) std.debug.assert(gpu.covers());
+    if (wanted != null) std.debug.assert(gpu.covers());
 
     var bridge: device.PciHost = .{};
     var bridge_memory: device.PciHost.Window = .{ .host = &bridge, .at = arm64.fdt.pci_memory_base };
     var bridge_memory64: device.PciHost.Window = .{ .host = &bridge, .at = arm64.fdt.pci_memory64_base };
-    if (options.glacier) std.debug.assert(bridge.add(gpu.function(.{ .device = 1 })));
+    if (wanted != null) std.debug.assert(bridge.add(gpu.function(.{ .device = 1 })));
     if (options.pci) {
         attached.add(bridge.device(arm64.fdt.ecam_base));
         attached.add(bridge_memory.device(arm64.fdt.pci_memory_size));

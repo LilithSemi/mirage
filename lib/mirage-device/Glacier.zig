@@ -195,6 +195,41 @@ pub const Aperture = struct {
     wide: bool = false,
 };
 
+/// What the card was asked to do, as it happens.
+///
+/// A counter says how much; this says what, in order, which is what a test on the other side reads
+/// to say the driver did the right things rather than merely enough of them.
+pub const Event = union(enum) {
+    transfer: Transfer,
+    mode: Mode,
+
+    /// One run of the engine, after it finished. The address and the length are what the driver
+    /// asked for, and the count is how far it got, so a refused transfer says both.
+    pub const Transfer = struct {
+        to_host: bool,
+        host: u64,
+        local: u64,
+        words: u32,
+        moved: u32,
+        failure: Failure,
+    };
+
+    /// A mode asked of a display, which only firmware calling the driver can bring about.
+    pub const Mode = struct {
+        display: usize,
+        value: u32,
+    };
+};
+
+/// Whoever is writing down what the card did. Nothing here keeps the events: a watcher is given
+/// each one as it happens and decides for itself what to do with it.
+pub const Watcher = struct {
+    ctx: *anyopaque,
+    saw: *const fn (ctx: *anyopaque, what: Event) void,
+};
+
+watching: ?Watcher = null,
+
 /// The host's memory. The engine moves words to and from it, and a word it cannot reach is
 /// answered as a completion that did not come back.
 memory: *GuestMemory,
@@ -495,6 +530,20 @@ fn start(self: *Glacier, word: u32) void {
     // Done is set whether the transfer finished or failed. A driver waits for done and then reads
     // the error, so an engine that left done clear on a failure would leave it waiting.
     self.done = true;
+
+    self.tell(.{ .transfer = .{
+        .to_host = self.to_host,
+        .host = self.host,
+        .local = self.local,
+        .words = self.length,
+        .moved = self.completed,
+        .failure = self.failure,
+    } });
+}
+
+fn tell(self: *Glacier, what: Event) void {
+    const watcher = self.watching orelse return;
+    watcher.saw(watcher.ctx, what);
 }
 
 /// A whole word of the card's memory, or nothing where the card has no such address.
@@ -525,6 +574,7 @@ fn fabricWrite(self: *Glacier, at: u64, value: u32) bool {
         // protocol the driver published, and this is the only way that ask reaches the card.
         if (self.display != null and at == self.display_at + displays_at + 0x08) {
             self.mode_selects += 1;
+            self.tell(.{ .mode = .{ .display = 0, .value = value } });
         }
         return true;
     }
@@ -1153,4 +1203,67 @@ test "the card says how far a driver got with it" {
     handler.vtable.write(handler.ctx, window_region, screen - 4, .word, 0);
     try testing.expectEqual(@as(u64, 8), one.painted);
     try testing.expectEqual(@as(u64, 4), one.outside);
+}
+
+/// Collects what the card was asked to do, so a test can look at it afterwards.
+const Notebook = struct {
+    transfers: usize = 0,
+    modes: usize = 0,
+    last_local: u64 = 0,
+    last_mode: u32 = 0xffff_ffff,
+
+    fn watcher(self: *Notebook) Watcher {
+        return .{ .ctx = self, .saw = Notebook.saw };
+    }
+
+    fn saw(ctx: *anyopaque, what: Event) void {
+        const self: *Notebook = @ptrCast(@alignCast(ctx));
+        switch (what) {
+            .transfer => |one| {
+                self.transfers += 1;
+                self.last_local = one.local;
+            },
+            .mode => |one| {
+                self.modes += 1;
+                self.last_mode = one.value;
+            },
+        }
+    }
+};
+
+test "a watcher is told what the card was asked to do, in order" {
+    var fixture: Fixture = .{};
+    var notebook: Notebook = .{};
+    var one = fixture.card();
+    const block = Fixture.fabric_at + 0x20;
+    one.display = prototype_display;
+    one.display_at = block;
+    one.watching = notebook.watcher();
+
+    // One transfer, with where it went and how far it got.
+    _ = through(&one, &fixture, block + 0x10);
+    try testing.expectEqual(@as(usize, 1), notebook.transfers);
+    try testing.expectEqual(block + 0x10, notebook.last_local);
+
+    // And a mode, which is the one thing in the block a driver writes.
+    put(&one, reg.host_low, Fixture.host_at);
+    put(&one, reg.local_low, @truncate(block + displays_at + 0x08));
+    put(&one, reg.length, 1);
+    put(&one, reg.control, control_start);
+    try testing.expectEqual(@as(usize, 1), notebook.modes);
+
+    // A transfer that failed is still a transfer, and says how far it got before it did.
+    put(&one, reg.length, 0);
+    put(&one, reg.control, control_start);
+    try testing.expectEqual(@as(usize, 3), notebook.transfers);
+}
+
+test "a card nobody is watching tells nothing and works the same" {
+    var fixture: Fixture = .{};
+    var one = fixture.card();
+
+    // No watcher, which is how a guest runs when nobody asked for a trace.
+    try testing.expectEqual(@as(?Watcher, null), one.watching);
+    _ = through(&one, &fixture, Fixture.fabric_at);
+    try testing.expectEqual(@as(u64, 1), one.transfers);
 }

@@ -10,6 +10,7 @@ const netmod = @import("mirage-net");
 const sessionmod = @import("mirage-session");
 const fsmod = @import("mirage-fs");
 const Options = @import("Options.zig");
+const Trace = @import("Trace.zig");
 const GuestMemory = @import("mirage-memory").GuestMemory;
 const attest = @import("mirage-attest");
 const Manifest = attest.Manifest;
@@ -548,7 +549,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     // mapped PL011 on arm, an I/O port 16550 on x86. The run loop is given a port bus only when the
     // serial is on one, because a bus with nothing on it still answers an access that matched nothing.
     const Serial = if (arch.platform.serial_is_port) device.Uart16550 else device.Pl011;
-    var serial: Serial = .{ .sink = out };
+    // What the guest has to print for the run to be over, where a caller named one. A test that
+    // knows what a working guest says waits for that rather than for a clock.
+    var serial: Serial = .{ .sink = out, .watch = options.stop_on orelse &.{} };
 
     var block: device.virtio.Block = undefined;
     if (disk) |bytes| block.init(bytes);
@@ -704,21 +707,40 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     };
     // The card's own memory. A region of the fabric rather than of the guest: the engine carries
     // words between the two, and the window lets the guest reach this much of it directly.
-    const fabric = if (options.glacier)
+    // The card the caller asked for, if they asked for one. A name and its settings, read where
+    // the device is made rather than turned into fields of its own.
+    const wanted = options.asked("glacier-pci");
+    const wanted_rom = if (wanted) |each| each.romFile() else null;
+
+    const fabric = if (wanted != null)
         try gpa.alloc(u8, device.Glacier.prototype_fabric_size)
     else
         @as([]u8, &.{});
-    defer if (options.glacier) gpa.free(fabric);
-    if (options.glacier) @memset(fabric, 0);
+    defer if (wanted != null) gpa.free(fabric);
+    if (wanted != null) @memset(fabric, 0);
 
-    const option_rom: []const u8 = if (options.glacier_rom) |path|
+    const option_rom: []const u8 = if (wanted_rom) |path|
         try cwd.readFileAlloc(io, path, gpa, file_limit)
     else
         &.{};
-    defer if (options.glacier_rom != null) gpa.free(@constCast(option_rom));
+    defer if (wanted_rom != null) gpa.free(@constCast(option_rom));
+
+    // Where what the devices did is written down, for a caller testing a driver. Opened before the
+    // guest runs so a device can be told about it as it is made.
+    var trace_file: ?std.Io.File = null;
+    var trace_room: [4096]u8 = undefined;
+    var trace_out: std.Io.File.Writer = undefined;
+    var trace: ?Trace = null;
+    if (options.trace) |path| {
+        trace_file = try cwd.createFile(io, path, .{});
+        trace_out = trace_file.?.writer(io, &trace_room);
+        trace = .{ .out = &trace_out.interface };
+    }
+    defer if (trace_file) |each| each.close(io);
 
     var gpu: device.Glacier = .{
         .memory = &memory,
+        .watching = if (trace != null) trace.?.watcher() else null,
         .fabric = fabric,
         .fabric_at = device.Glacier.prototype_window_at,
         .aperture = .{
@@ -731,7 +753,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     };
     // A window that does not cover every row of the frame buffer is a card firmware refuses. The
     // numbers are this runner's, not the guest's, so this is a mistake here or nowhere.
-    if (options.glacier) std.debug.assert(gpu.covers());
+    if (wanted != null) std.debug.assert(gpu.covers());
 
     if (options.pci) {
         if (platform.pci) |each| {
@@ -740,7 +762,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
             attached.add(bridge_memory64.device(each.memory64.len));
         }
     }
-    if (options.glacier) {
+    if (wanted != null) {
         // The slot is the bridge's to hold and firmware's to configure. A table that is full or a
         // card that describes regions the registers cannot hold is this runner being wrong.
         std.debug.assert(bridge.add(gpu.function(.{ .device = 1 })));
@@ -856,6 +878,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
 
     var end: Host = .{
         .io = io,
+        .heard = if (options.stop_on != null) &serial.said else null,
         .deadline = if (options.seconds) |limit|
             std.Io.Clock.awake.now(io).nanoseconds + @as(i96, limit) * std.time.ns_per_s
         else
@@ -957,7 +980,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         @import("builtin").mode,
     });
 
-    if (end.timed_out) {
+    if (end.said_it) {
+        try out.print("\nthe guest said what it was waited on to say\n", .{});
+    } else if (end.timed_out) {
         // `stopped` says the loop ended, not why. A guest that ran out of time and one
         // that was asked to stop look the same from inside the loop.
         try out.print("\nthe guest ran out of time after {?d} seconds\n", .{options.seconds});
@@ -965,6 +990,10 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     } else {
         try out.print("\nthe guest stopped: {t}\n", .{reason});
     }
+
+    // Everything counted, as the last line of the trace, so a test that wants an answer reads one
+    // line and a test that wants the story walks the rest.
+    if (trace) |*each| each.summary(&bridge, &gpu);
 
     // Where firmware put each region, which is the only account of whether it enumerated the bus
     // at all. A bridge nothing looked at reads as no regions placed and no slots asked about.
@@ -978,7 +1007,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
                 try out.print("pci: region {d} placed at {x}\n", .{ each, at });
             }
         }
-        if (options.glacier) {
+        if (wanted != null) {
             try out.print("pci: the rom was read {d} times, the card ran {d} transfers and {d} accesses strayed\n", .{
                 bridge.rom_reads,
                 gpu.transfers,

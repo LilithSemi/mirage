@@ -4,6 +4,7 @@
 //! every system, and what a caller may ask for is the same on all of them.
 
 const std = @import("std");
+const device = @import("mirage-device");
 
 pub const usage =
     \\mirage <command> [options]
@@ -38,8 +39,10 @@ pub const usage =
     \\  --root-hash <hex>     the hash tree root of the root filesystem, measured by name
     \\  --tpm <path>          a socket a security chip is listening on
     \\  --pci yes             give the guest a pci host bridge
-    \\  --glacier yes         put a glacier card behind the bridge
-    \\  --glacier-rom <path>  its expansion rom image
+    \\  --device <spec>       add a device, as `name,setting=value`
+    \\                        glacier-pci[,romfile=<path>]
+    \\  --trace <path>        write what the devices did, one json line each
+    \\  --stop-on <text>      stop once the guest has printed this
     \\  --share <name>=<dir>  offer that directory under that name, read only
     \\  --share <n>=<dir>:write  offer it and let the guest change what is in it
     \\  --session <path>      hold the guest up for whoever connects here
@@ -112,12 +115,15 @@ tpm: ?[]const u8 = null,
 /// Whether the guest is given a pci host bridge. On its own it enumerates an empty bus, which is
 /// what says the window and the tree agree.
 pci: bool = false,
-/// Whether a glacier card sits behind the bridge. A card needs a bridge, so asking for one asks
-/// for the other.
-glacier: bool = false,
-/// The card's expansion rom image. Firmware runs what is in it, so a card with none declares no
-/// rom at all rather than a rom that reads as zeros.
-glacier_rom: ?[]const u8 = null,
+/// The devices the caller asked for, in the order they asked.
+devices: [max_devices]Device = @splat(.{}),
+device_count: usize = 0,
+/// Where to write what the devices were asked to do. For a caller testing a driver rather than
+/// running a guest: the counts a run prints say how much happened, and this says what.
+trace: ?[]const u8 = null,
+/// Something to watch the guest print, after which the run ends. A test that knows what a working
+/// guest says waits for it to say that, rather than for a clock to run out.
+stop_on: ?[]const u8 = null,
 /// Directories on this machine the guest is offered, each under a name. The guest mounts one
 /// filesystem and sees a name for each of them, which is what lets the set change while it runs.
 shares: [max_shares]Share = @splat(.{}),
@@ -138,6 +144,59 @@ sev_policy: u32 = 0,
 /// How many a caller may name at boot. A harness names its store, the place work happens, a cache, a
 /// scratch area, somewhere to keep notes, and whatever a project binds, so the number is not small.
 pub const max_shares = 16;
+
+/// How many devices a caller may name. A machine of this shape has a handful of slots, and a guest
+/// is given the devices it was told about in the tree beside them.
+pub const max_devices = 4;
+
+/// A device the caller asked for, written the way a machine takes one: a name, and settings after
+/// it. `glacier-pci,optrom=/path/to/rom`.
+pub const Device = struct {
+    name: []const u8 = &.{},
+    /// Everything after the name, taken apart when a setting is asked for rather than here, so a
+    /// device whose settings this program does not know still parses.
+    settings: []const u8 = &.{},
+
+    /// The expansion rom image, under either name it may be written: the one other virtual machine
+    /// monitors take, and the one this started out with.
+    pub fn romFile(self: Device) ?[]const u8 {
+        return self.get("romfile") orelse self.get("optrom");
+    }
+
+    /// What a setting says, or nothing where it was not given. A setting written with no value
+    /// reads as `yes`, which is how a machine takes one that is only on or off.
+    pub fn get(self: Device, key: []const u8) ?[]const u8 {
+        var rest = self.settings;
+        while (rest.len != 0) {
+            const end = std.mem.indexOfScalar(u8, rest, ',') orelse rest.len;
+            const one = rest[0..end];
+            rest = if (end == rest.len) &.{} else rest[end + 1 ..];
+
+            const split = std.mem.indexOfScalar(u8, one, '=') orelse {
+                if (std.mem.eql(u8, one, key)) return "yes";
+                continue;
+            };
+            if (std.mem.eql(u8, one[0..split], key)) return one[split + 1 ..];
+        }
+        return null;
+    }
+};
+
+/// The devices this machine knows how to make. A name that is not one of these is a device nobody
+/// builds, and a guest started without it would be a guest missing what it was asked to have.
+///
+/// The names are the shape a caller coming from another virtual machine monitor expects: what the
+/// device is, then the bus it is on. A virtio device behind the bridge would be `virtio-net-pci`
+/// by the same rule.
+pub const known_devices = [_][]const u8{"glacier-pci"};
+
+/// The device of this name the caller asked for, if they asked for one.
+pub fn asked(self: *const Options, name: []const u8) ?Device {
+    for (self.devices[0..self.device_count]) |each| {
+        if (std.mem.eql(u8, each.name, name)) return each;
+    }
+    return null;
+}
 
 pub const Share = struct {
     name: []const u8 = &.{},
@@ -209,13 +268,19 @@ pub fn parse(args: []const [:0]const u8) !Options {
             options.tpm = value;
         } else if (std.mem.eql(u8, name, "--pci")) {
             options.pci = std.mem.eql(u8, value, "yes");
-        } else if (std.mem.eql(u8, name, "--glacier")) {
-            const on = std.mem.eql(u8, value, "yes");
-            options.glacier = on;
-            if (on) options.pci = true;
-        } else if (std.mem.eql(u8, name, "--glacier-rom")) {
-            options.glacier_rom = value;
-            options.glacier = true;
+        } else if (std.mem.eql(u8, name, "--trace")) {
+            options.trace = value;
+        } else if (std.mem.eql(u8, name, "--stop-on")) {
+            options.stop_on = value;
+        } else if (std.mem.eql(u8, name, "--device")) {
+            if (options.device_count == max_devices) return error.TooManyDevices;
+            const end = std.mem.indexOfScalar(u8, value, ',') orelse value.len;
+            options.devices[options.device_count] = .{
+                .name = value[0..end],
+                .settings = if (end == value.len) &.{} else value[end + 1 ..],
+            };
+            options.device_count += 1;
+            // A card needs a bridge to sit behind, so asking for one asks for the other.
             options.pci = true;
         } else if (std.mem.eql(u8, name, "--root-hash")) {
             options.root_hash = value;
@@ -298,9 +363,77 @@ pub fn complain(self: Options, out: *std.Io.Writer, cpu_room: u64) !bool {
             return true;
         }
     }
+    if (self.stop_on) |text| {
+        if (text.len == 0 or text.len > device.Pl011.max_watch) {
+            try out.print("what a guest is waited on to print is between 1 and {d} characters\n", .{
+                device.Pl011.max_watch,
+            });
+            return true;
+        }
+    }
+
+    for (self.devices[0..self.device_count]) |each| {
+        var known = false;
+        for (known_devices) |name| {
+            if (std.mem.eql(u8, each.name, name)) known = true;
+        }
+        if (!known) {
+            try out.print("there is no device called {s}, and this machine makes:\n", .{each.name});
+            for (known_devices) |name| try out.print("  {s}\n", .{name});
+            return true;
+        }
+    }
     if (self.cpus > cpu_room) {
         try out.print("the machine this describes has room for {d} cpus\n", .{cpu_room});
         return true;
     }
     return false;
+}
+
+test "a device is a name and the settings after it" {
+    const options = try parse(&.{ "--device", "glacier-pci,romfile=/tmp/glacier.rom" });
+
+    const card = options.asked("glacier-pci").?;
+    try std.testing.expectEqualSlices(u8, "glacier-pci", card.name);
+    try std.testing.expectEqualSlices(u8, "/tmp/glacier.rom", card.romFile().?);
+
+    // A setting nobody gave is nothing, rather than an empty value that reads as a path.
+    try std.testing.expectEqual(@as(?[]const u8, null), card.get("window"));
+
+    // And a card needs a bridge, so asking for one asks for the other.
+    try std.testing.expect(options.pci);
+}
+
+test "a device with no settings is still a device" {
+    const options = try parse(&.{ "--device", "glacier-pci" });
+
+    const card = options.asked("glacier-pci").?;
+    try std.testing.expectEqualSlices(u8, "glacier-pci", card.name);
+    try std.testing.expectEqual(@as(?[]const u8, null), card.romFile());
+    try std.testing.expectEqual(@as(?Device, null), options.asked("something-else"));
+}
+
+test "the rom is taken under the name other machines use for it, or the older one" {
+    const theirs = try parse(&.{ "--device", "glacier-pci,romfile=/tmp/a.rom" });
+    try std.testing.expectEqualSlices(u8, "/tmp/a.rom", theirs.asked("glacier-pci").?.romFile().?);
+
+    const ours = try parse(&.{ "--device", "glacier-pci,optrom=/tmp/b.rom" });
+    try std.testing.expectEqualSlices(u8, "/tmp/b.rom", ours.asked("glacier-pci").?.romFile().?);
+}
+
+test "a setting written on its own is one that is simply on" {
+    const options = try parse(&.{ "--device", "glacier-pci,romfile=/tmp/a.rom,quiet" });
+
+    const card = options.asked("glacier-pci").?;
+    try std.testing.expectEqualSlices(u8, "yes", card.get("quiet").?);
+    try std.testing.expectEqualSlices(u8, "/tmp/a.rom", card.romFile().?);
+}
+
+test "a device nobody builds is refused by name" {
+    var room: [256]u8 = undefined;
+    var said: std.Io.Writer = .fixed(&room);
+
+    const options = try parse(&.{ "--kernel", "/tmp/Image", "--device", "nvme" });
+    try std.testing.expect(try options.complain(&said, 64));
+    try std.testing.expect(std.mem.indexOf(u8, said.buffered(), "no device called nvme") != null);
 }
