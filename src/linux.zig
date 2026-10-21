@@ -358,6 +358,22 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     else
         null;
 
+    // Where firmware keeps its variables: a second bank of flash, directly above the image. Not
+    // memory: firmware erases and programs it by writing commands to it and waiting for a status
+    // register to answer, and memory that took those commands as data would leave it reading its
+    // own command back forever.
+    const vars = if (options.firmware_vars) |path|
+        try cwd.readFileAlloc(io, path, gpa, file_limit)
+    else
+        null;
+    defer if (vars) |bytes| gpa.free(bytes);
+
+    const vars_at = options.firmware_at + firmware_room;
+    // As much of the store as firmware keeps anything in. It holds three regions there, a quarter
+    // of a megabyte each, and reads nothing above them: a bank declared as large as the file is
+    // sixty four megabytes of window that nobody reads and every read of which leaves the guest.
+    const vars_room = if (vars) |bytes| @min(std.mem.alignForward(u64, bytes.len, 64 * 1024), 1024 * 1024) else 0;
+
     var regions: [2]GuestMemory.Region = undefined;
     regions[0] = region;
     var region_count: usize = 1;
@@ -451,6 +467,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     }
 
     var launch_config: core.Launch.Config = .{
+        .vars = if (vars != null) .{ .start = vars_at, .end = vars_at + vars_room } else null,
         .kind = if (options.firmware != null)
             .{ .firmware = .{ .at = options.firmware_at, .len = firmware_room } }
         else
@@ -671,6 +688,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     // of no such device and is given none.
     var settings: device.FwCfg = .{};
     if (options.firmware != null) attached.add(settings.device(platform.fw_cfg.addr));
+
+    var store: device.NorFlash = .{ .store = if (vars) |bytes| bytes else &.{} };
+    if (vars != null) attached.add(store.device(vars_at, vars_room));
     // Config space says where a region is and the windows are the regions, so all three belong to
     // one bridge. They are separate devices on the bus because they are separate spaces.
     var bridge: device.PciHost = .{};

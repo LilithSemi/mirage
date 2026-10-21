@@ -34,6 +34,7 @@ pub const usage =
     \\  --firmware <path>     start this instead of a kernel, from the bottom of memory
     \\  --firmware-at <addr>  where to place it, 0 by default
     \\  --firmware-room <mb>  how much room to give it, 64 by default
+    \\  --firmware-vars <path> the store firmware keeps its variables in
     \\  --root-hash <hex>     the hash tree root of the root filesystem, measured by name
     \\  --tpm <path>          a socket a security chip is listening on
     \\  --pci yes             give the guest a pci host bridge
@@ -98,6 +99,10 @@ firmware: ?[]const u8 = null,
 /// machine would have rather than the size of its image.
 firmware_at: u64 = 0,
 firmware_room: u64 = 64 * 1024 * 1024,
+/// The store firmware keeps its variables in, which is a second bank of flash above the image.
+/// Firmware that is given none is told of one bank, passes over it as its own image, and has
+/// nowhere to put a variable.
+firmware_vars: ?[]const u8 = null,
 /// The root of the hash tree over the root filesystem, as `seal` printed it. Measured under its
 /// own name so a verifier need not find it inside the command line.
 root_hash: ?[]const u8 = null,
@@ -218,6 +223,8 @@ pub fn parse(args: []const [:0]const u8) !Options {
             options.firmware_at = try std.fmt.parseInt(u64, value, 0);
         } else if (std.mem.eql(u8, name, "--firmware-room")) {
             options.firmware_room = try std.fmt.parseInt(u64, value, 0) * 1024 * 1024;
+        } else if (std.mem.eql(u8, name, "--firmware-vars")) {
+            options.firmware_vars = value;
         } else if (std.mem.eql(u8, name, "--firmware")) {
             options.firmware = value;
         } else if (std.mem.eql(u8, name, "--manifest")) {
