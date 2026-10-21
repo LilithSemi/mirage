@@ -248,6 +248,12 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         try out.writeAll("a pci bridge on this architecture is not described to a guest yet\n");
         return;
     }
+    // Where firmware put each region lives in the bridge and not in a snapshot, so a guest that
+    // came back would believe its card is somewhere the bridge no longer answers.
+    if (options.pci and (options.save != null or options.restore != null)) {
+        try out.writeAll("a bridge is not in a snapshot, so a guest with one cannot be moved yet\n");
+        return;
+    }
 
     // A harness starts a guest for every session, so where the time goes before the guest
     // runs matters as much as how fast the guest boots.
