@@ -24,14 +24,15 @@ pub const gicr_stride = 0x2_0000;
 /// port does not boot and does not say why. Up here the only thing above is memory.
 pub const gicr_base = 0x0d00_0000;
 
-/// How many CPUs the redistributors have room for before they would reach memory.
+/// How many CPUs the redistributors have room for before they would reach whatever is next.
 ///
-/// A limit that follows from the address map rather than one chosen here. It is in the thousands, so
-/// nothing will meet it, but a guest that asked for more has to be told rather than left to die in a
-/// window that overlaps its own memory.
+/// A limit that follows from the address map rather than one chosen here. What is next is pci
+/// config space, and memory above it. It is in the thousands, so nothing will meet it, but a guest
+/// that asked for more has to be told rather than left to die in a window that overlaps another.
 pub fn cpusThatFit(ram_base: u64) u64 {
-    if (ram_base <= gicr_base) return 0;
-    return (ram_base - gicr_base) / gicr_stride;
+    const ceiling = @min(ram_base, ecam_base);
+    if (ceiling <= gicr_base) return 0;
+    return (ceiling - gicr_base) / gicr_stride;
 }
 
 /// Where a GICv2 sits instead. The distributor keeps the same address, and the CPU
@@ -86,6 +87,22 @@ pub const fs_intid = 32 + fs_irq;
 pub const tpm_base = 0x0c00_0000;
 pub const tpm_size = 0x5000;
 
+/// Where pci config space sits, and how much of it one bus needs. An address inside the window
+/// names a bus, a device, a function and a register, so one bus of thirty two devices with eight
+/// functions each needs a megabyte. The bridge holds one bus.
+pub const ecam_base = 0x3000_0000;
+pub const ecam_size = 32 * 8 * 0x1000;
+
+/// The window a narrow region is placed in. Below four gigabytes, because that is all a thirty two
+/// bit base address register can name, and below memory because everything the VMM invents is.
+pub const pci_memory_base = 0x3800_0000;
+pub const pci_memory_size = 0x0800_0000;
+
+/// The window a wide region may go in instead. Above memory, where there is room for an aperture
+/// larger than the whole low window and nothing else to collide with.
+pub const pci_memory64_base = 0x80_0000_0000;
+pub const pci_memory64_size = 0x1_0000_0000;
+
 /// Level triggered, active low, for every CPU. This is the encoding an arm64 Linux
 /// guest expects for the architected timer.
 const timer_flags = 0xf08;
@@ -132,6 +149,9 @@ pub const Config = struct {
     share: bool = false,
     /// Whether the machine has a security chip.
     tpm: bool = false,
+    /// Whether the machine has a pci host bridge. A tree that names one the VMM did not build
+    /// sends firmware to enumerate a window that answers nothing.
+    pci: bool = false,
     /// Where the list of measurements is, if the guest is given one. It has to be inside memory the
     /// guest knows about, because Linux reads it through the map of ordinary memory.
     log: ?Range = null,
@@ -162,6 +182,47 @@ fn virtioNode(builder: anytype, name: []u8, at: u64, irq: u32) !void {
     try builder.propCells("reg", &cells(at, virtio_size));
     try builder.propCells("interrupts", &.{ spi, irq, 4 });
     try builder.endNode();
+}
+
+/// The pci host bridge, and the two windows it decodes.
+///
+/// `ranges` is what tells firmware which guest addresses it may place a region at. The first entry
+/// is thirty two bit memory space, the second is sixty four bit prefetchable memory space above
+/// four gigabytes, and both are mapped one to one: the address the guest writes into a base address
+/// register is the address the bridge answers at.
+///
+/// There is no interrupt map. Every interrupt line on the card this was built for is tied off, and
+/// nothing here raises one, so a guest given a map would wait for an interrupt that never comes.
+fn pciNode(builder: anytype, name: []u8) !void {
+    try builder.beginNode(try std.fmt.bufPrint(name, "pcie@{x}", .{ecam_base}));
+    // What Linux's generic host bridge driver binds to. A guest told any other name does not
+    // enumerate the bus at all.
+    try builder.propString("compatible", "pci-host-ecam-generic");
+    try builder.propString("device_type", "pci");
+    // Three cells for a child address, because a pci address is a space code and then sixty four
+    // bits of address.
+    try builder.propU32("#address-cells", 3);
+    try builder.propU32("#size-cells", 2);
+    try builder.propU32("#interrupt-cells", 1);
+    try builder.propCells("reg", &cells(ecam_base, ecam_size));
+    try builder.propCells("bus-range", &.{ 0, 0 });
+    try builder.propCells("ranges", &(windowRange(memory_space, pci_memory_base, pci_memory_size) ++
+        windowRange(memory_space_64 | prefetchable, pci_memory64_base, pci_memory64_size)));
+    try builder.endNode();
+}
+
+/// The space code of a `ranges` entry. Two for thirty two bit memory, three for sixty four bit, and
+/// the bit above them says reads may be prefetched.
+const memory_space: u32 = 0x02 << 24;
+const memory_space_64: u32 = 0x03 << 24;
+const prefetchable: u32 = 1 << 30;
+
+/// One `ranges` entry: where the window is in pci space, where it is in guest memory, and how long
+/// it is. The two addresses are the same because the bridge decodes what firmware wrote.
+fn windowRange(flags: u32, at: u64, len: u64) [7]u32 {
+    const high: u32 = @truncate(at >> 32);
+    const low: u32 = @truncate(at);
+    return .{ flags, high, low } ++ cells(at, len);
 }
 
 fn cells(address: u64, size: u64) [4]u32 {
@@ -300,6 +361,8 @@ pub fn build(gpa: std.mem.Allocator, config: Config) ![]u8 {
         }
         try builder.endNode();
     }
+
+    if (config.pci) try pciNode(&builder, &name);
 
     try builder.beginNode("apb-pclk");
     try builder.propString("compatible", "fixed-clock");
@@ -692,4 +755,93 @@ test "the room for cpus follows from the address map" {
     try std.testing.expect(cpusThatFit(0x4000_0000) > 1000);
     try testing.expectEqual(@as(u64, 0), cpusThatFit(gicr_base));
     try testing.expectEqual(@as(u64, 0), cpusThatFit(0));
+}
+
+test "the redistributors stop below config space rather than at memory" {
+    // Both are above the redistributors, so the room for them is whichever comes first. A tree
+    // that counted up to memory would put the last redistributors inside config space.
+    try testing.expectEqual((ecam_base - gicr_base) / gicr_stride, cpusThatFit(0x4000_0000));
+    try std.testing.expect(cpusThatFit(0x4000_0000) < (0x4000_0000 - gicr_base) / gicr_stride);
+}
+
+const with_pci: Config = .{
+    .ram_base = 0x4000_0000,
+    .ram_size = 0x0800_0000,
+    .cpus = 1,
+    .cmdline = "console=ttyAMA0",
+    .uart_base = 0x0900_0000,
+    .pci = true,
+};
+
+test "no bridge is described unless the machine has one" {
+    const gpa = testing.allocator();
+    const blob = try build(gpa, sample);
+    defer gpa.free(blob);
+
+    const tree = try read(gpa, blob);
+    defer tree.deinit();
+
+    // Firmware enumerates whatever the tree names. A bridge named here with nothing behind it
+    // sends it to read a window the bus does not carry.
+    try testing.expectError(error.NotFound, tree.find(&.{ "", "pcie@30000000", "compatible" }));
+}
+
+test "the bridge is described where the bus puts config space" {
+    const gpa = testing.allocator();
+    const blob = try build(gpa, with_pci);
+    defer gpa.free(blob);
+
+    const tree = try read(gpa, blob);
+    defer tree.deinit();
+
+    const compatible = try tree.find(&.{ "", "pcie@30000000", "compatible" });
+    try testing.expectEqualSlices(u8, "pci-host-ecam-generic\x00", compatible);
+
+    const reg = try tree.find(&.{ "", "pcie@30000000", "reg" });
+    try testing.expectEqual(@as(u64, ecam_base), std.mem.readInt(u64, reg[0..8], .big));
+    try testing.expectEqual(@as(u64, ecam_size), std.mem.readInt(u64, reg[8..16], .big));
+
+    // One bus, which is as many as the bridge holds. A wider range sends firmware to read config
+    // space for buses behind a bridge that is not there.
+    const buses = try tree.find(&.{ "", "pcie@30000000", "bus-range" });
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, buses[0..4], .big));
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, buses[4..8], .big));
+}
+
+test "the bridge decodes a window below four gigabytes and one above" {
+    const gpa = testing.allocator();
+    const blob = try build(gpa, with_pci);
+    defer gpa.free(blob);
+
+    const tree = try read(gpa, blob);
+    defer tree.deinit();
+
+    // Seven cells each: a space code, two for the pci address, two for the guest address, two for
+    // the length. Firmware places a region inside one of these and nowhere else.
+    const ranges = try tree.find(&.{ "", "pcie@30000000", "ranges" });
+    try testing.expectEqual(@as(usize, 2 * 7 * 4), ranges.len);
+
+    const low = ranges[0..28];
+    try testing.expectEqual(@as(u32, 0x0200_0000), std.mem.readInt(u32, low[0..4], .big));
+    try testing.expectEqual(@as(u64, pci_memory_base), std.mem.readInt(u64, low[4..12], .big));
+    try testing.expectEqual(@as(u64, pci_memory_base), std.mem.readInt(u64, low[12..20], .big));
+    try testing.expectEqual(@as(u64, pci_memory_size), std.mem.readInt(u64, low[20..28], .big));
+
+    // Sixty four bit memory space with the prefetchable bit set, which is what a frame buffer
+    // wants and the only way to offer an aperture larger than the low window.
+    const high = ranges[28..56];
+    try testing.expectEqual(@as(u32, 0x4300_0000), std.mem.readInt(u32, high[0..4], .big));
+    try testing.expectEqual(@as(u64, pci_memory64_base), std.mem.readInt(u64, high[4..12], .big));
+    try testing.expectEqual(@as(u64, pci_memory64_base), std.mem.readInt(u64, high[12..20], .big));
+    try testing.expectEqual(@as(u64, pci_memory64_size), std.mem.readInt(u64, high[20..28], .big));
+}
+
+test "the windows the tree names are the ones the bus is given" {
+    // The tree says where firmware may place a region and the bus decodes what firmware wrote, so
+    // a window named here and not carried there answers all ones at an address the guest was told
+    // to use. Config space holds one bus, and the windows sit below memory and above it.
+    try testing.expectEqual(@as(u64, 32 * 8 * 0x1000), ecam_size);
+    try std.testing.expect(ecam_base + ecam_size <= pci_memory_base);
+    try std.testing.expect(pci_memory_base + pci_memory_size <= 0x4000_0000);
+    try std.testing.expect(pci_memory64_base > 0xFFFF_FFFF);
 }
