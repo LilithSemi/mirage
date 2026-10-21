@@ -898,7 +898,14 @@ test "the express capability carries the payload size a link negotiated" {
     var one = host.device(0);
 
     // What the function can take is the hardware's to say, and so is what its link can do.
-    try testing.expectEqual(@as(u64, 1), one.vtable.read(one.ctx, ecam(2, 0, express_cap_at + 4), .word) & 7);
+    const capabilities = one.vtable.read(one.ctx, ecam(2, 0, express_cap_at + 4), .word);
+    try testing.expectEqual(@as(u64, 1), capabilities & 7);
+
+    // And what it cannot do is said by the bits that stay clear: five bit tags only, and no
+    // function level reset, which are both absent on the hardware this answers for. A guest that
+    // reads either as present asks for something nothing implements.
+    try testing.expectEqual(@as(u64, 0), capabilities & (1 << 5));
+    try testing.expectEqual(@as(u64, 0), capabilities & (1 << 28));
     const capable = one.vtable.read(one.ctx, ecam(2, 0, express_cap_at + 0x0c), .word);
     try testing.expectEqual(@as(u64, 2), capable & 0xf);
     try testing.expectEqual(@as(u64, 1), (capable >> 4) & 0x3f);
