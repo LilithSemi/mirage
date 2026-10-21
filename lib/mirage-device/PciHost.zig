@@ -70,14 +70,47 @@ pub const Function = struct {
     handler: ?Regions = null,
     /// The expansion rom image, served inside the rom region. May be shorter than `rom_size`.
     rom: []const u8 = &.{},
-    /// Whether to report a message signalled interrupt capability.
-    ///
-    /// The card this was built for advertises one while every interrupt line is tied off, so it can
-    /// be enabled and will never fire. Saying so here lets the model carry that, because a model
-    /// kinder than the hardware would let a guest enable it, wait, and pass where the real card
-    /// hangs.
-    msi_capability: bool = false,
+    /// Which capabilities the function reports, and what the hardware fixes inside them.
+    capabilities: Capabilities = .{},
 };
+
+/// The capability chain a function reports.
+///
+/// The offsets are the hardware's, so this says which links are in the chain rather than where
+/// they sit. Each one points at the next that is there, and the last points at nothing.
+pub const Capabilities = struct {
+    power_management: bool = false,
+    /// Message signalled interrupts. The card this was built for advertises them while every
+    /// interrupt line is tied off, so a guest can enable them and nothing will ever arrive. The
+    /// model carries that rather than hiding it, because a model kinder than the hardware lets a
+    /// guest enable it, wait, and pass where the real card hangs.
+    msi: bool = false,
+    /// What the hard block reports for the link, or nothing for a function with no pci express
+    /// capability. A driver reads the negotiated payload size out of this one, and an engine that
+    /// sizes its transfers by it has nothing to size them by without it.
+    express: ?Express = null,
+};
+
+/// What the pci express capability says about the function and its link.
+pub const Express = struct {
+    /// The largest payload the function can take, as the capability codes it: zero is a hundred
+    /// and twenty eight bytes and each step doubles.
+    max_payload: u3 = 0,
+    /// The link, as the hard block reports it. Two is five gigatransfers a second.
+    speed: u4 = 2,
+    width: u6 = 1,
+};
+
+/// Where each capability sits in config space. The hard block fixes these, and the chain is walked
+/// from the pointer at register 0x34.
+const pm_cap_at: u64 = 0x40;
+const msi_cap_at: u64 = 0x48;
+const express_cap_at: u64 = 0x60;
+
+/// How long each one is, which is what bounds the registers a guest may read inside it.
+const pm_cap_len: u64 = 0x08;
+const msi_cap_len: u64 = 0x10;
+const express_cap_len: u64 = 0x14;
 
 functions: [max_functions]?Function = @splat(null),
 /// What the guest has written that the bridge keeps: the command word, where firmware put each
@@ -96,10 +129,24 @@ pub const State = struct {
     /// two writes and the guest may make them in either order.
     bases: [max_regions]u32 = @splat(0),
     rom_base: u32 = 0,
-    /// What the guest wrote to the message signalled interrupt control word, kept so a read gives
-    /// back what was written. Nothing here ever sends one.
+    /// What the guest wrote to the message signalled interrupt capability, kept so a read gives
+    /// back what was written. Nothing here ever sends a message, and the address is where one
+    /// would go when something does.
     msi_control: u16 = 0,
+    msi_address: u64 = 0,
+    msi_data: u16 = 0,
+    /// Which power state the guest put the function in. Nothing changes with it.
+    power_state: u2 = 0,
+    /// The device control word, which is where the payload size a link negotiated ends up. The
+    /// reset value is the largest read request the specification asks for and the smallest
+    /// payload, so a guest that negotiates nothing still reads something sane.
+    device_control: u16 = mrrs_default,
+    link_control: u16 = 0,
 };
+
+/// Five hundred and twelve bytes, in the bits of the device control word that hold the largest
+/// read request a function will make.
+const mrrs_default: u16 = 0x2000;
 
 /// Whether a register holds a region, the high half of one, or nothing.
 const Role = union(enum) {
@@ -243,20 +290,18 @@ fn word(self: *const PciHost, slot: usize, reg: u64) u32 {
             .high => held.bases[index],
         };
     }
-    if (one.msi_capability and reg >= msi_cap_at and reg < msi_cap_at + 0x10) {
-        return self.msiWord(slot, reg - msi_cap_at);
-    }
+    if (capabilityWord(one, held, reg)) |value| return value;
 
     return switch (reg) {
         0x00 => @as(u32, one.device) << 16 | one.vendor,
-        0x04 => @as(u32, status) << 16 | held.command,
+        0x04 => @as(u32, statusWord(one)) << 16 | held.command,
         0x08 => @as(u32, one.class) << 24 | @as(u32, one.subclass) << 16 |
             @as(u32, one.prog_if) << 8 | one.revision,
         // Header type zero, no multi function bit, and a cache line size nothing here uses.
         0x0c => 0,
         0x2c => @as(u32, one.subsystem_device) << 16 | one.subsystem_vendor,
         0x30 => held.rom_base,
-        0x34 => if (one.msi_capability) msi_cap_at else 0,
+        0x34 => firstCapability(one.capabilities) orelse 0,
         // No interrupt pin, because nothing here raises one.
         0x3c => 0,
         else => 0,
@@ -265,21 +310,87 @@ fn word(self: *const PciHost, slot: usize, reg: u64) u32 {
 
 /// Where the capability list starts, when there is one. Anywhere above the header and below the
 /// first extended register will do, and this leaves the header alone.
-const msi_cap_at: u32 = 0x40;
-
-/// The message signalled interrupt capability, which is reported and never honoured. The identifier
-/// is five, the next pointer is zero because it is the only one, and the message control word is
-/// whatever the guest last wrote.
-fn msiWord(self: *const PciHost, slot: usize, within: u64) u32 {
-    const held = self.state[slot];
-    return switch (within) {
-        0x00 => @as(u32, held.msi_control) << 16 | 0x05,
-        else => 0,
-    };
+/// Where the chain starts, or nothing for a function with no capabilities at all.
+fn firstCapability(which: Capabilities) ?u32 {
+    if (which.power_management) return pm_cap_at;
+    if (which.msi) return msi_cap_at;
+    if (which.express != null) return express_cap_at;
+    return null;
 }
 
-/// The status word every function here reports. Nothing sets an error bit, so it is constant.
-const status: u16 = 0;
+/// What the capability at this offset points at: the next one that is there, or nothing where the
+/// chain ends. A pointer to a capability the function does not report is a chain a driver walks
+/// into and reads an identifier out of thin air.
+fn nextCapability(which: Capabilities, from: u64) u32 {
+    if (from < msi_cap_at and which.msi) return msi_cap_at;
+    if (from < express_cap_at and which.express != null) return express_cap_at;
+    return 0;
+}
+
+/// One dword of a capability, or nothing where the register belongs to no capability.
+fn capabilityWord(one: Function, held: State, reg: u64) ?u32 {
+    const which = one.capabilities;
+
+    if (which.power_management and reg >= pm_cap_at and reg < pm_cap_at + pm_cap_len) {
+        return switch (reg - pm_cap_at) {
+            // Version three, and no power management event from anywhere, because nothing here
+            // signals one.
+            0x00 => 0x0003 << 16 | nextCapability(which, pm_cap_at) << 8 | 0x01,
+            0x04 => held.power_state,
+            else => 0,
+        };
+    }
+
+    if (which.msi and reg >= msi_cap_at and reg < msi_cap_at + msi_cap_len) {
+        return switch (reg - msi_cap_at) {
+            0x00 => @as(u32, held.msi_control | msi_control_fixed) << 16 |
+                nextCapability(which, msi_cap_at) << 8 | 0x05,
+            0x04 => @truncate(held.msi_address),
+            0x08 => @truncate(held.msi_address >> 32),
+            0x0c => held.msi_data,
+            else => 0,
+        };
+    }
+
+    if (which.express) |link| {
+        if (reg >= express_cap_at and reg < express_cap_at + express_cap_len) {
+            return switch (reg - express_cap_at) {
+                // Version two, and an endpoint rather than a port, which is what the type bits
+                // above the version say by being zero.
+                0x00 => 0x0002 << 16 | nextCapability(which, express_cap_at) << 8 | 0x10,
+                0x04 => link.max_payload,
+                // The status half is clear: nothing here reports an error or a pending
+                // transaction.
+                0x08 => held.device_control,
+                0x0c => @as(u32, link.width) << 4 | link.speed,
+                // The link is up and running at what the hardware reports, because a guest that
+                // reads a link as down stops looking at the function.
+                0x10 => (link_active | @as(u32, link.width) << 4 | link.speed) << 16 |
+                    held.link_control,
+                else => 0,
+            };
+        }
+    }
+
+    return null;
+}
+
+/// Link status bit thirteen, the data link layer saying the link is up.
+const link_active: u32 = 1 << 13;
+
+/// The one bit of the message control word the hardware holds set: the function can take a sixty
+/// four bit message address. The card reports it whether or not anything ever sends a message.
+const msi_control_fixed: u16 = 0x0080;
+
+/// The status word a function reports. Nothing here sets an error bit, so the only thing in it is
+/// whether there is a capability list, and a pointer at register 0x34 that the status word does not
+/// announce is one no driver reads.
+fn statusWord(one: Function) u16 {
+    return if (firstCapability(one.capabilities) != null) capability_list else 0;
+}
+
+/// Status bit four, which says the pointer at 0x34 leads somewhere.
+const capability_list: u16 = 0x0010;
 
 fn write(ctx: *anyopaque, offset: u64, size: Bus.Size, value: u64) void {
     const self: *PciHost = @ptrCast(@alignCast(ctx));
@@ -316,10 +427,7 @@ fn write(ctx: *anyopaque, offset: u64, size: Bus.Size, value: u64) void {
         }
         return;
     }
-    if (one.msi_capability and aligned == msi_cap_at) {
-        held.msi_control = @truncate((narrow >> 16) & msi_control_writable);
-        return;
-    }
+    if (capabilityWrite(one, held, aligned, narrow)) return;
 
     switch (aligned) {
         // Only the bits a guest is allowed to set. The rest of the word is status, which is read
@@ -340,8 +448,48 @@ const command_writable: u32 = 0x0002 | 0x0004 | 0x0400;
 /// The rom's only low bit is the enable, which the guest owns.
 const rom_enable: u32 = 1;
 
-/// The one bit of the message control word a guest may set here, which is the enable.
+/// The one bit of the message control word a guest may set here, which is the enable. The rest of
+/// the word says what the function can do and is not the guest's to change.
 const msi_control_writable: u32 = 1;
+
+/// Returns whether the write belonged to a capability. The registers a guest may change are the
+/// ones a driver writes: the power state, where a message would go, and the payload sizes a link
+/// negotiated.
+fn capabilityWrite(one: Function, held: *State, aligned: u64, narrow: u32) bool {
+    const which = one.capabilities;
+
+    if (which.power_management and aligned >= pm_cap_at and aligned < pm_cap_at + pm_cap_len) {
+        if (aligned - pm_cap_at == 0x04) held.power_state = @truncate(narrow);
+        return true;
+    }
+
+    if (which.msi and aligned >= msi_cap_at and aligned < msi_cap_at + msi_cap_len) {
+        switch (aligned - msi_cap_at) {
+            0x00 => held.msi_control = @truncate((narrow >> 16) & msi_control_writable),
+            // The low two bits of a message address are not part of it.
+            0x04 => held.msi_address = (held.msi_address & 0xFFFF_FFFF_0000_0000) |
+                (narrow & ~@as(u32, 3)),
+            0x08 => held.msi_address = (@as(u64, narrow) << 32) |
+                (held.msi_address & 0xFFFF_FFFF),
+            0x0c => held.msi_data = @truncate(narrow),
+            else => {},
+        }
+        return true;
+    }
+
+    if (which.express != null and aligned >= express_cap_at and
+        aligned < express_cap_at + express_cap_len)
+    {
+        switch (aligned - express_cap_at) {
+            0x08 => held.device_control = @truncate(narrow),
+            0x10 => held.link_control = @truncate(narrow),
+            else => {},
+        }
+        return true;
+    }
+
+    return false;
+}
 
 /// Whoever answers reads and writes inside a function's regions.
 ///
@@ -661,31 +809,106 @@ test "a region that cannot fit its registers is refused" {
     try testing.expectEqual(false, host.add(too_big));
 }
 
-test "the interrupt capability is reported only when the caller asks for it" {
+test "a function with no capabilities says so, and a guest walks no list" {
     var host: PciHost = .{};
     var quiet = wide_card;
     quiet.at = .{ .device = 1 };
     try testing.expectEqual(true, host.add(quiet));
 
-    var loud = wide_card;
-    loud.at = .{ .device = 2 };
-    loud.msi_capability = true;
-    try testing.expectEqual(true, host.add(loud));
+    var one = host.device(0);
+
+    // A driver reads the status bit before the pointer, so a capability the status word hides is
+    // one nothing finds, and a pointer leading nowhere is what says there is nothing to walk.
+    try testing.expectEqual(@as(u64, 0), one.vtable.read(one.ctx, ecam(1, 0, 0x06), .half));
+    try testing.expectEqual(@as(u64, 0), one.vtable.read(one.ctx, ecam(1, 0, 0x34), .byte));
+}
+
+test "each capability points at the next one that is there" {
+    var host: PciHost = .{};
+
+    // Message signalled interrupts alone. The chain starts where that capability sits rather than
+    // where the first one would, because a pointer to a capability the function does not report
+    // is a chain a driver walks into and reads an identifier out of thin air.
+    var alone = wide_card;
+    alone.at = .{ .device = 1 };
+    alone.capabilities = .{ .msi = true };
+    try testing.expectEqual(true, host.add(alone));
+
+    // And the chain the card answers: power management, then messages, then pci express.
+    var whole = wide_card;
+    whole.at = .{ .device = 2 };
+    whole.capabilities = .{ .power_management = true, .msi = true, .express = .{} };
+    try testing.expectEqual(true, host.add(whole));
 
     var one = host.device(0);
 
-    // Without it the capability pointer leads nowhere, so a guest walks no list.
-    try testing.expectEqual(@as(u64, 0), one.vtable.read(one.ctx, ecam(1, 0, 0x34), .byte));
+    try testing.expectEqual(@as(u64, capability_list), one.vtable.read(one.ctx, ecam(1, 0, 0x06), .half));
+    try testing.expectEqual(msi_cap_at, one.vtable.read(one.ctx, ecam(1, 0, 0x34), .byte));
+    try testing.expectEqual(@as(u64, 0x05), one.vtable.read(one.ctx, ecam(1, 0, msi_cap_at), .byte));
+    try testing.expectEqual(@as(u64, 0), one.vtable.read(one.ctx, ecam(1, 0, msi_cap_at + 1), .byte));
 
-    // With it the pointer leads to a capability whose identifier is five, and the list ends there.
-    try testing.expectEqual(@as(u64, 0x40), one.vtable.read(one.ctx, ecam(2, 0, 0x34), .byte));
-    try testing.expectEqual(@as(u64, 0x05), one.vtable.read(one.ctx, ecam(2, 0, 0x40), .byte));
-    try testing.expectEqual(@as(u64, 0x00), one.vtable.read(one.ctx, ecam(2, 0, 0x41), .byte));
+    try testing.expectEqual(pm_cap_at, one.vtable.read(one.ctx, ecam(2, 0, 0x34), .byte));
+    try testing.expectEqual(@as(u64, 0x01), one.vtable.read(one.ctx, ecam(2, 0, pm_cap_at), .byte));
+    try testing.expectEqual(msi_cap_at, one.vtable.read(one.ctx, ecam(2, 0, pm_cap_at + 1), .byte));
+    try testing.expectEqual(@as(u64, 0x05), one.vtable.read(one.ctx, ecam(2, 0, msi_cap_at), .byte));
+    try testing.expectEqual(express_cap_at, one.vtable.read(one.ctx, ecam(2, 0, msi_cap_at + 1), .byte));
+    try testing.expectEqual(@as(u64, 0x10), one.vtable.read(one.ctx, ecam(2, 0, express_cap_at), .byte));
+    try testing.expectEqual(@as(u64, 0), one.vtable.read(one.ctx, ecam(2, 0, express_cap_at + 1), .byte));
+}
 
-    // The guest may enable it and read the enable back. Nothing here ever sends one, which is what
-    // the real card does today: a capability it advertises and does not honour.
-    one.vtable.write(one.ctx, ecam(2, 0, 0x40), .word, 0x0001_0000);
-    try testing.expectEqual(@as(u64, 1), one.vtable.read(one.ctx, ecam(2, 0, 0x42), .half));
+test "a guest enables messages and says where one would go" {
+    var host: PciHost = .{};
+    var card = wide_card;
+    card.at = .{ .device = 2 };
+    card.capabilities = .{ .power_management = true, .msi = true, .express = .{} };
+    try testing.expectEqual(true, host.add(card));
+
+    var one = host.device(0);
+
+    // The enable, beside the bit the hardware holds set to say it can take a sixty four bit
+    // message address. A guest cannot clear that one. Nothing here ever sends a message, which is
+    // what the card does today: a capability it advertises and does not honour.
+    one.vtable.write(one.ctx, ecam(2, 0, msi_cap_at), .word, 0x0001_0000);
+    try testing.expectEqual(@as(u64, 0x0081), one.vtable.read(one.ctx, ecam(2, 0, msi_cap_at + 2), .half));
+    one.vtable.write(one.ctx, ecam(2, 0, msi_cap_at), .word, 0);
+    try testing.expectEqual(@as(u64, 0x0080), one.vtable.read(one.ctx, ecam(2, 0, msi_cap_at + 2), .half));
+
+    // Where a message would go, in two halves because the address is sixty four bits wide. The
+    // low two bits are not part of it.
+    one.vtable.write(one.ctx, ecam(2, 0, msi_cap_at + 4), .word, 0x0800_1003);
+    one.vtable.write(one.ctx, ecam(2, 0, msi_cap_at + 8), .word, 0x0000_0001);
+    one.vtable.write(one.ctx, ecam(2, 0, msi_cap_at + 12), .word, 0x1234);
+    try testing.expectEqual(@as(u64, 0x0800_1000), one.vtable.read(one.ctx, ecam(2, 0, msi_cap_at + 4), .word));
+    try testing.expectEqual(@as(u64, 1), one.vtable.read(one.ctx, ecam(2, 0, msi_cap_at + 8), .word));
+    try testing.expectEqual(@as(u64, 0x1234), one.vtable.read(one.ctx, ecam(2, 0, msi_cap_at + 12), .half));
+}
+
+test "the express capability carries the payload size a link negotiated" {
+    var host: PciHost = .{};
+    var card = wide_card;
+    card.at = .{ .device = 2 };
+    // Two hundred and fifty six bytes supported, one lane at five gigatransfers a second.
+    card.capabilities = .{ .express = .{ .max_payload = 1, .speed = 2, .width = 1 } };
+    try testing.expectEqual(true, host.add(card));
+
+    var one = host.device(0);
+
+    // What the function can take is the hardware's to say.
+    try testing.expectEqual(@as(u64, 1), one.vtable.read(one.ctx, ecam(2, 0, express_cap_at + 4), .word) & 7);
+
+    // What it will use is written by whoever enumerated it, and read back by an engine that sizes
+    // its transfers from it. The reset value is the largest read request and the smallest payload,
+    // so an engine that reads before anything negotiates still reads something sane.
+    try testing.expectEqual(mrrs_default, one.vtable.read(one.ctx, ecam(2, 0, express_cap_at + 8), .half));
+    one.vtable.write(one.ctx, ecam(2, 0, express_cap_at + 8), .half, 0x2020);
+    try testing.expectEqual(@as(u64, 0x2020), one.vtable.read(one.ctx, ecam(2, 0, express_cap_at + 8), .half));
+
+    // And the link is up at the width and speed the hardware reports, because a guest that reads a
+    // link as down stops looking at the function.
+    const link = one.vtable.read(one.ctx, ecam(2, 0, express_cap_at + 0x12), .half);
+    try testing.expectEqual(@as(u64, 2), link & 0xf);
+    try testing.expectEqual(@as(u64, 1), (link >> 4) & 0x3f);
+    try testing.expectEqual(@as(u64, link_active), link & link_active);
 }
 
 /// A device that remembers the last access it was given, so a test can say which region the bridge

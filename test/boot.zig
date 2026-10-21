@@ -1065,6 +1065,11 @@ test "a real linux kernel boots far enough to speak" {
         // from the board here and nowhere else.
         try std.testing.expect(std.mem.indexOf(u8, log, "[10ee:7203]") != null);
 
+        // And it walked the capability chain to the end: the pointer at 0x34, power management,
+        // messages, then pci express. A kernel that found no express capability calls the card a
+        // conventional endpoint, which is what this said before the chain was modelled.
+        try std.testing.expect(std.mem.indexOf(u8, log, "class 0x038000 PCIe Endpoint") != null);
+
         // And it placed both regions. Sizing a region is a write of all ones and a read of what
         // came back, so an address here is the whole protocol having worked: the register block
         // in the window below four gigabytes, and the aperture wherever firmware chose.

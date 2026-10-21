@@ -51,6 +51,12 @@ pub const prototype_fabric_size = prototype_window_size + 0x1000;
 /// different card.
 pub const id: u32 = 0x48444d41;
 
+/// What the link reports: one lane at five gigatransfers a second, which is what the hard block
+/// in this build gives, and the largest payload the function will take.
+const max_payload: u3 = 0;
+const link_speed: u4 = 2;
+const link_width: u6 = 1;
+
 /// The engine's registers, as byte offsets into the first region. Harbor decodes them by word
 /// index; a driver uses byte offsets, and these are those.
 const reg = struct {
@@ -227,6 +233,14 @@ pub fn function(self: *Glacier, at: PciHost.Address) PciHost.Function {
         .subsystem_vendor = vendor,
         .subsystem_device = model,
         .handler = self.regions(),
+        // The chain the hard block answers: power management, then message signalled interrupts,
+        // then pci express. Every interrupt line is tied off, so a guest can enable messages and
+        // nothing will ever arrive, and the model carries that rather than hiding it.
+        .capabilities = .{
+            .power_management = true,
+            .msi = true,
+            .express = .{ .max_payload = max_payload, .speed = link_speed, .width = link_width },
+        },
     };
     one.regions[0] = .{ .size = registers_size };
     if (self.aperture) |each| {
