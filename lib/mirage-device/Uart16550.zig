@@ -57,6 +57,9 @@ sink: *std.Io.Writer,
 /// difference between a test that takes a second and one that takes a minute.
 watch: []const u8 = &.{},
 said: bool = false,
+/// Somewhere else the bytes go, beside the sink. What a guest says is part of the account of a
+/// run, and a caller writing that account down wants it in the same place as everything else.
+echo: ?Echo = null,
 /// The last bytes the guest said, as many as the thing being watched for is long. Compared whole
 /// each time rather than carried as a position: a match that can begin again inside itself is
 /// easy to get wrong that way, and `aab` really is inside `aaab`.
@@ -116,6 +119,13 @@ fn read(ctx: *anyopaque, offset: u64, size: Bus.Size) u64 {
     };
 }
 
+/// Another reader of what the guest says. One byte at a time, as the guest writes it, because a
+/// guest that stops half way through a line still said the half.
+pub const Echo = struct {
+    ctx: *anyopaque,
+    byte: *const fn (ctx: *anyopaque, said: u8) void,
+};
+
 /// The longest thing that can be watched for. A caller asking for more is refused where the ask
 /// is made rather than left with a guest that never stops.
 pub const max_watch = 64;
@@ -124,6 +134,7 @@ pub const max_watch = 64;
 /// for. The match runs over the stream rather than over a line, so the thing may be split across
 /// however many writes the guest made.
 fn hear(self: *@This(), byte: u8) void {
+    if (self.echo) |also| also.byte(also.ctx, byte);
     if (self.watch.len == 0 or self.said) return;
     if (self.watch.len > self.recent.len) return;
 

@@ -274,9 +274,15 @@ table_found: u64 = 0,
 /// asked to use it writes this, so it separates a driver that refused from one that was never
 /// called.
 mode_selects: u64 = 0,
-/// Bytes written into the frame buffer, and bytes written into the aperture outside it. The first
-/// is pixels. The second is a driver painting where it should not, which nothing is expected to do.
+/// Bytes written into the frame buffer by the card's own engine: the driver painting for itself.
 painted: u64 = 0,
+/// Bytes written into the frame buffer straight through the window, which is firmware or an
+/// operating system painting into the address the driver published. The window exists for this,
+/// so these two are counted apart: the first says the driver painted, the second says something
+/// else could, and only the second says the published address was usable.
+painted_through_window: u64 = 0,
+/// Bytes that landed in the aperture but outside the frame buffer, whichever way they came. A
+/// driver painting where it should not, which nothing is expected to do.
 outside: u64 = 0,
 
 /// What the bridge puts in config space for this card.
@@ -584,14 +590,14 @@ fn fabricWrite(self: *Glacier, at: u64, value: u32) bool {
     return true;
 }
 
-/// Where bytes of fabric landed: in the frame buffer, or in the aperture around it. Counted by the
-/// caller rather than inside the write, because the window writes a byte at a time while the engine
-/// writes a word, and both have to come to the same number of bytes.
-fn landed(self: *Glacier, at: u64, bytes: u64) void {
+/// Where bytes of fabric landed: in the frame buffer, or in the aperture around it, and by which
+/// way they arrived. Counted by the caller rather than inside the write, because the window writes
+/// a byte at a time while the engine writes a word, and both have to come to the same bytes.
+fn landed(self: *Glacier, at: u64, bytes: u64, through_window: bool) void {
     const shown = self.display orelse return;
     const needed = @as(u64, shown.pitch) * shown.height;
     if (at >= shown.framebuffer and at < shown.framebuffer + needed) {
-        self.painted += bytes;
+        if (through_window) self.painted_through_window += bytes else self.painted += bytes;
         return;
     }
 
@@ -645,7 +651,7 @@ fn move(self: *Glacier) void {
                 self.failure = .fabric;
                 return;
             }
-            self.landed(local, 4);
+            self.landed(local, 4, false);
             self.data = word;
         }
         // Counted as each word lands, so a transfer that stopped half way says how far it got.
@@ -704,7 +710,7 @@ fn windowWrite(self: *Glacier, offset: u64, size: Bus.Size, value: u64) void {
         };
         const byte: u32 = @intCast((value >> @intCast(taken * 8)) & 0xff);
         const mask = @as(u32, 0xff) << (shift * 8);
-        if (self.fabricWrite(at, (whole & ~mask) | (byte << (shift * 8)))) self.landed(whole_at, 1);
+        if (self.fabricWrite(at, (whole & ~mask) | (byte << (shift * 8)))) self.landed(whole_at, 1, true);
     }
 }
 
@@ -1187,22 +1193,35 @@ test "the card says how far a driver got with it" {
     small.pitch = 16;
     one.display = small;
 
-    const screen = @as(u64, small.pitch) * small.height;
+    const rows = @as(u64, small.pitch) * small.height;
     handler.vtable.write(handler.ctx, window_region, 0, .word, 0x00ff_00ff);
-    try testing.expectEqual(@as(u64, 4), one.painted);
+
+    // Through the window, so this is something other than the driver painting into the address
+    // the driver published. The engine's own painting is counted apart from it.
+    try testing.expectEqual(@as(u64, 4), one.painted_through_window);
+    try testing.expectEqual(@as(u64, 0), one.painted);
     try testing.expectEqual(@as(u64, 0), one.outside);
 
     // One word past the last row, which is the aperture and not the screen. A driver painting
     // here is painting where it should not.
-    handler.vtable.write(handler.ctx, window_region, screen, .word, 0);
-    try testing.expectEqual(@as(u64, 4), one.painted);
+    handler.vtable.write(handler.ctx, window_region, rows, .word, 0);
+    try testing.expectEqual(@as(u64, 4), one.painted_through_window);
     try testing.expectEqual(@as(u64, 4), one.outside);
 
     // And the last word of the screen is still the screen, so the boundary is where the rows end
     // and not a word either side of it.
-    handler.vtable.write(handler.ctx, window_region, screen - 4, .word, 0);
-    try testing.expectEqual(@as(u64, 8), one.painted);
+    handler.vtable.write(handler.ctx, window_region, rows - 4, .word, 0);
+    try testing.expectEqual(@as(u64, 8), one.painted_through_window);
     try testing.expectEqual(@as(u64, 4), one.outside);
+
+    // The engine writing the same place is the driver painting, and counts on its own side.
+    @memcpy(fixture.host_bytes[0..4], &[_]u8{ 1, 2, 3, 4 });
+    put(&one, reg.host_low, Fixture.host_at);
+    put(&one, reg.local_low, @truncate(small.framebuffer));
+    put(&one, reg.length, 1);
+    put(&one, reg.control, control_start);
+    try testing.expectEqual(@as(u64, 4), one.painted);
+    try testing.expectEqual(@as(u64, 8), one.painted_through_window);
 }
 
 /// Collects what the card was asked to do, so a test can look at it afterwards.
@@ -1266,4 +1285,48 @@ test "a card nobody is watching tells nothing and works the same" {
     try testing.expectEqual(@as(?Watcher, null), one.watching);
     _ = through(&one, &fixture, Fixture.fabric_at);
     try testing.expectEqual(@as(u64, 1), one.transfers);
+}
+
+/// The bytes of the frame buffer as the card holds them, or nothing where this card has no
+/// display, no window, or a window that does not cover every row.
+///
+/// Whoever wants a picture of the screen takes it from here and makes one: what the pixels mean is
+/// the format the display reports, and turning that into a file is not a device's work.
+pub fn screen(self: *const Glacier) ?[]const u8 {
+    if (!self.covers()) return null;
+    const shown = self.display orelse return null;
+    if (shown.framebuffer < self.fabric_at) return null;
+
+    const within = shown.framebuffer - self.fabric_at;
+    const needed = @as(u64, shown.pitch) * shown.height;
+    if (within + needed > self.fabric.len) return null;
+    return self.fabric[@intCast(within)..][0..@intCast(needed)];
+}
+
+test "the screen is the rows of the frame buffer, or nothing where there is no screen" {
+    var fixture: Fixture = .{};
+    var one = fixture.card();
+
+    // No display and no window, so there is nothing to take a picture of.
+    try testing.expectEqual(@as(?[]const u8, null), one.screen());
+
+    var small = prototype_display;
+    small.width = 4;
+    small.height = 2;
+    small.pitch = 16;
+    one.display = small;
+    one.aperture = .{ .at = Fixture.fabric_at, .len = 32 };
+
+    const taken = one.screen().?;
+    try testing.expectEqual(@as(usize, 32), taken.len);
+
+    // What the guest painted is what a picture of it holds.
+    var handler = one.regions();
+    handler.vtable.write(handler.ctx, window_region, 0, .word, 0x0011_2233);
+    try testing.expectEqual(@as(u8, 0x33), taken[0]);
+
+    // A card whose fabric is shorter than the rows has no whole screen to hand over, which is a
+    // card built wrong rather than a guest being wrong.
+    one.display = prototype_display;
+    try testing.expectEqual(@as(?[]const u8, null), one.screen());
 }

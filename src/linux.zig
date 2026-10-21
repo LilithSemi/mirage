@@ -11,6 +11,7 @@ const sessionmod = @import("mirage-session");
 const fsmod = @import("mirage-fs");
 const Options = @import("Options.zig");
 const Trace = @import("Trace.zig");
+const Screendump = @import("Screendump.zig");
 const GuestMemory = @import("mirage-memory").GuestMemory;
 const attest = @import("mirage-attest");
 const Manifest = attest.Manifest;
@@ -735,6 +736,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         trace_file = try cwd.createFile(io, path, .{});
         trace_out = trace_file.?.writer(io, &trace_room);
         trace = .{ .out = &trace_out.interface };
+        // What the guest says goes in the same file as what the devices did, so one reader has
+        // the whole account of a run rather than two halves of it.
+        serial.echo = trace.?.echo();
     }
     defer if (trace_file) |each| each.close(io);
 
@@ -876,9 +880,28 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         }
     }
 
+    // Pictures of the screen, where a caller asked for them. The directory has to be there
+    // already: making one for a mistyped path is how a typo becomes a surprise directory.
+    var screens: ?Screendump = null;
+    if (wanted) |each| {
+        if (each.get("screendump")) |at| {
+            const into = cwd.openDir(io, at, .{}) catch {
+                try out.print("there is no directory at {s} to put pictures in\n", .{at});
+                return;
+            };
+            screens = .{
+                .into = into,
+                .card = &gpu,
+                .io = io,
+                .every = @as(i96, @intCast(try each.screendumpMs())) * std.time.ns_per_ms,
+            };
+        }
+    }
+
     var end: Host = .{
         .io = io,
         .heard = if (options.stop_on != null) &serial.said else null,
+        .screens = if (screens != null) &screens.? else null,
         .deadline = if (options.seconds) |limit|
             std.Io.Clock.awake.now(io).nanoseconds + @as(i96, limit) * std.time.ns_per_s
         else
@@ -991,9 +1014,18 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         try out.print("\nthe guest stopped: {t}\n", .{reason});
     }
 
+    // The last thing on the screen, which is the thing somebody wants to see.
+    if (screens) |*each| {
+        each.take();
+        try out.print("glacier: {d} pictures of the screen written, {d} lost\n", .{ each.taken, each.lost });
+    }
+
     // Everything counted, as the last line of the trace, so a test that wants an answer reads one
     // line and a test that wants the story walks the rest.
-    if (trace) |*each| each.summary(&bridge, &gpu);
+    if (trace) |*each| {
+        each.lastWord();
+        each.summary(&bridge, &gpu);
+    }
 
     // Where firmware put each region, which is the only account of whether it enumerated the bus
     // at all. A bridge nothing looked at reads as no regions placed and no slots asked about.
@@ -1024,8 +1056,11 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
                 bridge.state[0].base_reads[device.Glacier.window_region],
                 gpu.mode_selects,
             });
-            try out.print("glacier: {d} bytes painted into the frame buffer, {d} elsewhere in the aperture\n", .{
+            // Apart, because they mean different things: the engine is the driver painting for
+            // itself, and the window is something else painting into the address it published.
+            try out.print("glacier: {d} bytes painted by the engine, {d} through the window, {d} elsewhere\n", .{
                 gpu.painted,
+                gpu.painted_through_window,
                 gpu.outside,
             });
         }

@@ -41,6 +41,7 @@ pub const usage =
     \\  --pci yes             give the guest a pci host bridge
     \\  --device <spec>       add a device, as `name,setting=value`
     \\                        glacier-pci[,romfile=<path>]
+    \\                          [,screendump=<dir>][,screendump-ms=<n>]
     \\  --trace <path>        write what the devices did, one json line each
     \\  --stop-on <text>      stop once the guest has printed this
     \\  --share <name>=<dir>  offer that directory under that name, read only
@@ -161,6 +162,13 @@ pub const Device = struct {
     /// monitors take, and the one this started out with.
     pub fn romFile(self: Device) ?[]const u8 {
         return self.get("romfile") orelse self.get("optrom");
+    }
+
+    /// How long between pictures of the screen, in milliseconds. A second by default, which fills
+    /// a directory slowly enough to look through and often enough to watch a console fill.
+    pub fn screendumpMs(self: Device) !u64 {
+        const said = self.get("screendump-ms") orelse return 1000;
+        return std.fmt.parseInt(u64, said, 10);
     }
 
     /// What a setting says, or nothing where it was not given. A setting written with no value

@@ -192,6 +192,8 @@ pub const Host = struct {
     heard: ?*const bool = null,
     /// True once that stopped the guest.
     said_it: bool = false,
+    /// Whoever is taking pictures of the screen, where a caller asked for them.
+    screens: ?*@import("Screendump.zig") = null,
     /// Counts the turns, so the serial output can be pushed out now and then. A guest that
     /// is killed before it stops would otherwise lose whatever is still buffered, which is
     /// exactly the output someone debugging needs.
@@ -353,6 +355,8 @@ pub const Host = struct {
                 return false;
             }
         }
+
+        if (self.screens) |each| each.maybe();
 
         self.drainBalloon();
         self.carryChip();
