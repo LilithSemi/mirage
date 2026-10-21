@@ -372,9 +372,39 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     if (options.tpm != null) attached.add(chip.device(arm64.fdt.tpm_base));
     // Config space says where a region is and the windows are the regions, so all three belong to
     // one bridge. They are separate devices on the bus because they are separate spaces.
+    // The card's own memory: the window the guest reaches directly, and a page past it for the
+    // block that describes the display.
+    const fabric = if (options.glacier)
+        try gpa.alloc(u8, device.Glacier.prototype_fabric_size)
+    else
+        @as([]u8, &.{});
+    defer if (options.glacier) gpa.free(fabric);
+    if (options.glacier) @memset(fabric, 0);
+
+    const option_rom: []const u8 = if (options.glacier_rom) |path|
+        try cwd.readFileAlloc(io, path, gpa, file_limit)
+    else
+        &.{};
+    defer if (options.glacier_rom != null) gpa.free(@constCast(option_rom));
+
+    var gpu: device.Glacier = .{
+        .memory = &memory,
+        .fabric = fabric,
+        .fabric_at = device.Glacier.prototype_window_at,
+        .aperture = .{
+            .at = device.Glacier.prototype_window_at,
+            .len = device.Glacier.prototype_window_size,
+        },
+        .display = device.Glacier.prototype_display,
+        .display_at = device.Glacier.prototype_display_at,
+        .rom = option_rom,
+    };
+    if (options.glacier) std.debug.assert(gpu.covers());
+
     var bridge: device.PciHost = .{};
     var bridge_memory: device.PciHost.Window = .{ .host = &bridge, .at = arm64.fdt.pci_memory_base };
     var bridge_memory64: device.PciHost.Window = .{ .host = &bridge, .at = arm64.fdt.pci_memory64_base };
+    if (options.glacier) std.debug.assert(bridge.add(gpu.function(.{ .device = 1 })));
     if (options.pci) {
         attached.add(bridge.device(arm64.fdt.ecam_base));
         attached.add(bridge_memory.device(arm64.fdt.pci_memory_size));
