@@ -230,6 +230,7 @@ pub fn buildBootParams(
     cpus: u32,
     virtio: []const acpi.VirtioDevice,
     tpm: ?acpi.Tpm,
+    bridge: ?acpi.Bridge,
 ) Error!void {
     // Reject a cmdline that would not fit in its reserved region.
     const cmdline_room = low.pml4 - low.cmdline;
@@ -248,7 +249,12 @@ pub fn buildBootParams(
     // the kernel finds it without scanning for the "RSD PTR " signature.
     {
         var acpi_buf: [4096]u8 align(16) = undefined;
-        const built = try acpi.build(&acpi_buf, acpi_base, .{ .cpus = cpus, .virtio = virtio, .tpm = tpm });
+        const built = try acpi.build(&acpi_buf, acpi_base, .{
+            .cpus = cpus,
+            .virtio = virtio,
+            .tpm = tpm,
+            .pci = bridge,
+        });
         std.debug.assert(acpi_base + built.bytes.len <= 0x9fc00);
         try memory.write(acpi_base, built.bytes);
         var rsdp_buf: [8]u8 = undefined;
@@ -348,7 +354,7 @@ test "boot_params carries the e820 map, cmdline pointer, and header" {
     header.version = 0x020c;
     // boot_flag at rel offset 0x0d (abs 0x1fe): set it so the copy preserves it
     header.boot_flag = 0xaa55;
-    try buildBootParams(&memory, header, "console=ttyS0", null, default_low, 1, &.{}, null);
+    try buildBootParams(&memory, header, "console=ttyS0", null, default_low, 1, &.{}, null, null);
 
     // The copied header carries boot_flag 0xaa55 at zero-page offset 0x1fe.
     var flag_buf: [2]u8 = undefined;
@@ -385,7 +391,7 @@ test "a cmdline longer than its region is refused" {
     const too_long = try testing.allocator().alloc(u8, 0x10000);
     defer testing.allocator().free(too_long);
     @memset(too_long, 'x');
-    try testing.expectError(error.CmdlineTooLong, buildBootParams(&memory, header, too_long, null, default_low, 1, &.{}, null));
+    try testing.expectError(error.CmdlineTooLong, buildBootParams(&memory, header, too_long, null, default_low, 1, &.{}, null, null));
 }
 
 test "more than 128 regions is refused" {
@@ -400,7 +406,7 @@ test "more than 128 regions is refused" {
     var header: SetupHeader = std.mem.zeroes(SetupHeader);
     header.version = 0x020c;
 
-    try testing.expectError(error.TooManyRegions, buildBootParams(&memory, header, "x", null, default_low, 1, &.{}, null));
+    try testing.expectError(error.TooManyRegions, buildBootParams(&memory, header, "x", null, default_low, 1, &.{}, null, null));
 }
 
 test "an initramfs is placed in guest ram and recorded in boot_params" {
@@ -412,7 +418,7 @@ test "an initramfs is placed in guest ram and recorded in boot_params" {
     var header: SetupHeader = std.mem.zeroes(SetupHeader);
     header.version = 0x020c;
     const initrd = "INITRAMFSBYTES";
-    try buildBootParams(&memory, header, "console=ttyS0", initrd, default_low, 1, &.{}, null);
+    try buildBootParams(&memory, header, "console=ttyS0", initrd, default_low, 1, &.{}, null, null);
     // ramdisk_image/ramdisk_size recorded
     var img: [4]u8 = undefined;
     try memory.read(default_low.boot_params + 0x218, &img);
@@ -436,7 +442,7 @@ test "an initramfs past guest ram is refused" {
     var header: SetupHeader = std.mem.zeroes(SetupHeader);
     header.version = 0x020c;
     const initrd = "INITRAMFSBYTES";
-    try testing.expectError(error.InitrdTooLarge, buildBootParams(&memory, header, "console=ttyS0", initrd, default_low, 1, &.{}, null));
+    try testing.expectError(error.InitrdTooLarge, buildBootParams(&memory, header, "console=ttyS0", initrd, default_low, 1, &.{}, null, null));
 }
 
 /// GDT selectors matching the descriptors written by buildLongMode.
@@ -639,8 +645,7 @@ pub const Config = struct {
     net: bool = false,
     share: bool = false,
     tpm: bool = false,
-    /// Whether the guest is told it has a pci host bridge. Nothing here describes one yet, so a
-    /// runner that asks for one is refused before it reaches this.
+    /// Whether the guest is told it has a pci host bridge, which it learns of from ACPI here.
     pci: bool = false,
     ram_base: u64,
     ram_size: u64,
@@ -764,7 +769,15 @@ pub fn prepare(
 
     var virtio_buf: [5]acpi.VirtioDevice = undefined;
     const virtio = virtioDevicesFromConfig(config, &virtio_buf);
-    try buildBootParams(memory, parsed.header, config.cmdline, config.initrd, low, config.cpus, virtio, tpm_desc);
+    // The bridge the tables describe is the one the bus carries, so both come from the platform's
+    // own addresses rather than from numbers written twice.
+    const bridge: ?acpi.Bridge = if (config.pci) if (platform.pci) |each| .{
+        .ecam = each.ecam,
+        .memory = .{ .at = each.memory.at, .len = each.memory.len },
+        .memory64 = .{ .at = each.memory64.at, .len = each.memory64.len },
+    } else null else null;
+
+    try buildBootParams(memory, parsed.header, config.cmdline, config.initrd, low, config.cpus, virtio, tpm_desc, bridge);
     try buildLongMode(memory, low, config.ram_size, config.sev_c_bit);
     try memory.write(kernel_base, protected);
 
@@ -847,7 +860,7 @@ test "boot_params records the acpi rsdp address" {
     var memory: GuestMemory = .{ .regions = &regions };
     var header: SetupHeader = std.mem.zeroes(SetupHeader);
     header.version = 0x020c;
-    try buildBootParams(&memory, header, "console=ttyS0", null, default_low, 1, &.{}, null);
+    try buildBootParams(&memory, header, "console=ttyS0", null, default_low, 1, &.{}, null, null);
 
     // Read the 8-byte acpi_rsdp_addr at zero-page offset 0x070.
     var rsdp_buf: [8]u8 = undefined;
@@ -872,7 +885,7 @@ test "boot params build a dsdt with the given virtio device" {
     header.version = 0x020c;
 
     // Build with no devices; record the DSDT body length.
-    try buildBootParams(&memory, header, "console=ttyS0", null, default_low, 1, &.{}, null);
+    try buildBootParams(&memory, header, "console=ttyS0", null, default_low, 1, &.{}, null, null);
     var rsdp_buf: [8]u8 = undefined;
     try memory.read(default_low.boot_params + acpi_rsdp_addr_offset, &rsdp_buf);
     const rsdp_empty = std.mem.readInt(u64, &rsdp_buf, .little);
@@ -887,7 +900,7 @@ test "boot params build a dsdt with the given virtio device" {
     // Build with one virtio device; the DSDT must be longer.
     @memset(backing, 0);
     const dev = acpi.VirtioDevice{ .addr = 0xd0000200, .size = 0x200, .gsi = 17 };
-    try buildBootParams(&memory, header, "console=ttyS0", null, default_low, 1, &.{dev}, null);
+    try buildBootParams(&memory, header, "console=ttyS0", null, default_low, 1, &.{dev}, null, null);
     try memory.read(default_low.boot_params + acpi_rsdp_addr_offset, &rsdp_buf);
     const rsdp_dev = std.mem.readInt(u64, &rsdp_buf, .little);
     const tabs_dev = try Tables.init(.{ .offset = offset }, rsdp_dev);

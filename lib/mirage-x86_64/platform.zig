@@ -51,16 +51,24 @@ pub const Window = struct {
     len: u64,
 };
 
-/// Where a pci host bridge sits. There is none here: a guest on this architecture learns of one
-/// from the ACPI memory mapped config space table, which this VMM does not write, and a bridge no
-/// guest is told about is a window nothing ever reads.
+/// Where a pci host bridge sits. A guest on this architecture learns of one from two ACPI tables
+/// rather than from a device tree: the memory mapped config space table says where config space is,
+/// and a device in the DSDT says there is a root bus behind it.
+///
+/// Config space and the window below four gigabytes sit in the hole between the virtio window and
+/// the interrupt controllers, which is where a PC keeps its buses. The window above goes past
+/// anything a guest here has memory for.
 pub const Bridge = struct {
     ecam: u64,
     memory: Window,
     memory64: Window,
 };
 
-pub const pci: ?Bridge = null;
+pub const pci: ?Bridge = .{
+    .ecam = 0xe000_0000,
+    .memory = .{ .at = 0xe800_0000, .len = 0x0800_0000 },
+    .memory64 = .{ .at = 0x80_0000_0000, .len = 0x1_0000_0000 },
+};
 
 const testing = @import("mirage-testing");
 const std = @import("std");

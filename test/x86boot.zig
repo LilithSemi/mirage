@@ -1877,3 +1877,156 @@ test "an x86 guest reads and writes a shared host directory" {
     const got = linux.read(@intCast(rfd), &readback, readback.len);
     try std.testing.expectEqualSlices(u8, "written by the guest\n", readback[0..@intCast(got)]);
 }
+
+test "a real x86 kernel enumerates a pci bus and the card behind it" {
+    // Only an x86 host can build the page tables this gate relies on and run the bzImage it maps.
+    if (@import("builtin").cpu.arch != .x86_64) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+
+    const kernel = (try mapKernel()) orelse return error.SkipZigTest;
+    defer std.posix.munmap(kernel);
+
+    var machine = backend.kvm.Machine.create(gpa, 1) catch |err| switch (err) {
+        error.NoKvm => return error.SkipZigTest,
+        else => return err,
+    };
+    defer machine.deinit();
+
+    const region = try machine.vm.addMemory(ram_base, ram_size, .shared);
+    var regions = [_]GuestMemory.Region{region};
+    var memory: GuestMemory = .{ .regions = &regions };
+
+    const hv = machine.backend();
+    const id = try hv.addVcpu();
+
+    var gic = try backend.platform.createController(&machine.vm, 1);
+    defer gic.deinit();
+
+    var manifest: Manifest = .{};
+    defer manifest.deinit(gpa);
+
+    var archive: image.Cpio = .init(gpa);
+    defer archive.deinit();
+    try archive.addDirectory("dev", 0o755);
+    try archive.addCharacterDevice("dev/console", 0o600, 5, 1);
+    try archive.addFile("init", 0o755, guest_init);
+    const initrd = try archive.finish();
+    defer gpa.free(initrd);
+
+    const layout = try core.Launch.prepare(gpa, &memory, &manifest, .{
+        .kernel = kernel,
+        .initrd = initrd,
+        .cmdline = "console=ttyS0 earlyprintk=serial,ttyS0 panic=-1 rdinit=/init",
+        .ram_base = ram_base,
+        .ram_size = ram_size,
+        .cpus = 1,
+        .uart_base = serial_port,
+        .block_device = false,
+        // Which puts the config space table in the set and the host bridge in the DSDT. A guest
+        // given neither scans no root bus, however much config space answers.
+        .pci = true,
+    });
+
+    const output = try gpa.alloc(u8, 256 << 10);
+    defer gpa.free(output);
+    var sink = std.Io.Writer.fixed(output);
+    var serial: device.Uart16550 = .{ .sink = &sink };
+    var acpi_shutdown: device.AcpiShutdown = .{ .slp_typ = acpi.s5_slp_typ };
+
+    // The card's own memory: the window the guest reaches directly, and a page past it for the
+    // block that describes the display.
+    const fabric = try gpa.alloc(u8, device.Glacier.prototype_fabric_size);
+    defer gpa.free(fabric);
+    @memset(fabric, 0);
+
+    var gpu: device.Glacier = .{
+        .memory = &memory,
+        .fabric = fabric,
+        .fabric_at = device.Glacier.prototype_window_at,
+        .aperture = .{
+            .at = device.Glacier.prototype_window_at,
+            .len = device.Glacier.prototype_window_size,
+        },
+        .display = device.Glacier.prototype_display,
+        .display_at = device.Glacier.prototype_display_at,
+    };
+
+    const where = arch.platform.pci.?;
+    var bridge: device.PciHost = .{};
+    var bridge_memory: device.PciHost.Window = .{ .host = &bridge, .at = where.memory.at };
+    var bridge_memory64: device.PciHost.Window = .{ .host = &bridge, .at = where.memory64.at };
+    try std.testing.expect(bridge.add(gpu.function(.{ .device = 1 })));
+
+    var port_devices = [_]device.Bus.Device{ serial.device(serial_port), acpi_shutdown.device(acpi.sleep_port) };
+    var ports: device.Bus = .{ .devices = &port_devices };
+    var devices = [_]device.Bus.Device{
+        bridge.device(where.ecam),
+        bridge_memory.device(where.memory.len),
+        bridge_memory64.device(where.memory64.len),
+    };
+    var bus: device.Bus = .{ .devices = &devices };
+
+    try arch.boot.enter(&machine.vcpus[id], layout);
+
+    const deadline = nowMs() + 20_000;
+    armTicks(10);
+
+    var exits: usize = 0;
+    var stopped: ?backend.Backend.Exit = null;
+    var powered_off = false;
+    while (exits < max_exits) : (exits += 1) {
+        if (exits % 1024 == 0 and nowMs() > deadline) {
+            std.debug.print("\n=== deadline after {d} exits ===\n", .{exits});
+            break;
+        }
+
+        try machine.vm.setIrq(serial_irq, serial.signalling());
+
+        const exit = hv.run(id) catch |err| {
+            std.debug.print("\nrun failed after {d} exits: {t}, kvm said {?}\n", .{ exits, err, machine.fault });
+            break;
+        };
+
+        switch (exit) {
+            .port_out => |w| ports.write(w.port, w.size, w.value),
+            .port_in => |r| try hv.completeMmioRead(id, ports.read(r.port, r.size)),
+            .mmio_write => |w| bus.write(w.gpa, w.size, w.value),
+            .mmio_read => |r| try hv.completeMmioRead(id, bus.read(r.gpa, r.size)),
+            .interrupted => {},
+            else => {
+                stopped = exit;
+                break;
+            },
+        }
+
+        if (acpi_shutdown.requested) {
+            powered_off = true;
+            break;
+        }
+
+        if (sink.buffered().len + 512 > output.len) break;
+    }
+
+    const log = sink.buffered();
+
+    if (std.mem.indexOf(u8, log, "[10ee:7203]") == null or !powered_off) {
+        std.debug.print(
+            "\n=== after {d} exits, stopped {?}, powered_off {}, unmapped {d}, unclaimed {d} ===\n{s}\n=== end ===\n",
+            .{ exits, stopped, powered_off, bus.unmapped, bridge.unclaimed, log },
+        );
+    }
+
+    // The guest read the tables, found a root bus behind them, and walked config space to the card.
+    try std.testing.expect(std.mem.indexOf(u8, log, "[10ee:7203]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, log, "PCIe Endpoint") != null);
+
+    // And placed both regions inside the window the bridge's resources named, which is the whole
+    // sizing protocol having worked through ACPI rather than through a device tree.
+    const registers = bridge.baseOf(0, 0) orelse return error.TestExpectedEqual;
+    try std.testing.expect(registers >= where.memory.at);
+    try std.testing.expect(registers + device.Glacier.registers_size <= where.memory.at + where.memory.len);
+    try std.testing.expect(bridge.baseOf(0, device.Glacier.window_region) != null);
+
+    try std.testing.expect(powered_off);
+}

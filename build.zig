@@ -398,6 +398,16 @@ pub fn build(b: *std.Build) void {
             .root_module = x86boot_module,
             .filters = &.{"serial banner"},
         });
+
+        // The pci gate for this architecture: a guest learns of the bridge from ACPI rather than
+        // from a device tree, so this is the one that says those tables are right.
+        const x86pci_tests = b.addTest(.{
+            .name = "x86pci",
+            .root_module = x86boot_module,
+            .filters = &.{"enumerates a pci bus"},
+        });
+        b.step("test-x86pci", "Boot a real x86 kernel and enumerate a pci bus under KVM")
+            .dependOn(&b.addRunArtifact(x86pci_tests).step);
         b.step("test-x86boot", "Boot a real x86 kernel to its serial banner under KVM")
             .dependOn(&b.addRunArtifact(x86boot_tests).step);
 

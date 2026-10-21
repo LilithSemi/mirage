@@ -26,6 +26,28 @@ pub const Tpm = struct {
     log_len: u32 = 0,
 };
 
+/// One window a pci region may be placed in.
+pub const Window = struct {
+    at: u64,
+    len: u64,
+};
+
+/// A pci host bridge to describe.
+///
+/// Two things have to say so, and a guest needs both: the memory mapped config space table, which
+/// is where config space is, and a device in the DSDT, which is what makes a root bus exist at all.
+/// A guest given one and not the other finds either a bus it cannot configure or config space
+/// belonging to nothing.
+pub const Bridge = struct {
+    /// Where config space sits, and which buses it covers.
+    ecam: u64,
+    bus_start: u8 = 0,
+    bus_end: u8 = 0,
+    /// The windows a region may be placed in, which the bridge's resources name.
+    memory: Window,
+    memory64: Window,
+};
+
 /// Options for building the ACPI table set.
 pub const Options = struct {
     /// How many Processor Local APIC entries the MADT carries.
@@ -34,6 +56,8 @@ pub const Options = struct {
     virtio: []const VirtioDevice = &.{},
     /// When set, a TPM2 table is emitted and listed in the XSDT.
     tpm: ?Tpm = null,
+    /// When set, an MCFG table is emitted and a host bridge is described in the DSDT.
+    pci: ?Bridge = null,
 };
 
 /// The result of building the table set: the bytes to copy into guest RAM and
@@ -51,7 +75,7 @@ const sdt_header_size: usize = 36;
 
 /// Room reserved for the DSDT's AML before any of it is written. The length is not known until it
 /// has been, and `endTable` gives back whatever was not used, so this only has to be generous.
-const dsdt_room: usize = 512;
+const dsdt_room: usize = 1024;
 
 /// The register window a TIS chip answers on, and the start method that names it.
 const tis_size: u32 = 0x5000;
@@ -137,8 +161,12 @@ pub const VirtioDevice = struct {
 /// The buffer's size is written before its contents, so the descriptors go into scratch first to
 /// learn their length. `almanac.resource.encode` lays each one out, which is what keeps the tag
 /// bytes and the little endian widths in one place rather than in this file.
+/// The resources of one device, encoded into a buffer and then named.
+///
+/// The largest set here is the pci bridge's: a bus number range, a thirty two bit window and a
+/// sixty four bit one, which come to ninety bytes with the end tag.
 fn emitCrs(aml: *Emitter, resources: []const almanac.resource.Resource) !void {
-    var scratch: [64]u8 = undefined;
+    var scratch: [128]u8 = undefined;
     var used: usize = 0;
     for (resources) |each| used += try almanac.resource.encode(scratch[used..], each);
     used += try almanac.resource.encodeEndTag(scratch[used..]);
@@ -190,6 +218,72 @@ pub fn emitTpmScope(aml: *Emitter, control: u32) !void {
     try aml.end(scope);
 }
 
+/// `Scope(\_SB_){ Device(PCI0){ _HID "PNP0A08"; _CID "PNP0A03"; _SEG; _BBN; _UID; _CRS ... } }`.
+///
+/// With ACPI present, Linux scans no pci root bus without this device: the config space table says
+/// where config space is and this says there is a bus behind it. The resources are the bus numbers
+/// the bridge answers for and the windows a region may be placed in, which is what the guest's own
+/// allocator then places them inside.
+///
+/// No `_PRT`, because nothing here raises an interrupt and a routing table for interrupts that
+/// never come is a table a guest waits on.
+pub fn emitPciScope(aml: *Emitter, bridge: Bridge) !void {
+    const scope = try aml.beginScope("\\_SB_");
+    const device = try aml.beginDevice("PCI0");
+    // Express first, with the older identifier beside it, which is the pair Linux matches on.
+    try aml.name("_HID", .{ .text = "PNP0A08" });
+    try aml.name("_CID", .{ .text = "PNP0A03" });
+    try aml.name("_SEG", .{ .integer = 0 });
+    try aml.name("_BBN", .{ .integer = bridge.bus_start });
+    try aml.name("_UID", .{ .integer = 0 });
+
+    const buses = bridge.bus_end - bridge.bus_start + 1;
+    try emitCrs(aml, &.{
+        // Resource type two is a bus number range, and the length is how many buses it holds.
+        .{ .word_address = .{
+            .resource_type = 2,
+            .flags = 0,
+            .type_flags = 0,
+            .granularity = 0,
+            .min = bridge.bus_start,
+            .max = bridge.bus_end,
+            .translation = 0,
+            .length = buses,
+            .source = "",
+        } },
+        // The window below four gigabytes, which is where a thirty two bit region goes.
+        .{ .dword_address = .{
+            .resource_type = 0,
+            .flags = 0,
+            .type_flags = memory_non_cacheable,
+            .granularity = 0,
+            .min = bridge.memory.at,
+            .max = bridge.memory.at + bridge.memory.len - 1,
+            .translation = 0,
+            .length = bridge.memory.len,
+            .source = "",
+        } },
+        // And the one above it, for a region too large or too wide for the first.
+        .{ .qword_address = .{
+            .resource_type = 0,
+            .flags = 0,
+            .type_flags = memory_non_cacheable,
+            .granularity = 0,
+            .min = bridge.memory64.at,
+            .max = bridge.memory64.at + bridge.memory64.len - 1,
+            .translation = 0,
+            .length = bridge.memory64.len,
+            .source = "",
+        } },
+    });
+    try aml.end(device);
+    try aml.end(scope);
+}
+
+/// The type flags of a memory range that a guest may write to and may not cache: bit zero is the
+/// write permission and the two above it are the cacheability.
+const memory_non_cacheable: u8 = 1;
+
 /// `Name(_S5, Package(2){ 5, 5 })`, which is what a hardware reduced platform powers off through.
 ///
 /// The two elements are SLP_TYPa and SLP_TYPb.
@@ -215,6 +309,7 @@ fn emitAml(into: []u8, opts: Options) error{ OutOfSpace, BadAml }!usize {
         emitSleepState(&aml) catch |err| break :emit err;
         if (opts.virtio.len > 0) emitSystemBus(&aml, opts.virtio) catch |err| break :emit err;
         if (opts.tpm) |t| emitTpmScope(&aml, @intCast(t.control)) catch |err| break :emit err;
+        if (opts.pci) |bridge| emitPciScope(&aml, bridge) catch |err| break :emit err;
         break :emit aml.finish();
     } catch |err| switch (err) {
         error.OutOfSpace => return error.OutOfSpace,
@@ -260,8 +355,8 @@ pub fn build(buf: []u8, base_phys: u64, opts: Options) !Built {
     writeMadtBody(madt_body, opts.cpus);
     const madt_phys = try b.addTable("APIC", madt_body, 4);
 
-    // Build the XSDT entry list. Max 3: FADT, MADT, and optionally TPM2.
-    var xsdt_entries: [3]u64 = undefined;
+    // Build the XSDT entry list. Max 4: FADT, MADT, and optionally TPM2 and MCFG.
+    var xsdt_entries: [4]u64 = undefined;
     var n: usize = 0;
     xsdt_entries[n] = fadt_phys;
     n += 1;
@@ -279,6 +374,23 @@ pub fn build(buf: []u8, base_phys: u64, opts: Options) !Built {
             .log_area_start = t.log_addr,
         });
         xsdt_entries[n] = tpm2_phys;
+        n += 1;
+    }
+
+    if (opts.pci) |bridge| {
+        // Eight reserved bytes, then one sixteen byte allocation for each segment group. One
+        // segment here, so one allocation. Almanac reads this table and does not write it, so the
+        // body is composed here and handed over whole.
+        var body: [8 + @sizeOf(almanac.tables.mcfg.Allocation)]u8 = @splat(0);
+        const entry: almanac.tables.mcfg.Allocation = .{
+            .base_address = bridge.ecam,
+            .pci_segment = 0,
+            .start_bus = bridge.bus_start,
+            .end_bus = bridge.bus_end,
+            .reserved = 0,
+        };
+        @memcpy(body[8..], std.mem.asBytes(&entry));
+        xsdt_entries[n] = try b.addTable("MCFG", &body, 1);
         n += 1;
     }
 
@@ -757,4 +869,91 @@ test "the dsdt names the tpm as an msft0101 device" {
 
 test {
     _ = almanac;
+}
+
+test "the acpi set carries a config space table when a bridge is given" {
+    var buf: [4096]u8 align(16) = undefined;
+    const base: u64 = 0x80000;
+    const Tables = almanac.TablesGeneric(almanac.OffsetMapper);
+    const offset: u64 = @intFromPtr(&buf) -% base;
+
+    const bridge: Bridge = .{
+        .ecam = 0xe000_0000,
+        .memory = .{ .at = 0xe800_0000, .len = 0x0800_0000 },
+        .memory64 = .{ .at = 0x80_0000_0000, .len = 0x1_0000_0000 },
+    };
+    const built = try build(&buf, base, .{ .pci = bridge });
+    const tabs = try Tables.init(.{ .offset = offset }, built.rsdp);
+
+    // Read back with almanac's own reader rather than by offset, so the table this writes is a
+    // table something else agrees is one.
+    const mcfg = (try tabs.findAs(almanac.tables.mcfg.Mcfg)).?;
+    var each = mcfg.iterator();
+    const first = each.next().?;
+    try testing.expectEqual(bridge.ecam, first.base_address);
+    try testing.expectEqual(@as(u16, 0), first.pci_segment);
+    try testing.expectEqual(@as(u8, 0), first.start_bus);
+    try testing.expectEqual(@as(u8, 0), first.end_bus);
+
+    // One segment group, so one allocation and nothing after it.
+    try std.testing.expect(each.next() == null);
+
+    // And no such table for a machine with no bridge, because config space belonging to nothing is
+    // a window a guest reads and finds all ones in.
+    const plain = try build(&buf, base, .{});
+    const without = try Tables.init(.{ .offset = offset }, plain.rsdp);
+    try testing.expectEqual(@as(?almanac.tables.mcfg.Mcfg, null), try without.findAs(almanac.tables.mcfg.Mcfg));
+}
+
+test "the dsdt describes the bridge as a pnp0a08 device with both windows" {
+    var buf: [4096]u8 align(16) = undefined;
+    const base: u64 = 0x80000;
+    const Tables = almanac.TablesGeneric(almanac.OffsetMapper);
+    const offset: u64 = @intFromPtr(&buf) -% base;
+
+    const bridge: Bridge = .{
+        .ecam = 0xe000_0000,
+        .bus_end = 0,
+        .memory = .{ .at = 0xe800_0000, .len = 0x0800_0000 },
+        .memory64 = .{ .at = 0x80_0000_0000, .len = 0x1_0000_0000 },
+    };
+    const built = try build(&buf, base, .{ .pci = bridge });
+    const tabs = try Tables.init(.{ .offset = offset }, built.rsdp);
+    const fadt = (try tabs.findAs(almanac.Fadt)).?;
+    const mapper = almanac.OffsetMapper{ .offset = offset };
+    const dsdt_addr = fadt.preferredDsdt();
+    const dsdt_header = mapper.slice(dsdt_addr, 36);
+    const dsdt_len: usize = std.mem.readInt(u32, dsdt_header[4..8], .little);
+    const body = mapper.slice(dsdt_addr, dsdt_len)[36..];
+
+    // Linux matches on this pair, and finds no root bus without one of them.
+    try std.testing.expect(std.mem.indexOf(u8, body, "PNP0A08") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "PNP0A03") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "PCI0") != null);
+
+    // The resources the bridge answers for. A bus number range, then the window below four
+    // gigabytes as a thirty two bit range, then the one above it as a sixty four bit range: the
+    // guest's allocator places regions inside these and nowhere else.
+    const crs = std.mem.indexOf(u8, body, "_CRS").?;
+    var found_bus = false;
+    var found_low = false;
+    var found_high = false;
+    var at = crs;
+    while (at + 3 < body.len) : (at += 1) {
+        // Word, dword and qword address space descriptors, by their large resource tags.
+        if (body[at] == 0x88 and body[at + 3] == 2) found_bus = true;
+        if (body[at] == 0x87 and body[at + 3] == 0) found_low = true;
+        if (body[at] == 0x8a and body[at + 3] == 0) found_high = true;
+    }
+    try std.testing.expect(found_bus);
+    try std.testing.expect(found_low);
+    try std.testing.expect(found_high);
+
+    // The windows themselves, little endian in the descriptor bodies.
+    var window: [4]u8 = undefined;
+    std.mem.writeInt(u32, &window, @intCast(bridge.memory.at), .little);
+    try std.testing.expect(std.mem.indexOf(u8, body, &window) != null);
+    var high: [8]u8 = undefined;
+    std.mem.writeInt(u64, &high, bridge.memory64.at, .little);
+    try std.testing.expect(std.mem.indexOf(u8, body, &high) != null);
 }
