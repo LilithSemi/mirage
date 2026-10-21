@@ -89,9 +89,6 @@ state: [max_functions]State = @splat(.{}),
 unclaimed: u64 = 0,
 /// Accesses that found a region whose function declared nobody to answer them.
 unanswered: u64 = 0,
-/// Where the memory window sits, remembered when it is handed out so an access can be turned back
-/// into the address the guest used.
-window_at: u64 = 0,
 
 pub const State = struct {
     command: u16 = 0,
@@ -365,20 +362,36 @@ pub const Regions = struct {
 /// region replying from wherever it used to sit.
 const memory_enable: u16 = 1 << 1;
 
-/// The memory window the bridge decodes, anchored where the device tree says it is.
+/// One memory window the bridge decodes, anchored where the device tree says it is.
 ///
 /// Separate from the config window because they are different spaces: config says where a region
-/// is, and this is the region. Both belong to the bridge, so the bridge is the one thing that knows
-/// where firmware put what.
-pub fn window(self: *PciHost, at: u64, len: u64) Bus.Device {
-    self.window_at = at;
-    return .{
-        .base = at,
-        .len = len,
-        .ctx = self,
-        .vtable = &.{ .read = PciHost.windowRead, .write = PciHost.windowWrite },
-    };
-}
+/// is, and this is the region. A machine has a window below four gigabytes and may have a second
+/// above it, so the base belongs to the window while the functions belong to the bridge.
+pub const Window = struct {
+    host: *PciHost,
+    /// The guest address the window starts at. An access arrives as an offset, so this is what
+    /// turns one back into the address firmware placed a region at.
+    at: u64,
+
+    pub fn device(self: *Window, len: u64) Bus.Device {
+        return .{
+            .base = self.at,
+            .len = len,
+            .ctx = self,
+            .vtable = &.{ .read = Window.read, .write = Window.write },
+        };
+    }
+
+    fn read(ctx: *anyopaque, offset: u64, size: Bus.Size) u64 {
+        const self: *Window = @ptrCast(@alignCast(ctx));
+        return self.host.windowRead(self.at + offset, size);
+    }
+
+    fn write(ctx: *anyopaque, offset: u64, size: Bus.Size, value: u64) void {
+        const self: *Window = @ptrCast(@alignCast(ctx));
+        self.host.windowWrite(self.at + offset, size, value);
+    }
+};
 
 /// Which function and region owns an address, and how far into it the address is.
 const Hit = struct {
@@ -416,10 +429,8 @@ fn decode(self: *const PciHost, address: u64, size: Bus.Size) ?Hit {
     return null;
 }
 
-fn windowRead(ctx: *anyopaque, offset: u64, size: Bus.Size) u64 {
-    const self: *PciHost = @ptrCast(@alignCast(ctx));
+fn windowRead(self: *PciHost, address: u64, size: Bus.Size) u64 {
     const bytes: u64 = @backingInt(size);
-    const address = self.window_at + offset;
 
     const hit = self.decode(address, size) orelse {
         self.unclaimed += 1;
@@ -454,10 +465,7 @@ fn romRead(self: *const PciHost, slot: usize, within: u64, size: Bus.Size) u64 {
     return value;
 }
 
-fn windowWrite(ctx: *anyopaque, offset: u64, size: Bus.Size, value: u64) void {
-    const self: *PciHost = @ptrCast(@alignCast(ctx));
-    const address = self.window_at + offset;
-
+fn windowWrite(self: *PciHost, address: u64, size: Bus.Size, value: u64) void {
     const hit = self.decode(address, size) orelse {
         self.unclaimed += 1;
         return;
@@ -720,7 +728,8 @@ test "a region answers nothing until the guest enables memory space" {
     try testing.expectEqual(true, host.add(card));
 
     var config = host.device(0);
-    var memory = host.window(window_base, 0x1000_0000);
+    var memory_window: Window = .{ .host = &host, .at = window_base };
+    var memory = memory_window.device(0x1000_0000);
     config.vtable.write(config.ctx, ecam(1, 0, 0x10), .word, @intCast(window_base));
 
     // Placed but not enabled. Firmware sizes regions with decode off, so a region that answered
@@ -741,7 +750,8 @@ test "the bridge says which region an address fell in and how far into it" {
     try testing.expectEqual(true, host.add(card));
 
     var config = host.device(0);
-    var memory = host.window(window_base, 0x1000_0000);
+    var memory_window: Window = .{ .host = &host, .at = window_base };
+    var memory = memory_window.device(0x1000_0000);
 
     // Region zero at the bottom of the window, region two a megabyte up.
     config.vtable.write(config.ctx, ecam(1, 0, 0x10), .word, @intCast(window_base));
@@ -770,7 +780,8 @@ test "an address inside the window that no region covers reads all ones" {
     try testing.expectEqual(true, host.add(card));
 
     var config = host.device(0);
-    var memory = host.window(window_base, 0x1000_0000);
+    var memory_window: Window = .{ .host = &host, .at = window_base };
+    var memory = memory_window.device(0x1000_0000);
     config.vtable.write(config.ctx, ecam(1, 0, 0x10), .word, @intCast(window_base));
     config.vtable.write(config.ctx, ecam(1, 0, 0x04), .half, 0x02);
 
@@ -791,7 +802,8 @@ test "the rom answers only when both enables are set, and its tail is zero" {
     try testing.expectEqual(true, host.add(card));
 
     var config = host.device(0);
-    var memory = host.window(window_base, 0x1000_0000);
+    var memory_window: Window = .{ .host = &host, .at = window_base };
+    var memory = memory_window.device(0x1000_0000);
     const rom_at: u64 = window_base + 0x80_0000;
     config.vtable.write(config.ctx, ecam(1, 0, 0x30), .word, @intCast(rom_at));
     config.vtable.write(config.ctx, ecam(1, 0, 0x04), .half, 0x02);
@@ -817,10 +829,50 @@ test "a declared function with nobody to answer is counted rather than guessed a
     try testing.expectEqual(true, host.add(glacier));
 
     var config = host.device(0);
-    var memory = host.window(window_base, 0x1000_0000);
+    var memory_window: Window = .{ .host = &host, .at = window_base };
+    var memory = memory_window.device(0x1000_0000);
     config.vtable.write(config.ctx, ecam(1, 0, 0x10), .word, @intCast(window_base));
     config.vtable.write(config.ctx, ecam(1, 0, 0x04), .half, 0x02);
 
     try testing.expectEqual(@as(u64, 0), memory.vtable.read(memory.ctx, 0, .word));
     try testing.expectEqual(@as(u64, 1), host.unanswered);
+}
+
+/// Where a machine puts the window a wide region may be placed in. Above four gigabytes, which is
+/// the whole reason for having a second one.
+const high_window_base: u64 = 0x80_0000_0000;
+
+test "a machine with two windows decodes a region in either of them" {
+    var spy: Spy = .{};
+    var host: PciHost = .{};
+    var card = wide_card;
+    card.handler = spy.regions();
+    try testing.expectEqual(true, host.add(card));
+
+    var config = host.device(0);
+    var low: Window = .{ .host = &host, .at = window_base };
+    var high: Window = .{ .host = &host, .at = high_window_base };
+    var narrow = low.device(0x1000_0000);
+    var wide = high.device(0x1_0000_0000);
+
+    // The register block in the low window, the aperture in the high one. Firmware writes the
+    // high half of a wide region to the register after it.
+    config.vtable.write(config.ctx, ecam(1, 0, 0x10), .word, @intCast(window_base));
+    config.vtable.write(config.ctx, ecam(1, 0, 0x18), .word, @truncate(high_window_base));
+    config.vtable.write(config.ctx, ecam(1, 0, 0x1c), .word, @intCast(high_window_base >> 32));
+    config.vtable.write(config.ctx, ecam(1, 0, 0x04), .half, 0x02);
+
+    try testing.expectEqual(@as(u64, 0x48444d41), narrow.vtable.read(narrow.ctx, 0x20, .word));
+    try testing.expectEqual(@as(usize, 0), spy.region);
+    try testing.expectEqual(@as(u64, 0x20), spy.offset);
+
+    // Two windows and one table of functions, so an access high up reaches the same card at the
+    // offset inside its own region rather than at the offset inside the window.
+    try testing.expectEqual(@as(u64, 0x48444d41), wide.vtable.read(wide.ctx, 0x1_0000, .word));
+    try testing.expectEqual(@as(usize, 2), spy.region);
+    try testing.expectEqual(@as(u64, 0x1_0000), spy.offset);
+
+    // An address in the high window past the end of the aperture belongs to nothing.
+    try testing.expectEqual(@as(u64, 0xFFFF_FFFF), wide.vtable.read(wide.ctx, 0x40_0000, .word));
+    try testing.expectEqual(@as(u64, 1), host.unclaimed);
 }
