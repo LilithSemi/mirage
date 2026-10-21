@@ -51,11 +51,19 @@ pub const prototype_fabric_size = prototype_window_size + 0x1000;
 /// different card.
 pub const id: u32 = 0x48444d41;
 
-/// What the link reports: one lane at five gigatransfers a second, which is what the hard block
-/// in this build gives, and the largest payload the function will take.
-const max_payload: u3 = 0;
-const link_speed: u4 = 2;
+/// What the hard block in this build reports, from its generated parameters rather than from the
+/// module's name: the largest payload the function can take, and a link of one lane at two and a
+/// half gigatransfers a second.
+///
+/// The speed is worth more than a constant. One lane at that rate carries about two hundred
+/// megabytes a second after encoding, which is where the board's memory already sits, so the link
+/// and the memory run out together. A model that claimed five would report twice the budget the
+/// card has, and an aperture sized against that number would be sized against nothing.
+const max_payload: u3 = 1;
+const link_speed: u4 = 1;
 const link_width: u6 = 1;
+/// The low power state the link supports, which is L0s and not L1.
+const link_aspm: u2 = 1;
 
 /// The engine's registers, as byte offsets into the first region. Harbor decodes them by word
 /// index; a driver uses byte offsets, and these are those.
@@ -239,7 +247,12 @@ pub fn function(self: *Glacier, at: PciHost.Address) PciHost.Function {
         .capabilities = .{
             .power_management = true,
             .msi = true,
-            .express = .{ .max_payload = max_payload, .speed = link_speed, .width = link_width },
+            .express = .{
+                .max_payload = max_payload,
+                .speed = link_speed,
+                .width = link_width,
+                .aspm = link_aspm,
+            },
         },
     };
     one.regions[0] = .{ .size = registers_size };
@@ -466,8 +479,12 @@ fn start(self: *Glacier, word: u32) void {
 /// A whole word of the card's memory, or nothing where the card has no such address.
 fn memoryWord(self: *Glacier, at: u64) ?*[4]u8 {
     if (at < self.fabric_at) return null;
+    // The guest chooses this address, so the room for a word is checked by subtracting from the
+    // length rather than by adding to the offset. Adding wraps at the top of the address space and
+    // then passes a bounds test it should have failed.
+    if (self.fabric.len < 4) return null;
     const within = at - self.fabric_at;
-    if (within + 4 > self.fabric.len) return null;
+    if (within > self.fabric.len - 4) return null;
     return self.fabric[@intCast(within)..][0..4];
 }
 
@@ -498,26 +515,39 @@ fn move(self: *Glacier) void {
     while (moved < self.length) : (moved += 1) {
         const step = @as(u64, moved) * 4;
 
+        // Both addresses and the length come from the guest, so a step past the top of the address
+        // space is the fault of the end the address belonged to rather than a wrap into a low
+        // address that answers. Guest memory refuses a word whose own end overflows, so the host
+        // end cannot reach this; the fabric end can, and does.
+        const host = std.math.add(u64, self.host, step) catch {
+            self.failure = .completion_status;
+            return;
+        };
+        const local = std.math.add(u64, self.local, step) catch {
+            self.failure = .fabric;
+            return;
+        };
+
         if (self.to_host) {
-            const word = self.fabricRead(self.local + step) orelse {
+            const word = self.fabricRead(local) orelse {
                 self.failure = .fabric;
                 return;
             };
             var bytes: [4]u8 = undefined;
             std.mem.writeInt(u32, &bytes, word, .little);
-            self.memory.write(self.host + step, &bytes) catch {
+            self.memory.write(host, &bytes) catch {
                 self.failure = .completion_status;
                 return;
             };
             self.data = word;
         } else {
             var taken: [4]u8 = undefined;
-            self.memory.read(self.host + step, &taken) catch {
+            self.memory.read(host, &taken) catch {
                 self.failure = .completion_status;
                 return;
             };
             const word = std.mem.readInt(u32, &taken, .little);
-            if (!self.fabricWrite(self.local + step, word)) {
+            if (!self.fabricWrite(local, word)) {
                 self.failure = .fabric;
                 return;
             }
@@ -534,9 +564,19 @@ fn windowRead(self: *Glacier, offset: u64, size: Bus.Size) u64 {
     const each = self.aperture orelse return 0;
     const bytes: u64 = @backingInt(size);
 
+    // Where in the fabric this access begins. The offset is the guest's, so the addition is
+    // checked: wrapping here would read somewhere that answers.
+    const from = std.math.add(u64, each.at, offset) catch {
+        self.strayed += 1;
+        return 0;
+    };
+
     var value: u64 = 0;
     for (0..bytes) |taken| {
-        const at = each.at + offset + taken;
+        const at = std.math.add(u64, from, taken) catch {
+            self.strayed += 1;
+            continue;
+        };
         const whole = self.fabricRead(at & ~@as(u64, 3)) orelse {
             self.strayed += 1;
             continue;
@@ -551,9 +591,18 @@ fn windowWrite(self: *Glacier, offset: u64, size: Bus.Size, value: u64) void {
     const each = self.aperture orelse return;
     const bytes: u64 = @backingInt(size);
 
+    const from = std.math.add(u64, each.at, offset) catch {
+        self.strayed += 1;
+        return;
+    };
+
     for (0..bytes) |taken| {
-        const at = (each.at + offset + taken) & ~@as(u64, 3);
-        const shift: u5 = @intCast((each.at + offset + taken) & 3);
+        const whole_at = std.math.add(u64, from, taken) catch {
+            self.strayed += 1;
+            continue;
+        };
+        const at = whole_at & ~@as(u64, 3);
+        const shift: u5 = @intCast(whole_at & 3);
         const whole = self.fabricRead(at) orelse {
             self.strayed += 1;
             continue;
@@ -970,4 +1019,36 @@ test "a card with no display and no window covers nothing" {
     try testing.expectEqual(false, one.covers());
     one.aperture = .{ .at = Fixture.fabric_at, .len = 0x20_0000 };
     try testing.expectEqual(false, one.covers());
+}
+
+test "an address at the top of the address space is refused rather than wrapped" {
+    var fixture: Fixture = .{};
+    var one = fixture.card();
+
+    // The guest chooses both addresses and the length. Memory refuses a word that runs off the
+    // end of the address space, so the transfer stops at the first one rather than carrying on
+    // into whatever a wrapped address would have found.
+    put(&one, reg.host_low, 0xFFFF_FFFC);
+    put(&one, reg.host_high, 0xFFFF_FFFF);
+    put(&one, reg.local_low, @truncate(Fixture.fabric_at));
+    put(&one, reg.length, 2);
+    put(&one, reg.control, control_start | control_to_host);
+
+    try testing.expectEqual(@backingInt(Failure.completion_status), peek(&one, reg.error_code));
+    try testing.expectEqual(status_done | status_failed | status_to_host, peek(&one, reg.status));
+    try testing.expectEqual(@as(u32, 0), peek(&one, reg.completed));
+
+    // And the fabric end, on a card whose memory starts at zero, which is the one a guest can
+    // reach. The room for a word is checked by subtracting from the length, because adding four
+    // to this offset wraps, passes a bounds test it should have failed, and reads a long way
+    // outside the card's memory.
+    var low: Glacier = .{ .memory = &fixture.memory, .fabric = &fixture.fabric_bytes };
+    put(&low, reg.host_low, Fixture.host_at);
+    put(&low, reg.local_low, 0xFFFF_FFFC);
+    put(&low, reg.local_high, 0xFFFF_FFFF);
+    put(&low, reg.length, 1);
+    put(&low, reg.control, control_start | control_to_host);
+
+    try testing.expectEqual(@backingInt(Failure.fabric), peek(&low, reg.error_code));
+    try testing.expectEqual(@as(u32, 0), peek(&low, reg.completed));
 }

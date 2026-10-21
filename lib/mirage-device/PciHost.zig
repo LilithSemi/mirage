@@ -96,9 +96,12 @@ pub const Express = struct {
     /// The largest payload the function can take, as the capability codes it: zero is a hundred
     /// and twenty eight bytes and each step doubles.
     max_payload: u3 = 0,
-    /// The link, as the hard block reports it. Two is five gigatransfers a second.
-    speed: u4 = 2,
+    /// The link, as the hardware reports it. One is two and a half gigatransfers a second and each
+    /// step doubles, and the width is in lanes.
+    speed: u4 = 1,
     width: u6 = 1,
+    /// Which low power link states the hardware supports: one is L0s, two is L1, three is both.
+    aspm: u2 = 0,
 };
 
 /// Where each capability sits in config space. The hard block fixes these, and the chain is walked
@@ -362,7 +365,7 @@ fn capabilityWord(one: Function, held: State, reg: u64) ?u32 {
                 // The status half is clear: nothing here reports an error or a pending
                 // transaction.
                 0x08 => held.device_control,
-                0x0c => @as(u32, link.width) << 4 | link.speed,
+                0x0c => @as(u32, link.aspm) << 10 | @as(u32, link.width) << 4 | link.speed,
                 // The link is up and running at what the hardware reports, because a guest that
                 // reads a link as down stops looking at the function.
                 0x10 => (link_active | @as(u32, link.width) << 4 | link.speed) << 16 |
@@ -887,14 +890,19 @@ test "the express capability carries the payload size a link negotiated" {
     var host: PciHost = .{};
     var card = wide_card;
     card.at = .{ .device = 2 };
-    // Two hundred and fifty six bytes supported, one lane at five gigatransfers a second.
-    card.capabilities = .{ .express = .{ .max_payload = 1, .speed = 2, .width = 1 } };
+    // Two hundred and fifty six bytes supported, one lane at five gigatransfers a second, and the
+    // L0s low power state.
+    card.capabilities = .{ .express = .{ .max_payload = 1, .speed = 2, .width = 1, .aspm = 1 } };
     try testing.expectEqual(true, host.add(card));
 
     var one = host.device(0);
 
-    // What the function can take is the hardware's to say.
+    // What the function can take is the hardware's to say, and so is what its link can do.
     try testing.expectEqual(@as(u64, 1), one.vtable.read(one.ctx, ecam(2, 0, express_cap_at + 4), .word) & 7);
+    const capable = one.vtable.read(one.ctx, ecam(2, 0, express_cap_at + 0x0c), .word);
+    try testing.expectEqual(@as(u64, 2), capable & 0xf);
+    try testing.expectEqual(@as(u64, 1), (capable >> 4) & 0x3f);
+    try testing.expectEqual(@as(u64, 1), (capable >> 10) & 0x3);
 
     // What it will use is written by whoever enumerated it, and read back by an engine that sizes
     // its transfers from it. The reset value is the largest read request and the smallest payload,
