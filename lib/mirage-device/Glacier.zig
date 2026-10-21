@@ -34,6 +34,19 @@ pub const rom_size = 0x4_0000;
 /// defines it as two, so a driver looks there and nowhere else.
 pub const window_region = 2;
 
+/// The prototype aperture: this much fabric from this address.
+///
+/// Not a shipping number. The kernel module wants that window for an allocator rather than for one
+/// frame buffer, so the real aperture is larger and may want sixty four bits. Nothing in the model
+/// or the bridge assumes a size, which is why these two are here and not inside either.
+pub const prototype_window_at = 0x8000_0000;
+pub const prototype_window_size = 0x20_0000;
+
+/// The prototype mode, and where the block that reports it sits: past the window, so a guest
+/// painting its frame buffer cannot write over the registers that describe it.
+pub const prototype_display_at = prototype_window_at + prototype_window_size;
+pub const prototype_fabric_size = prototype_window_size + 0x1000;
+
 /// What the engine answers at the first word. A driver that reads anything else has found a
 /// different card.
 pub const id: u32 = 0x48444d41;
@@ -96,6 +109,52 @@ const entry_stride = 0x10;
 /// The window onto the fabric, as the table names it.
 pub const window_kind: u32 = 0x5744574e;
 
+/// The display block, as the table names it. The block answers the same fourcc at its own first
+/// word, and a driver that reads anything else there has found no display block.
+pub const display_kind: u32 = 0x47444953;
+pub const display_version: u32 = 1;
+
+/// Where the displays start inside the block, and how far apart they are. The stride is in the
+/// block's header because a driver reads it rather than assuming it.
+const displays_at = 0x40;
+const display_stride = 0x40;
+
+/// The two pixel formats a driver takes. Anything else it refuses rather than paint wrongly.
+pub const xr24: u32 = 0x34325258;
+pub const ar24: u32 = 0x34325241;
+
+/// One display, as its registers report it. The geometry is the caller's to state: a model that
+/// invented it would be a card nobody built.
+pub const Display = struct {
+    width: u32,
+    height: u32,
+    /// Bytes per row, which is at least four times the width and may be more. The padding of the
+    /// last row is inside what a frame buffer needs, so a window sized to width times four times
+    /// height is too small whenever there is padding.
+    pitch: u32,
+    /// Where the frame buffer sits in the fabric.
+    framebuffer: u64,
+    format: u32 = xr24,
+    /// Bit zero says HDMI, bit one DVI, bit two that there is an EDID to read. A driver with none
+    /// of them set reports DVI rather than refusing.
+    caps: u32 = 0,
+    /// Bit zero is hot plug detect.
+    status: u32 = 0,
+    pixel_clock: u32 = 0,
+    /// The sideband controller, or zero where the board routes no pins for one.
+    ddc: u32 = 0,
+};
+
+/// Six hundred and forty by four hundred and eighty, four bytes a pixel, at the bottom of the
+/// window. A prototype mode like the window it sits in, and small enough that the frame buffer is
+/// a long way inside a two megabyte aperture.
+pub const prototype_display: Display = .{
+    .width = 640,
+    .height = 480,
+    .pitch = 2560,
+    .framebuffer = prototype_window_at,
+};
+
 /// One entry of the device table. Every field is thirty two bits, which is what bounds the fabric
 /// addresses a card can describe.
 pub const Entry = struct {
@@ -129,6 +188,12 @@ memory: *GuestMemory,
 fabric: []u8,
 fabric_at: u64 = 0,
 aperture: ?Aperture = null,
+/// The one display this card reports, where it has one. A card with none is a build with no
+/// aperture to paint into, and a driver refuses it rather than publishing an address.
+display: ?Display = null,
+/// Where the display block sits in the fabric. The table carries this, and a driver reads the
+/// block through the engine like everything else that is not config space.
+display_at: u64 = 0,
 /// The expansion rom image, or nothing for a card built without one.
 rom: []const u8 = &.{},
 
@@ -139,6 +204,9 @@ completed: u32 = 0,
 data: u32 = 0,
 failure: Failure = .none,
 done: bool = false,
+/// Whether a transfer is in flight. The hardware gates a start on this and drops one silently
+/// while it is set, so the model does too.
+busy: bool = false,
 to_host: bool = false,
 
 /// How many transfers were started. Not a register: a test needs to tell a transfer that moved
@@ -182,7 +250,10 @@ pub fn regions(self: *Glacier) PciHost.Regions {
 /// How many entries the table holds. A card with nothing to describe has no table at all, and a
 /// window of zeros is what a driver reads as one.
 fn entryCount(self: *const Glacier) usize {
-    return if (self.aperture != null) 1 else 0;
+    var count: usize = 0;
+    if (self.aperture != null) count += 1;
+    if (self.display != null) count += 1;
+    return count;
 }
 
 fn entryAt(self: *const Glacier, index: usize) ?Entry {
@@ -195,7 +266,72 @@ fn entryAt(self: *const Glacier, index: usize) ?Entry {
         };
         count += 1;
     }
+    if (self.display != null) {
+        if (index == count) return .{
+            .kind = display_kind,
+            .base = @truncate(self.display_at),
+            .size = displays_at + display_stride,
+        };
+        count += 1;
+    }
     return null;
+}
+
+/// One word of the display block, or nothing where the address is not inside it.
+///
+/// Served from what the card is rather than written into the fabric, so the geometry a driver
+/// reads cannot drift from the geometry the model has. These are registers: a write to one is not
+/// a write to memory.
+fn displayWord(self: *const Glacier, at: u64) ?u32 {
+    const shown = self.display orelse return null;
+    if (at < self.display_at) return null;
+    const within = at - self.display_at;
+    if (within >= displays_at + display_stride) return null;
+
+    if (within < displays_at) return switch (within) {
+        0x00 => display_kind,
+        0x04 => display_version,
+        // One display. A driver refuses a count of zero rather than looking anyway.
+        0x08 => 1,
+        0x0c => display_stride,
+        // Enabled, by index. A display nothing enabled is one a driver passes over.
+        0x10 => 1,
+        // Nothing has underrun, because nothing here scans out.
+        0x14 => 0,
+        else => 0,
+    };
+
+    return switch (within - displays_at) {
+        0x00 => shown.caps,
+        0x08, 0x0c => 0,
+        0x10 => shown.width,
+        0x14 => shown.height,
+        0x18 => shown.pixel_clock,
+        0x1c => @truncate(shown.framebuffer),
+        0x20 => shown.status,
+        0x24 => shown.ddc,
+        0x28 => shown.format,
+        0x2c => shown.pitch,
+        // The frame counter counts started frames. Nothing here scans out, so no frame has begun.
+        0x30 => 0,
+        else => 0,
+    };
+}
+
+/// Whether the aperture covers every row of the frame buffer.
+///
+/// The same arithmetic firmware does before it publishes an address, so a card built with a window
+/// one byte too small is caught here rather than by a guest reading rows that land outside the
+/// region. The padding of the last row counts.
+pub fn covers(self: *const Glacier) bool {
+    const each = self.aperture orelse return false;
+    const shown = self.display orelse return false;
+    if (each.len == 0) return false;
+    if (shown.framebuffer < each.at) return false;
+
+    const offset = shown.framebuffer - each.at;
+    if (offset >= each.len) return false;
+    return @as(u64, shown.pitch) * shown.height <= each.len - offset;
 }
 
 fn tableWord(self: *const Glacier, within: u64) u32 {
@@ -290,6 +426,11 @@ fn start(self: *Glacier, word: u32) void {
     }
     if (word & control_start == 0) return;
 
+    // A start while a transfer is in flight is dropped, with no error and no done, which is what
+    // the hardware does with it. One access runs to the end before the next begins here, so a
+    // guest cannot reach this today; an engine that carried a transfer across several could.
+    if (self.busy) return;
+
     // A start clears everything the last transfer left behind, so a driver that reads a count or
     // an error after one is reading this transfer's and never the one before.
     self.to_host = word & control_to_host != 0;
@@ -299,19 +440,38 @@ fn start(self: *Glacier, word: u32) void {
     self.data = 0;
     self.transfers += 1;
 
+    self.busy = true;
     self.move();
+    self.busy = false;
 
     // Done is set whether the transfer finished or failed. A driver waits for done and then reads
     // the error, so an engine that left done clear on a failure would leave it waiting.
     self.done = true;
 }
 
-/// A whole word of fabric, or nothing where the card has no such address.
-fn fabricWord(self: *Glacier, at: u64) ?*[4]u8 {
+/// A whole word of the card's memory, or nothing where the card has no such address.
+fn memoryWord(self: *Glacier, at: u64) ?*[4]u8 {
     if (at < self.fabric_at) return null;
     const within = at - self.fabric_at;
     if (within + 4 > self.fabric.len) return null;
     return self.fabric[@intCast(within)..][0..4];
+}
+
+/// One word of the fabric: the display block where the address is inside it, and the card's
+/// memory everywhere else. There is one fabric, and the engine and the window are two ways in.
+fn fabricRead(self: *Glacier, at: u64) ?u32 {
+    if (self.displayWord(at)) |value| return value;
+    const word = self.memoryWord(at) orelse return null;
+    return std.mem.readInt(u32, word, .little);
+}
+
+/// Returns whether the write landed. A write into the display block reaches a register rather than
+/// memory, and nothing here changes a mode, so it is taken and dropped.
+fn fabricWrite(self: *Glacier, at: u64, value: u32) bool {
+    if (self.displayWord(at) != null) return true;
+    const word = self.memoryWord(at) orelse return false;
+    std.mem.writeInt(u32, word, value, .little);
+    return true;
 }
 
 fn move(self: *Glacier) void {
@@ -323,14 +483,15 @@ fn move(self: *Glacier) void {
     var moved: u32 = 0;
     while (moved < self.length) : (moved += 1) {
         const step = @as(u64, moved) * 4;
-        const local = self.fabricWord(self.local + step) orelse {
-            self.failure = .fabric;
-            return;
-        };
 
         if (self.to_host) {
-            const word = std.mem.readInt(u32, local, .little);
-            self.memory.write(self.host + step, local) catch {
+            const word = self.fabricRead(self.local + step) orelse {
+                self.failure = .fabric;
+                return;
+            };
+            var bytes: [4]u8 = undefined;
+            std.mem.writeInt(u32, &bytes, word, .little);
+            self.memory.write(self.host + step, &bytes) catch {
                 self.failure = .completion_status;
                 return;
             };
@@ -341,8 +502,12 @@ fn move(self: *Glacier) void {
                 self.failure = .completion_status;
                 return;
             };
-            local.* = taken;
-            self.data = std.mem.readInt(u32, &taken, .little);
+            const word = std.mem.readInt(u32, &taken, .little);
+            if (!self.fabricWrite(self.local + step, word)) {
+                self.failure = .fabric;
+                return;
+            }
+            self.data = word;
         }
         // Counted as each word lands, so a transfer that stopped half way says how far it got.
         self.completed += 1;
@@ -358,11 +523,10 @@ fn windowRead(self: *Glacier, offset: u64, size: Bus.Size) u64 {
     var value: u64 = 0;
     for (0..bytes) |taken| {
         const at = each.at + offset + taken;
-        const word = self.fabricWord(at & ~@as(u64, 3)) orelse {
+        const whole = self.fabricRead(at & ~@as(u64, 3)) orelse {
             self.strayed += 1;
             continue;
         };
-        const whole = std.mem.readInt(u32, word, .little);
         const byte: u64 = (whole >> @intCast((at & 3) * 8)) & 0xff;
         value |= byte << @intCast(taken * 8);
     }
@@ -374,15 +538,15 @@ fn windowWrite(self: *Glacier, offset: u64, size: Bus.Size, value: u64) void {
     const bytes: u64 = @backingInt(size);
 
     for (0..bytes) |taken| {
-        const at = each.at + offset + taken;
-        const word = self.fabricWord(at & ~@as(u64, 3)) orelse {
+        const at = (each.at + offset + taken) & ~@as(u64, 3);
+        const shift: u5 = @intCast((each.at + offset + taken) & 3);
+        const whole = self.fabricRead(at) orelse {
             self.strayed += 1;
             continue;
         };
-        const shift: u5 = @intCast((at & 3) * 8);
-        const whole = std.mem.readInt(u32, word, .little);
         const byte: u32 = @intCast((value >> @intCast(taken * 8)) & 0xff);
-        std.mem.writeInt(u32, word, (whole & ~(@as(u32, 0xff) << shift)) | (byte << shift), .little);
+        const mask = @as(u32, 0xff) << (shift * 8);
+        _ = self.fabricWrite(at, (whole & ~mask) | (byte << (shift * 8)));
     }
 }
 
@@ -395,7 +559,8 @@ const Fixture = struct {
     memory: GuestMemory = undefined,
 
     const host_at = 0x4000_0000;
-    const fabric_at = 0x8000_0000;
+    // The same address the prototype card uses, so a test can take the prototype mode as it is.
+    const fabric_at = Glacier.prototype_window_at;
 
     fn card(self: *Fixture) Glacier {
         self.regions = .{.{
@@ -656,4 +821,139 @@ test "the card reports the identity the hardware does" {
     one.rom = &[_]u8{ 0x55, 0xaa };
     const with_rom = one.function(.{ .device = 1 });
     try testing.expectEqual(@as(u32, rom_size), with_rom.rom_size);
+}
+
+test "the table names the display block beside the window" {
+    var fixture: Fixture = .{};
+    var one = fixture.card();
+    one.aperture = .{ .at = Fixture.fabric_at, .len = 0x20_0000 };
+    one.display = prototype_display;
+    one.display_at = Fixture.fabric_at + 0x20_0000;
+
+    try testing.expectEqual(@as(u32, 2), peek(&one, table_at + 0x08));
+
+    const second = table_at + entries_at + entry_stride;
+    try testing.expectEqual(display_kind, peek(&one, second));
+    try testing.expectEqual(@as(u32, Fixture.fabric_at + 0x20_0000), peek(&one, second + 0x04));
+}
+
+/// Read one word of the fabric the way a driver does: a transfer of one word into guest memory,
+/// then the word out of there. Eighteen of these is what enumerating a display costs.
+fn through(one: *Glacier, fixture: *Fixture, at: u64) u32 {
+    put(one, reg.host_low, Fixture.host_at);
+    put(one, reg.host_high, 0);
+    put(one, reg.local_low, @truncate(at));
+    put(one, reg.local_high, @truncate(at >> 32));
+    put(one, reg.length, 1);
+    put(one, reg.control, control_start | control_to_host);
+    return std.mem.readInt(u32, fixture.host_bytes[0..4], .little);
+}
+
+test "a driver finds the display through the engine, a word at a time" {
+    var fixture: Fixture = .{};
+    var one = fixture.card();
+    const block = Fixture.fabric_at + 0x20;
+    one.aperture = .{ .at = Fixture.fabric_at, .len = 0x20 };
+    one.display = prototype_display;
+    one.display_at = block;
+
+    // The header first. A driver that reads another fourcc here has found no display block, and
+    // one that reads another version refuses rather than guessing the layout.
+    try testing.expectEqual(display_kind, through(&one, &fixture, block));
+    try testing.expectEqual(display_version, through(&one, &fixture, block + 0x04));
+    try testing.expectEqual(@as(u32, 1), through(&one, &fixture, block + 0x08));
+    try testing.expectEqual(@as(u32, display_stride), through(&one, &fixture, block + 0x0c));
+    // Enabled by index, and nothing has underrun because nothing scans out.
+    try testing.expectEqual(@as(u32, 1), through(&one, &fixture, block + 0x10));
+    try testing.expectEqual(@as(u32, 0), through(&one, &fixture, block + 0x14));
+
+    // Then the display itself.
+    const display = block + displays_at;
+    try testing.expectEqual(@as(u32, 640), through(&one, &fixture, display + 0x10));
+    try testing.expectEqual(@as(u32, 480), through(&one, &fixture, display + 0x14));
+    try testing.expectEqual(@as(u32, Fixture.fabric_at), through(&one, &fixture, display + 0x1c));
+    try testing.expectEqual(xr24, through(&one, &fixture, display + 0x28));
+    try testing.expectEqual(@as(u32, 2560), through(&one, &fixture, display + 0x2c));
+
+    // Nothing routes sideband pins here, and no frame has begun.
+    try testing.expectEqual(@as(u32, 0), through(&one, &fixture, display + 0x24));
+    try testing.expectEqual(@as(u32, 0), through(&one, &fixture, display + 0x30));
+}
+
+test "the display registers are not memory, so nothing writes over the geometry" {
+    var fixture: Fixture = .{};
+    var one = fixture.card();
+    const block = Fixture.fabric_at + 0x20;
+    one.display = prototype_display;
+    one.display_at = block;
+
+    @memcpy(fixture.host_bytes[0..4], &[_]u8{ 0, 0, 0, 0 });
+    put(&one, reg.host_low, Fixture.host_at);
+    put(&one, reg.local_low, block + displays_at + 0x10);
+    put(&one, reg.length, 1);
+    put(&one, reg.control, control_start);
+
+    // The transfer is taken, because the fabric answered it. The width still reads as the width.
+    try testing.expectEqual(@as(u32, 0), peek(&one, reg.error_code));
+    try testing.expectEqual(@as(u32, 1), peek(&one, reg.completed));
+    try testing.expectEqual(@as(u32, 640), through(&one, &fixture, block + displays_at + 0x10));
+}
+
+test "a window one byte short of the last row is refused" {
+    var fixture: Fixture = .{};
+    var one = fixture.card();
+    one.display = prototype_display;
+
+    // Pitch times height. Six hundred and forty by four hundred and eighty at four bytes a pixel
+    // and no padding comes to this, and one byte less is refused.
+    const needed = 2560 * 480;
+    try testing.expectEqual(@as(u64, 1_228_800), needed);
+
+    one.aperture = .{ .at = Fixture.fabric_at, .len = needed };
+    try testing.expectEqual(true, one.covers());
+
+    one.aperture = .{ .at = Fixture.fabric_at, .len = needed - 1 };
+    try testing.expectEqual(false, one.covers());
+
+    // A row with padding in it needs the padding as well, including on the last row. A window
+    // sized from the width rather than the pitch is short by that much, which is the mistake this
+    // exists to catch.
+    var padded = prototype_display;
+    padded.pitch = 2816;
+    one.display = padded;
+    one.aperture = .{ .at = Fixture.fabric_at, .len = 640 * 4 * 480 };
+    try testing.expectEqual(false, one.covers());
+    one.aperture = .{ .at = Fixture.fabric_at, .len = 2816 * 480 };
+    try testing.expectEqual(true, one.covers());
+}
+
+test "a frame buffer the window does not start at is measured from where it sits" {
+    var fixture: Fixture = .{};
+    var one = fixture.card();
+    var moved = prototype_display;
+    moved.framebuffer = Fixture.fabric_at + 0x1000;
+    one.display = moved;
+
+    // The rows start a page into the window, so the window needs that page as well.
+    one.aperture = .{ .at = Fixture.fabric_at, .len = 0x1000 + 2560 * 480 };
+    try testing.expectEqual(true, one.covers());
+    one.aperture = .{ .at = Fixture.fabric_at, .len = 2560 * 480 };
+    try testing.expectEqual(false, one.covers());
+
+    // And a frame buffer below the window is not inside it however large the window is.
+    moved.framebuffer = Fixture.fabric_at - 4;
+    one.display = moved;
+    one.aperture = .{ .at = Fixture.fabric_at, .len = 0x20_0000 };
+    try testing.expectEqual(false, one.covers());
+}
+
+test "a card with no display and no window covers nothing" {
+    var fixture: Fixture = .{};
+    var one = fixture.card();
+
+    // A build with no aperture publishes no address at all, which is a card a driver passes over
+    // rather than one it refuses.
+    try testing.expectEqual(false, one.covers());
+    one.aperture = .{ .at = Fixture.fabric_at, .len = 0x20_0000 };
+    try testing.expectEqual(false, one.covers());
 }

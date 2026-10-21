@@ -37,6 +37,8 @@ pub const usage =
     \\  --root-hash <hex>     the hash tree root of the root filesystem, measured by name
     \\  --tpm <path>          a socket a security chip is listening on
     \\  --pci yes             give the guest a pci host bridge
+    \\  --glacier yes         put a glacier card behind the bridge
+    \\  --glacier-rom <path>  its expansion rom image
     \\  --share <name>=<dir>  offer that directory under that name, read only
     \\  --share <n>=<dir>:write  offer it and let the guest change what is in it
     \\  --session <path>      hold the guest up for whoever connects here
@@ -102,9 +104,15 @@ root_hash: ?[]const u8 = null,
 /// A socket a program implementing the chip's commands is listening on. Whoever starts a guest
 /// starts that program, the same way it starts the network helper.
 tpm: ?[]const u8 = null,
-/// Whether the guest is given a pci host bridge. Nothing sits behind it yet, so a guest with one
-/// enumerates an empty bus, which is what says the window and the tree agree.
+/// Whether the guest is given a pci host bridge. On its own it enumerates an empty bus, which is
+/// what says the window and the tree agree.
 pci: bool = false,
+/// Whether a glacier card sits behind the bridge. A card needs a bridge, so asking for one asks
+/// for the other.
+glacier: bool = false,
+/// The card's expansion rom image. Firmware runs what is in it, so a card with none declares no
+/// rom at all rather than a rom that reads as zeros.
+glacier_rom: ?[]const u8 = null,
 /// Directories on this machine the guest is offered, each under a name. The guest mounts one
 /// filesystem and sees a name for each of them, which is what lets the set change while it runs.
 shares: [max_shares]Share = @splat(.{}),
@@ -196,6 +204,14 @@ pub fn parse(args: []const [:0]const u8) !Options {
             options.tpm = value;
         } else if (std.mem.eql(u8, name, "--pci")) {
             options.pci = std.mem.eql(u8, value, "yes");
+        } else if (std.mem.eql(u8, name, "--glacier")) {
+            const on = std.mem.eql(u8, value, "yes");
+            options.glacier = on;
+            if (on) options.pci = true;
+        } else if (std.mem.eql(u8, name, "--glacier-rom")) {
+            options.glacier_rom = value;
+            options.glacier = true;
+            options.pci = true;
         } else if (std.mem.eql(u8, name, "--root-hash")) {
             options.root_hash = value;
         } else if (std.mem.eql(u8, name, "--firmware-at")) {

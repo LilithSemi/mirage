@@ -53,9 +53,12 @@ const net_on = net_socket.len > 0;
 /// beside this test, which is what lets it be a gate that always runs.
 const nat_on = options.nat;
 
-/// Whether the guest is given a pci host bridge with nothing behind it. Needs a kernel with the
-/// generic host bridge driver built in, so it is a gate of its own.
-const pci_on = options.pci;
+/// Whether the guest is given a pci host bridge. Needs a kernel with the generic host bridge
+/// driver built in, so it is a gate of its own.
+const pci_on = options.pci or options.glacier;
+
+/// Whether a glacier card sits behind the bridge. A card needs a bridge, so this brings one.
+const glacier_on = options.glacier;
 
 /// Whether the guest is offered a directory on this machine to mount. Needs a kernel with the
 /// filesystem driver built in, so it is a gate of its own rather than part of every boot.
@@ -535,6 +538,24 @@ test "a real linux kernel boots far enough to speak" {
     // A bridge is three devices on the bus for one bridge: config space, the window below four
     // gigabytes and the window above it. All three or none, because config space says where a
     // region is and the windows are where it answers.
+    // The card's own memory: the window the guest reaches directly, and a page past it for the
+    // block that describes the display.
+    const fabric = if (glacier_on) try gpa.alloc(u8, device.Glacier.prototype_fabric_size) else @as([]u8, &.{});
+    defer if (glacier_on) gpa.free(fabric);
+    if (glacier_on) @memset(fabric, 0);
+
+    var gpu: device.Glacier = .{
+        .memory = &memory,
+        .fabric = fabric,
+        .fabric_at = device.Glacier.prototype_window_at,
+        .aperture = .{
+            .at = device.Glacier.prototype_window_at,
+            .len = device.Glacier.prototype_window_size,
+        },
+        .display = device.Glacier.prototype_display,
+        .display_at = device.Glacier.prototype_display_at,
+    };
+
     var bridge: device.PciHost = .{};
     var bridge_memory: device.PciHost.Window = .{ .host = &bridge, .at = arm64.fdt.pci_memory_base };
     var bridge_memory64: device.PciHost.Window = .{ .host = &bridge, .at = arm64.fdt.pci_memory64_base };
@@ -575,6 +596,7 @@ test "a real linux kernel boots far enough to speak" {
         devices[on_bus] = chip.device(arm64.fdt.tpm_base);
         on_bus += 1;
     }
+    if (glacier_on) try std.testing.expect(bridge.add(gpu.function(.{ .device = 1 })));
     if (pci_on) {
         devices[on_bus] = bridge.device(arm64.fdt.ecam_base);
         devices[on_bus + 1] = bridge_memory.device(arm64.fdt.pci_memory_size);
@@ -1035,6 +1057,22 @@ test "a real linux kernel boots far enough to speak" {
         // if the kernel never reached the window the tree sent it to.
         try std.testing.expect(bridge.unclaimed > 0);
         try std.testing.expectEqual(@as(u64, 0), bridge.unanswered);
+    }
+
+    if (glacier_on) {
+        // The guest read the card's identity out of config space. Vendor and device as the
+        // generated hardware reports them, so a model that answered its own numbers would differ
+        // from the board here and nowhere else.
+        try std.testing.expect(std.mem.indexOf(u8, log, "[10ee:7203]") != null);
+
+        // And it placed both regions. Sizing a region is a write of all ones and a read of what
+        // came back, so an address here is the whole protocol having worked: the register block
+        // in the window below four gigabytes, and the aperture wherever firmware chose.
+        const registers = bridge.baseOf(0, 0) orelse return error.TestExpectedEqual;
+        try std.testing.expect(registers >= arm64.fdt.pci_memory_base);
+        try std.testing.expect(registers + device.Glacier.registers_size <=
+            arm64.fdt.pci_memory_base + arm64.fdt.pci_memory_size);
+        try std.testing.expect(bridge.baseOf(0, device.Glacier.window_region) != null);
     }
 
     try std.testing.expectEqual(@as(u64, 0), bus.unmapped);

@@ -326,6 +326,9 @@ pub fn build(b: *std.Build) void {
         // the generic host bridge driver built in, which the small kernel here does not have.
         const pci_on = b.option(bool, "pci", "Give the guest a pci host bridge") orelse false;
         boot_options.addOption(bool, "pci", pci_on);
+        // And a glacier card behind it, so the guest sizes real regions and firmware places them.
+        const glacier_on = b.option(bool, "glacier", "Put a glacier card behind the bridge") orelse false;
+        boot_options.addOption(bool, "glacier", glacier_on);
         // Whether the guest is offered a directory on this machine to mount. Needs a kernel with the
         // filesystem driver built in, which the default kernel here does not have.
         boot_options.addOption(bool, "share", share_on);

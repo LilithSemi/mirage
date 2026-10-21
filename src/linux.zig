@@ -646,12 +646,48 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         .host = &bridge,
         .at = if (platform.pci) |each| each.memory64.at else 0,
     };
+    // The card's own memory. A region of the fabric rather than of the guest: the engine carries
+    // words between the two, and the window lets the guest reach this much of it directly.
+    const fabric = if (options.glacier)
+        try gpa.alloc(u8, device.Glacier.prototype_fabric_size)
+    else
+        @as([]u8, &.{});
+    defer if (options.glacier) gpa.free(fabric);
+    if (options.glacier) @memset(fabric, 0);
+
+    const option_rom: []const u8 = if (options.glacier_rom) |path|
+        try cwd.readFileAlloc(io, path, gpa, file_limit)
+    else
+        &.{};
+    defer if (options.glacier_rom != null) gpa.free(@constCast(option_rom));
+
+    var gpu: device.Glacier = .{
+        .memory = &memory,
+        .fabric = fabric,
+        .fabric_at = device.Glacier.prototype_window_at,
+        .aperture = .{
+            .at = device.Glacier.prototype_window_at,
+            .len = device.Glacier.prototype_window_size,
+        },
+        .display = device.Glacier.prototype_display,
+        .display_at = device.Glacier.prototype_display_at,
+        .rom = option_rom,
+    };
+    // A window that does not cover every row of the frame buffer is a card firmware refuses. The
+    // numbers are this runner's, not the guest's, so this is a mistake here or nowhere.
+    if (options.glacier) std.debug.assert(gpu.covers());
+
     if (options.pci) {
         if (platform.pci) |each| {
             attached.add(bridge.device(each.ecam));
             attached.add(bridge_memory.device(each.memory.len));
             attached.add(bridge_memory64.device(each.memory64.len));
         }
+    }
+    if (options.glacier) {
+        // The slot is the bridge's to hold and firmware's to configure. A table that is full or a
+        // card that describes regions the registers cannot hold is this runner being wrong.
+        std.debug.assert(bridge.add(gpu.function(.{ .device = 1 })));
     }
     if (disk != null) {
         attached.addServed(block.device(platform.virtio.addr), block.service(platform.virtio.intid));
