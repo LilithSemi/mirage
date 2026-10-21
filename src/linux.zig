@@ -1130,4 +1130,19 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         }
         if (balloon.refused != 0) try out.print("{d} balloon pages were refused\n", .{balloon.refused});
     }
+
+    // A caller that named something to wait for and never heard it has a guest that did not do
+    // what it was run to do. Said plainly and answered with a failure, because the one asking is
+    // a test and a test that passes when the guest never spoke is worse than no test.
+    //
+    // Leaving this way rather than returning an error: the run is over, everything worth writing
+    // has been written, and an error here would arrive wrapped in a stack trace of this program
+    // rather than as the plain answer a caller wants.
+    if (options.stop_on) |text| {
+        if (!end.said_it) {
+            try out.print("the guest never said {s}\n", .{text});
+            try out.flush();
+            std.process.exit(1);
+        }
+    }
 }
