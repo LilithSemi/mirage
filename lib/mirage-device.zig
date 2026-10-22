@@ -77,6 +77,7 @@ pub const Pl011 = @import("mirage-device/Pl011.zig");
 pub const Uart16550 = @import("mirage-device/Uart16550.zig");
 pub const Tpm = @import("mirage-device/Tpm.zig");
 pub const PciHost = @import("mirage-device/PciHost.zig");
+pub const Settings = @import("mirage-device/Settings.zig");
 pub const Glacier = @import("mirage-device/Glacier.zig");
 pub const FwCfg = @import("mirage-device/FwCfg.zig");
 pub const NorFlash = @import("mirage-device/NorFlash.zig");
@@ -98,6 +99,7 @@ test {
     _ = Uart16550;
     _ = Tpm;
     _ = PciHost;
+    _ = Settings;
     _ = Glacier;
     _ = Glacier.Core;
     _ = FwCfg;
