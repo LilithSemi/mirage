@@ -84,6 +84,35 @@ test "runBlock fetches guest instructions from GuestMemory and executes them" {
     try testing.expectEqual(@as(u64, base + 4), cpu.pc);
 }
 
+test "a block run again from the same address is found without a fetch, until its page is written" {
+    const base: u64 = 0x4000_0000;
+    var bytes: [4096]u8 = @splat(0);
+    std.mem.writeInt(u32, bytes[0..4], 0xd28000e0, .little); // movz x0, #7
+    std.mem.writeInt(u32, bytes[4..8], 0x14000000, .little); // b .
+    const regions = [_]GuestMemory.Region{.{ .gpa = base, .len = bytes.len, .backing = .{ .shared = &bytes } }};
+    var memory: GuestMemory = .{ .regions = &regions };
+    var cpu: Cpu = .{ .pc = base };
+    var cache = Cache.init(testing.allocator());
+    defer cache.deinit();
+    var tlb: Translate.Tlb = .{};
+
+    _ = try cache.runBlock(&memory, &cpu, &tlb);
+    try testing.expectEqual(@as(u64, 7), cpu.x[0]);
+    // A write to some other page is not a write to code.
+    cache.written(base + 0x10_0000);
+    cpu.pc = base;
+    _ = try cache.runBlock(&memory, &cpu, &tlb);
+    try testing.expectEqual(@as(usize, 1), cache.blocks.items.len);
+
+    // Rewriting the instruction and telling the cache must run the new one.
+    std.mem.writeInt(u32, bytes[0..4], 0xd28001e0, .little); // movz x0, #15
+    cache.written(base);
+    cpu.pc = base;
+    _ = try cache.runBlock(&memory, &cpu, &tlb);
+    try testing.expectEqual(@as(u64, 15), cpu.x[0]);
+    try testing.expectEqual(@as(usize, 2), cache.blocks.items.len);
+}
+
 test "ADD immediate uses SP for register 31" {
     var block = try compileWords(testing.allocator(), 0x2000, &.{0x910017ff});
     defer block.deinit();
@@ -10034,8 +10063,8 @@ const classes = struct {
                 try testing.expectEqual(true, decoded.terminates());
                 var cpu: Cpu = .{};
                 try run(word, &cpu);
-                // The same trap an ISB raises: the run loop flushes on it.
-                try testing.expectEqual(Cpu.Trap.sync, cpu.trap);
+                // Unlike an ISB, it says the cache is stale outright.
+                try testing.expectEqual(Cpu.Trap.tlbi, cpu.trap);
             }
         }
 

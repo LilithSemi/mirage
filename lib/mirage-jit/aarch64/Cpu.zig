@@ -130,6 +130,8 @@ pub const Trap = enum(u8) {
     /// An `ISB`, which orders nothing here but does mean the translation cache
     /// is stale. It ends a block so the run loop can act on that.
     sync,
+    /// A `TLBI`, which says outright that what the translation cache holds is stale.
+    tlbi,
     /// An access that address translation refused. The reason is in `esr`, and
     /// the faulting address in `far`, which is what an exception handler reads.
     translation,

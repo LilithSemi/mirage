@@ -33,9 +33,17 @@ pub const Block = struct {
 /// Lower little-endian AArch64 instructions at `guest_pc` into native code.
 /// Control flow, memory access, or a trap terminates the block.
 pub fn compile(allocator: std.mem.Allocator, guest_pc: u64, bytes: []const u8) Error!Block {
+    return compileIn(allocator, allocator, guest_pc, bytes);
+}
+
+/// Like `compile`, but everything the translation needs only while it runs comes
+/// from `scratch`, which the caller can reset afterwards, and only what the block
+/// keeps for its lifetime comes from `allocator`. A block is a few hundred bytes
+/// of that and many kilobytes of the other.
+pub fn compileIn(scratch: std.mem.Allocator, allocator: std.mem.Allocator, guest_pc: u64, bytes: []const u8) Error!Block {
     if (bytes.len == 0) return error.EmptyBlock;
     if (bytes.len % 4 != 0) return error.UnsupportedInstruction;
-    var func = Function.init(allocator);
+    var func = Function.init(scratch);
     defer func.deinit();
 
     const u64_t = try func.types.intern(.{ .int = .{ .signedness = .unsigned, .bits = 64 } });
@@ -397,7 +405,8 @@ pub fn compile(allocator: std.mem.Allocator, guest_pc: u64, bytes: []const u8) E
             // that the translation regime may have changed, so it ends the block
             // and the run loop acts on it.
             .isb, .tlbi => {
-                try storeFieldConst(&func, entry, cpu_ptr, @offsetOf(Cpu, "trap"), @backingInt(Cpu.Trap.sync), u8_t, u64_t, ptr_t);
+                const trap: Cpu.Trap = if (instruction == .tlbi) .tlbi else .sync;
+                try storeFieldConst(&func, entry, cpu_ptr, @offsetOf(Cpu, "trap"), @backingInt(trap), u8_t, u64_t, ptr_t);
                 const next = try func.appendInst(entry, u64_t, .{ .iconst = @bitCast(pc +% 4) });
                 func.setTerminator(entry, .{ .ret = ir.function.Ret.one(next) });
                 terminated = true;
@@ -447,7 +456,19 @@ pub fn compile(allocator: std.mem.Allocator, guest_pc: u64, bytes: []const u8) E
     }
 
     const funcs = [_]native.ModuleFunction{.{ .name = "block", .func = &func }};
-    return .{ .image = try native.jitModule(allocator, &funcs) };
+    var image = try native.jitModule(scratch, &funcs);
+    errdefer image.deinit();
+    // The module's own bookkeeping was taken from `scratch`, which is about to be
+    // reused, so it moves to the allocator that will free it.
+    if (@intFromPtr(scratch.ptr) != @intFromPtr(allocator.ptr)) {
+        const symbols = try allocator.dupe(@TypeOf(image.symbols[0]), image.symbols);
+        errdefer allocator.free(symbols);
+        const data = try allocator.dupe(@TypeOf(image.data[0]), image.data);
+        image.symbols = symbols;
+        image.data = data;
+        image.allocator = allocator;
+    }
+    return .{ .image = image };
 }
 
 /// One `ADD`/`SUB` immediate. The `S` forms also update NZCV, which is what
