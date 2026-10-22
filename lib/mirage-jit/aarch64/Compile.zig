@@ -43,6 +43,7 @@ pub fn compile(allocator: std.mem.Allocator, guest_pc: u64, bytes: []const u8) E
 pub fn compileIn(scratch: std.mem.Allocator, allocator: std.mem.Allocator, guest_pc: u64, bytes: []const u8) Error!Block {
     if (bytes.len == 0) return error.EmptyBlock;
     if (bytes.len % 4 != 0) return error.UnsupportedInstruction;
+    known = @splat(null);
     var func = Function.init(scratch);
     defer func.deinit();
 
@@ -59,12 +60,18 @@ pub fn compileIn(scratch: std.mem.Allocator, allocator: std.mem.Allocator, guest
     // block boundaries.
     var pc: u64 = guest_pc;
     var terminated = false;
+    var pending: u64 = 0;
     for (0..bytes.len / 4) |index| {
         if (terminated) break;
-        const counter = try loadField(&func, entry, cpu_ptr, @offsetOf(Cpu, "system") + @offsetOf(Cpu.System, "cntvct_el0"), u64_t, ptr_t);
-        try storeField(&func, entry, cpu_ptr, @offsetOf(Cpu, "system") + @offsetOf(Cpu.System, "cntvct_el0"), try func.appendArithImm(entry, u64_t, .add, counter, 1), u64_t, ptr_t);
         const word = std.mem.readInt(u32, bytes[index * 4 ..][0..4], .little);
         const instruction = try Decode.decode(word);
+        // The counter is only observed where the block ends or a system register is
+        // touched, so instructions are tallied here and added in one step there.
+        pending += 1;
+        if (instruction.terminates() or instruction == .system) {
+            try advanceCounter(&func, entry, cpu_ptr, pending, u64_t, ptr_t);
+            pending = 0;
+        }
         switch (instruction) {
             .movz => |wide| {
                 const bits: u64 = @as(u64, wide.immediate) << wide.shift;
@@ -161,6 +168,8 @@ pub fn compileIn(scratch: std.mem.Allocator, allocator: std.mem.Allocator, guest
                     } else {
                         const from = try loadRegOrZero(&func, entry, cpu_ptr, sys.rt, u64_t, u64_t, ptr_t);
                         try func.appendStore(entry, from, address);
+                        // It may have landed on the live stack pointer.
+                        known[31] = null;
                     }
                 } else if (sys.register == .current_el) {
                     // The level in the two bits the architecture puts it in, and nothing
@@ -451,6 +460,7 @@ pub fn compileIn(scratch: std.mem.Allocator, allocator: std.mem.Allocator, guest
     }
 
     if (!terminated) {
+        try advanceCounter(&func, entry, cpu_ptr, pending, u64_t, ptr_t);
         const next = try func.appendInst(entry, u64_t, .{ .iconst = @bitCast(pc) });
         func.setTerminator(entry, .{ .ret = ir.function.Ret.one(next) });
     }
@@ -1020,6 +1030,13 @@ fn loadField(func: *Function, block: ir.function.Block, cpu_ptr: Value, offset: 
     return func.appendInst(block, ty, .{ .load = .{ .ptr = delta } });
 }
 
+fn advanceCounter(func: *Function, block: ir.function.Block, cpu_ptr: Value, count: u64, u64_t: ir.types.Type, ptr_t: ir.types.Type) Error!void {
+    if (count == 0) return;
+    const at = @offsetOf(Cpu, "system") + @offsetOf(Cpu.System, "cntvct_el0");
+    const counter = try loadField(func, block, cpu_ptr, at, u64_t, ptr_t);
+    try storeField(func, block, cpu_ptr, at, try func.appendArithImm(block, u64_t, .add, counter, @intCast(count)), u64_t, ptr_t);
+}
+
 fn regAddress(func: *Function, block: ir.function.Block, cpu_ptr: Value, reg: u32, u64_t: ir.types.Type, ptr_t: ir.types.Type) std.mem.Allocator.Error!Value {
     const byte_offset: i64 = if (reg == 31)
         @intCast(@offsetOf(Cpu, "sp"))
@@ -1029,9 +1046,20 @@ fn regAddress(func: *Function, block: ir.function.Block, cpu_ptr: Value, reg: u3
     return func.appendInst(block, ptr_t, .{ .arith = .{ .op = .add, .lhs = cpu_ptr, .rhs = offset } });
 }
 
+/// What the block being translated already holds of each register, as the value
+/// loaded or stored last. A block is one straight run of IR, so a value defined
+/// earlier is the register's value until something else is stored to it, and
+/// reading it again is a use rather than another trip to memory. Reset at the
+/// start of each translation, and one translation runs on a thread at a time.
+threadlocal var known: [32]?Value = @splat(null);
+
 fn loadReg(func: *Function, block: ir.function.Block, cpu_ptr: Value, reg: u32, ty: ir.types.Type, u64_t: ir.types.Type, ptr_t: ir.types.Type) std.mem.Allocator.Error!Value {
-    const address = try regAddress(func, block, cpu_ptr, reg, u64_t, ptr_t);
-    const full = try func.appendInst(block, u64_t, .{ .load = .{ .ptr = address } });
+    const full = known[reg] orelse load: {
+        const address = try regAddress(func, block, cpu_ptr, reg, u64_t, ptr_t);
+        const loaded = try func.appendInst(block, u64_t, .{ .load = .{ .ptr = address } });
+        known[reg] = loaded;
+        break :load loaded;
+    };
     if (func.valueType(full) == ty) return full;
     return func.appendInst(block, ty, .{ .convert = .{ .value = full } });
 }
@@ -1041,6 +1069,7 @@ fn storeReg(func: *Function, block: ir.function.Block, cpu_ptr: Value, reg: u32,
     const value_ty = func.valueType(value);
     const full = if (value_ty == u64_t) value else try func.appendInst(block, u64_t, .{ .convert = .{ .value = value } });
     try func.appendStore(block, full, address);
+    known[reg] = full;
 }
 
 fn storeField(func: *Function, block: ir.function.Block, cpu_ptr: Value, offset: usize, value: Value, u64_t: ir.types.Type, ptr_t: ir.types.Type) std.mem.Allocator.Error!void {
