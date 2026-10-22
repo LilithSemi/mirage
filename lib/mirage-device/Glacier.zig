@@ -154,6 +154,8 @@ pub const Display = struct {
     caps: u32 = 0,
     /// Bit zero is hot plug detect.
     status: u32 = 0,
+    /// Hertz of the dot clock the mode needs. A driver may refuse a mode whose clock is zero,
+    /// because no board can make one.
     pixel_clock: u32 = 0,
     /// The sideband controller, or zero where the board routes no pins for one.
     ddc: u32 = 0,
@@ -167,6 +169,9 @@ pub const prototype_display: Display = .{
     .height = 480,
     .pitch = 2560,
     .framebuffer = prototype_window_at,
+    // The VESA dot clock for this mode at sixty hertz. A real number because a driver is right to
+    // refuse a mode that asks a board for no clock at all.
+    .pixel_clock = 25_175_000,
 };
 
 /// One entry of the device table. Every field is thirty two bits, which is what bounds the fabric
@@ -281,6 +286,11 @@ painted: u64 = 0,
 /// so these two are counted apart: the first says the driver painted, the second says something
 /// else could, and only the second says the published address was usable.
 painted_through_window: u64 = 0,
+/// Bytes the window served, wherever in the fabric they went. Counted beside the frame buffer
+/// numbers because a zero here says nothing came through the window at all, which is a different
+/// fault from something arriving somewhere nobody expected.
+read_through_window: u64 = 0,
+written_through_window: u64 = 0,
 /// Bytes that landed in the aperture but outside the frame buffer, whichever way they came. A
 /// driver painting where it should not, which nothing is expected to do.
 outside: u64 = 0,
@@ -684,6 +694,7 @@ fn windowRead(self: *Glacier, offset: u64, size: Bus.Size) u64 {
         };
         const byte: u64 = (whole >> @intCast((at & 3) * 8)) & 0xff;
         value |= byte << @intCast(taken * 8);
+        self.read_through_window += 1;
     }
     return value;
 }
@@ -710,7 +721,10 @@ fn windowWrite(self: *Glacier, offset: u64, size: Bus.Size, value: u64) void {
         };
         const byte: u32 = @intCast((value >> @intCast(taken * 8)) & 0xff);
         const mask = @as(u32, 0xff) << (shift * 8);
-        if (self.fabricWrite(at, (whole & ~mask) | (byte << (shift * 8)))) self.landed(whole_at, 1, true);
+        if (self.fabricWrite(at, (whole & ~mask) | (byte << (shift * 8)))) {
+            self.written_through_window += 1;
+            self.landed(whole_at, 1, true);
+        }
     }
 }
 
@@ -1329,4 +1343,52 @@ test "the screen is the rows of the frame buffer, or nothing where there is no s
     // card built wrong rather than a guest being wrong.
     one.display = prototype_display;
     try testing.expectEqual(@as(?[]const u8, null), one.screen());
+}
+
+test "a frame buffer painted through the bridge lands in the fabric the display scans" {
+    var fixture: Fixture = .{};
+    var one = fixture.card();
+    one.aperture = .{ .at = Fixture.fabric_at, .len = fixture.fabric_bytes.len };
+    // A mode the size of the fixture's fabric, so the whole path fits in sixty four bytes.
+    one.display = .{ .width = 4, .height = 2, .pitch = 16, .framebuffer = Fixture.fabric_at };
+    one.display_at = Fixture.fabric_at + 0x1000;
+    try testing.expectEqual(true, one.covers());
+
+    var host: PciHost = .{};
+    try testing.expectEqual(true, host.add(one.function(.{ .device = 1 })));
+
+    const window_base: u64 = 0x1000_0000;
+    var config = host.device(0);
+    var window: PciHost.Window = .{ .host = &host, .at = window_base };
+    var memory = window.device(0x1_0000);
+
+    // What firmware does: place both regions, then set memory space enable.
+    const slot: u64 = @as(u64, 1) << 15;
+    config.vtable.write(config.ctx, slot | 0x10, .word, @intCast(window_base));
+    config.vtable.write(config.ctx, slot | 0x18, .word, @intCast(window_base + 0x1000));
+    config.vtable.write(config.ctx, slot | 0x04, .half, 0x02);
+
+    // One pixel, painted the way firmware and an operating system paint one: a store into the
+    // address the driver published, with no engine involved.
+    memory.vtable.write(memory.ctx, 0x1000, .word, 0xffff_ffff);
+    try testing.expectEqual(@as(u32, 0xffff_ffff), std.mem.readInt(u32, fixture.fabric_bytes[0..4], .little));
+    try testing.expectEqual(@as(u64, 4), one.painted_through_window);
+    try testing.expectEqual(@as(u64, 0), host.unclaimed);
+    try testing.expectEqual(@as(u64, 0), host.refused);
+
+    // The engine carries the same bytes out, which is the memory the display block scans.
+    put(&one, reg.host_low, Fixture.host_at);
+    put(&one, reg.local_low, Fixture.fabric_at);
+    put(&one, reg.length, 1);
+    put(&one, reg.control, control_start | control_to_host);
+    try testing.expectEqual(@as(u32, 0xffff_ffff), std.mem.readInt(u32, fixture.host_bytes[0..4], .little));
+
+    // The same store with the card switched off reaches nothing: a guest that paints into an
+    // address whose card is off reads its writes back as all ones and sees a black screen.
+    config.vtable.write(config.ctx, slot | 0x04, .half, 0x00);
+    memory.vtable.write(memory.ctx, 0x1004, .word, 0xffff_ffff);
+    try testing.expectEqual(@as(u64, 0xFFFF_FFFF), memory.vtable.read(memory.ctx, 0x1004, .word));
+    try testing.expectEqual(@as(u64, 4), one.painted_through_window);
+    try testing.expectEqual(@as(u64, 2), host.refused);
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, fixture.fabric_bytes[4..8], .little));
 }

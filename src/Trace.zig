@@ -23,8 +23,30 @@ lost: u64 = 0,
 said: [line_room]u8 = @splat(0),
 saying: usize = 0,
 
-pub fn watcher(self: *Trace) device.Glacier.Watcher {
+pub fn cardWatcher(self: *Trace) device.Glacier.Watcher {
     return .{ .ctx = self, .saw = Trace.saw };
+}
+
+pub fn bridgeWatcher(self: *Trace) device.PciHost.Watcher {
+    return .{ .ctx = self, .saw = Trace.sawStray };
+}
+
+/// An access the bridge gave to nobody. The bridge reports the first few of each kind, so a test
+/// reading this file can say which addresses a driver poked and why they went nowhere.
+fn sawStray(ctx: *anyopaque, what: device.PciHost.Event) void {
+    const self: *Trace = @ptrCast(@alignCast(ctx));
+    switch (what) {
+        .stray => |one| self.line(
+            \\{{"event":"stray","space":"{s}","why":"{s}","at":{d},"bytes":{d},"write":{},"value":{d}}}
+        , .{
+            @tagName(one.space),
+            @tagName(one.why),
+            one.at,
+            one.bytes,
+            one.write,
+            one.value,
+        }),
+    }
 }
 
 fn saw(ctx: *anyopaque, what: device.Glacier.Event) void {
@@ -62,14 +84,18 @@ fn line(self: *Trace, comptime shape: []const u8, args: anytype) void {
 /// reader of this file and a reader of the code are reading the same words.
 pub fn summary(self: *Trace, bridge: *const device.PciHost, gpu: *const device.Glacier) void {
     self.line(
-        \\{{"event":"summary","rom_reads":{d},"unclaimed":{d},"unanswered":{d},"registers_at":{d},"aperture_at":{d},"aperture_reads":{d},"transfers":{d},"table_reads":{d},"table_found":{d},"mode_selects":{d},"painted_by_engine":{d},"painted_through_window":{d},"outside":{d},"strayed":{d}}}
+        \\{{"event":"summary","rom_reads":{d},"unclaimed":{d},"refused":{d},"unanswered":{d},"command":{d},"registers_at":{d},"aperture_at":{d},"aperture_base_reads":{d},"read_through_window":{d},"written_through_window":{d},"transfers":{d},"table_reads":{d},"table_found":{d},"mode_selects":{d},"painted_by_engine":{d},"painted_through_window":{d},"outside":{d},"strayed":{d}}}
     , .{
         bridge.rom_reads,
         bridge.unclaimed,
+        bridge.refused,
         bridge.unanswered,
+        bridge.state[0].command,
         bridge.baseOf(0, 0) orelse 0,
         bridge.baseOf(0, device.Glacier.window_region) orelse 0,
         bridge.state[0].base_reads[device.Glacier.window_region],
+        gpu.read_through_window,
+        gpu.written_through_window,
         gpu.transfers,
         gpu.table_reads,
         gpu.table_found,

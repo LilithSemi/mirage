@@ -742,9 +742,13 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     }
     defer if (trace_file) |each| each.close(io);
 
+    // Where an access went nowhere is the other half of a driver's story, so the bridge writes
+    // into the same file the card does.
+    if (trace != null) bridge.watching = trace.?.bridgeWatcher();
+
     var gpu: device.Glacier = .{
         .memory = &memory,
-        .watching = if (trace != null) trace.?.watcher() else null,
+        .watching = if (trace != null) trace.?.cardWatcher() else null,
         .fabric = fabric,
         .fabric_at = device.Glacier.prototype_window_at,
         .aperture = .{
@@ -1030,6 +1034,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     }
     if (bridge.unanswered != 0) {
         try say.print("pci: {d} accesses reached a region with nobody to answer them\n", .{bridge.unanswered});
+    }
+    if (bridge.refused != 0) {
+        try say.print("pci: {d} accesses reached a card the guest has not switched on\n", .{bridge.refused});
     }
     if (screens) |each| {
         if (each.lost != 0) try say.print("glacier: {d} pictures could not be written\n", .{each.lost});

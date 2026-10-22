@@ -128,6 +128,14 @@ unanswered: u64 = 0,
 /// Reads of an expansion rom. Firmware reads one only when it means to run it, so this is how a
 /// run says whether the image was dispatched at all.
 rom_reads: u64 = 0,
+/// Accesses that fell inside a region of a function whose memory decoding is off. Counted apart
+/// from `unclaimed` because the address belongs to a card and the card is not listening: firmware
+/// that gives an operating system an address and then switches the card off reads as a card with
+/// no such address until these two are apart.
+refused: u64 = 0,
+watching: ?Watcher = null,
+/// How many stray accesses have been reported, by space and reason.
+told: [2][3]u8 = @splat(@splat(0)),
 
 pub const State = struct {
     command: u16 = 0,
@@ -241,6 +249,15 @@ pub fn device(self: *PciHost, at: u64) Bus.Device {
     };
 }
 
+fn tell(self: *PciHost, one: Stray) void {
+    const watcher = self.watching orelse return;
+    const space = @backingInt(one.space);
+    const why = @backingInt(one.why);
+    if (self.told[space][why] == max_told) return;
+    self.told[space][why] += 1;
+    watcher.saw(watcher.ctx, .{ .stray = one });
+}
+
 fn slotOf(self: *const PciHost, bus: u8, dev: u5, fun: u3) ?usize {
     if (bus != 0) return null;
     for (self.functions, 0..) |each, index| {
@@ -261,6 +278,7 @@ fn read(ctx: *anyopaque, offset: u64, size: Bus.Size) u64 {
 
     const slot = self.slotOf(bus, dev, fun) orelse {
         self.unclaimed += 1;
+        self.tell(.{ .at = offset, .bytes = bytes, .write = false, .value = 0, .space = .config, .why = .nobody });
         return absent >> @intCast(64 - bytes * 8);
     };
 
@@ -404,7 +422,6 @@ const capability_list: u16 = 0x0010;
 
 fn write(ctx: *anyopaque, offset: u64, size: Bus.Size, value: u64) void {
     const self: *PciHost = @ptrCast(@alignCast(ctx));
-    _ = size;
 
     const bus: u8 = @truncate(offset >> 20);
     const dev: u5 = @truncate(offset >> 15);
@@ -413,6 +430,14 @@ fn write(ctx: *anyopaque, offset: u64, size: Bus.Size, value: u64) void {
 
     const slot = self.slotOf(bus, dev, fun) orelse {
         self.unclaimed += 1;
+        self.tell(.{
+            .at = offset,
+            .bytes = @backingInt(size),
+            .write = true,
+            .value = value,
+            .space = .config,
+            .why = .nobody,
+        });
         return;
     };
 
@@ -515,6 +540,48 @@ pub const Regions = struct {
     };
 };
 
+/// An access the bridge could not hand to a device, and why.
+///
+/// A guest picks every address, so an access that lands nowhere is ordinary and is reported rather
+/// than refused loudly. The reason is what makes a report worth reading: an address no card owns
+/// and an address whose card is switched off read the same to a guest and are different faults.
+pub const Stray = struct {
+    /// For the memory window, the guest address. For config space, the offset inside the window,
+    /// which names a bus, a device, a function and a register.
+    at: u64,
+    bytes: u64,
+    write: bool,
+    value: u64,
+    space: Space,
+    why: Reason,
+
+    pub const Space = enum { config, memory };
+
+    pub const Reason = enum {
+        /// No function owns the address.
+        nobody,
+        /// A function owns it and its guest has not set memory space enable.
+        decoding_off,
+        /// A function owns it and declared nobody to answer for it.
+        unanswered,
+    };
+};
+
+pub const Event = union(enum) {
+    stray: Stray,
+};
+
+/// Who to tell about an access nothing answered.
+pub const Watcher = struct {
+    ctx: *anyopaque,
+    saw: *const fn (ctx: *anyopaque, what: Event) void,
+};
+
+/// How many of each kind of stray access are reported. A guest that paints a whole frame into an
+/// address nothing answers makes a million of them, and the first few say as much as all of them.
+/// The counters keep the whole total.
+const max_told = 16;
+
 /// Command bit one, memory space enable. A function whose guest has not set it does not answer in
 /// the memory window at all, which is what lets firmware size a region without the half placed
 /// region replying from wherever it used to sit.
@@ -556,6 +623,9 @@ const Hit = struct {
     slot: usize,
     region: usize,
     within: u64,
+    /// Whether the function's guest has set memory space enable. A hit on a function that has not
+    /// is answered the way a miss is, and counted its own way.
+    enabled: bool,
     /// Set when the address fell in the expansion rom rather than a region.
     rom: bool = false,
 };
@@ -566,7 +636,7 @@ fn decode(self: *const PciHost, address: u64, size: Bus.Size) ?Hit {
 
     for (self.functions, 0..) |each, slot| {
         const one = each orelse continue;
-        if (self.state[slot].command & memory_enable == 0) continue;
+        const enabled = self.state[slot].command & memory_enable != 0;
 
         var region: usize = 0;
         while (region < max_regions) : (region += 1) {
@@ -574,13 +644,19 @@ fn decode(self: *const PciHost, address: u64, size: Bus.Size) ?Hit {
             const base = self.baseOf(slot, region) orelse continue;
             if (address < base) continue;
             if (end > base + one.regions[region].size) continue;
-            return .{ .slot = slot, .region = region, .within = address - base };
+            return .{ .slot = slot, .region = region, .within = address - base, .enabled = enabled };
         }
 
         if (one.rom_size != 0 and self.state[slot].rom_base & rom_enable != 0) {
             const base = self.state[slot].rom_base & ~@as(u32, rom_enable);
             if (base != 0 and address >= base and end <= @as(u64, base) + one.rom_size) {
-                return .{ .slot = slot, .region = 0, .within = address - base, .rom = true };
+                return .{
+                    .slot = slot,
+                    .region = 0,
+                    .within = address - base,
+                    .enabled = enabled,
+                    .rom = true,
+                };
             }
         }
     }
@@ -592,8 +668,14 @@ fn windowRead(self: *PciHost, address: u64, size: Bus.Size) u64 {
 
     const hit = self.decode(address, size) orelse {
         self.unclaimed += 1;
+        self.tell(.{ .at = address, .bytes = bytes, .write = false, .value = 0, .space = .memory, .why = .nobody });
         return absent >> @intCast(64 - bytes * 8);
     };
+    if (!hit.enabled) {
+        self.refused += 1;
+        self.tell(.{ .at = address, .bytes = bytes, .write = false, .value = 0, .space = .memory, .why = .decoding_off });
+        return absent >> @intCast(64 - bytes * 8);
+    }
 
     if (hit.rom) {
         self.rom_reads += 1;
@@ -603,6 +685,7 @@ fn windowRead(self: *PciHost, address: u64, size: Bus.Size) u64 {
     const one = self.functions[hit.slot].?;
     const answers = one.handler orelse {
         self.unanswered += 1;
+        self.tell(.{ .at = address, .bytes = bytes, .write = false, .value = 0, .space = .memory, .why = .unanswered });
         return 0;
     };
     return answers.vtable.read(answers.ctx, hit.region, hit.within, size);
@@ -627,16 +710,25 @@ fn romRead(self: *const PciHost, slot: usize, within: u64, size: Bus.Size) u64 {
 }
 
 fn windowWrite(self: *PciHost, address: u64, size: Bus.Size, value: u64) void {
+    const bytes: u64 = @backingInt(size);
+
     const hit = self.decode(address, size) orelse {
         self.unclaimed += 1;
+        self.tell(.{ .at = address, .bytes = bytes, .write = true, .value = value, .space = .memory, .why = .nobody });
         return;
     };
+    if (!hit.enabled) {
+        self.refused += 1;
+        self.tell(.{ .at = address, .bytes = bytes, .write = true, .value = value, .space = .memory, .why = .decoding_off });
+        return;
+    }
     // A rom is read only. A guest writing into one is allowed to be wrong.
     if (hit.rom) return;
 
     const one = self.functions[hit.slot].?;
     const answers = one.handler orelse {
         self.unanswered += 1;
+        self.tell(.{ .at = address, .bytes = bytes, .write = true, .value = value, .space = .memory, .why = .unanswered });
         return;
     };
     answers.vtable.write(answers.ctx, hit.region, hit.within, size, value);
@@ -1123,4 +1215,112 @@ test "a machine with two windows decodes a region in either of them" {
     // An address in the high window past the end of the aperture belongs to nothing.
     try testing.expectEqual(@as(u64, 0xFFFF_FFFF), wide.vtable.read(wide.ctx, 0x40_0000, .word));
     try testing.expectEqual(@as(u64, 1), host.unclaimed);
+}
+
+/// Keeps what the bridge reported, so a test can read the reason rather than a total.
+const Keeper = struct {
+    seen: [8]Stray = @splat(undefined),
+    count: usize = 0,
+    all: u64 = 0,
+
+    fn watcher(self: *Keeper) Watcher {
+        return .{ .ctx = self, .saw = Keeper.saw };
+    }
+
+    fn saw(ctx: *anyopaque, what: Event) void {
+        const self: *Keeper = @ptrCast(@alignCast(ctx));
+        switch (what) {
+            .stray => |one| {
+                self.all += 1;
+                if (self.count == self.seen.len) return;
+                self.seen[self.count] = one;
+                self.count += 1;
+            },
+        }
+    }
+};
+
+test "a card the guest switched off is counted apart from an address nothing owns" {
+    var spy: Spy = .{};
+    var host: PciHost = .{};
+    var card = glacier;
+    card.handler = spy.regions();
+    try testing.expectEqual(true, host.add(card));
+
+    var config = host.device(0);
+    var memory_window: Window = .{ .host = &host, .at = window_base };
+    var memory = memory_window.device(0x1000_0000);
+    config.vtable.write(config.ctx, ecam(1, 0, 0x10), .word, @intCast(window_base));
+    config.vtable.write(config.ctx, ecam(1, 0, 0x04), .half, 0x02);
+
+    // Switched on, then off again, which is what firmware does to a card before it hands the
+    // machine over. The address the guest was given still belongs to the card.
+    config.vtable.write(config.ctx, ecam(1, 0, 0x04), .half, 0x00);
+    memory.vtable.write(memory.ctx, 0x10, .word, 0xffff_ffff);
+    try testing.expectEqual(@as(u64, 0xFFFF_FFFF), memory.vtable.read(memory.ctx, 0x10, .word));
+
+    // All ones from a card that is there and not listening reads the same as all ones from an
+    // address nothing owns, so the two are counted apart.
+    try testing.expectEqual(@as(u64, 2), host.refused);
+    try testing.expectEqual(@as(u64, 0), host.unclaimed);
+    try testing.expectEqual(@as(usize, 0), spy.reads);
+    try testing.expectEqual(@as(usize, 0), spy.writes);
+}
+
+test "a stray access names the space it was in and why" {
+    var keeper: Keeper = .{};
+    var spy: Spy = .{};
+    var host: PciHost = .{ .watching = keeper.watcher() };
+    var card = glacier;
+    card.handler = spy.regions();
+    try testing.expectEqual(true, host.add(card));
+
+    var config = host.device(0);
+    var memory_window: Window = .{ .host = &host, .at = window_base };
+    var memory = memory_window.device(0x1000_0000);
+    config.vtable.write(config.ctx, ecam(1, 0, 0x10), .word, @intCast(window_base));
+
+    // A slot with nothing in it, which is every enumeration there has ever been.
+    _ = config.vtable.read(config.ctx, ecam(3, 0, 0x00), .word);
+    // The card, placed and not switched on.
+    memory.vtable.write(memory.ctx, 0x20, .word, 0xdeadbeef);
+    // Switched on, and an address past the end of its one region.
+    config.vtable.write(config.ctx, ecam(1, 0, 0x04), .half, 0x02);
+    _ = memory.vtable.read(memory.ctx, 0x1_0000, .word);
+
+    try testing.expectEqual(@as(usize, 3), keeper.count);
+
+    try testing.expectEqual(Stray.Space.config, keeper.seen[0].space);
+    try testing.expectEqual(Stray.Reason.nobody, keeper.seen[0].why);
+    try testing.expectEqual(ecam(3, 0, 0x00), keeper.seen[0].at);
+
+    try testing.expectEqual(Stray.Space.memory, keeper.seen[1].space);
+    try testing.expectEqual(Stray.Reason.decoding_off, keeper.seen[1].why);
+    try testing.expectEqual(window_base + 0x20, keeper.seen[1].at);
+    try testing.expectEqual(true, keeper.seen[1].write);
+    try testing.expectEqual(@as(u64, 0xdeadbeef), keeper.seen[1].value);
+
+    try testing.expectEqual(Stray.Space.memory, keeper.seen[2].space);
+    try testing.expectEqual(Stray.Reason.nobody, keeper.seen[2].why);
+    try testing.expectEqual(window_base + 0x1_0000, keeper.seen[2].at);
+    try testing.expectEqual(false, keeper.seen[2].write);
+}
+
+test "a guest painting into a card that is off is reported a few times and counted every time" {
+    var keeper: Keeper = .{};
+    var host: PciHost = .{ .watching = keeper.watcher() };
+    const card = glacier;
+    try testing.expectEqual(true, host.add(card));
+
+    var config = host.device(0);
+    var memory_window: Window = .{ .host = &host, .at = window_base };
+    var memory = memory_window.device(0x1000_0000);
+    config.vtable.write(config.ctx, ecam(1, 0, 0x10), .word, @intCast(window_base));
+
+    // A frame buffer is painted a word at a time, and a trace of a million of them is a trace
+    // nobody can read.
+    for (0..1000) |each| memory.vtable.write(memory.ctx, @intCast(each * 4), .word, 0xffff_ffff);
+
+    try testing.expectEqual(@as(u64, 1000), host.refused);
+    try testing.expectEqual(@as(u64, max_told), keeper.all);
 }
