@@ -94,6 +94,60 @@ pub fn build(b: *std.Build) void {
         .{ .name = "mirage-arch", .module = arch },
         .{ .name = "mirage-attest", .module = attest },
     });
+    // Experimental DBT is hosted-only: Vulcan's native JIT emits code for the build host.
+    if (has_os and target.result.cpu.arch == .x86_64) {
+        const vulcan = b.dependency("vulcan", .{ .target = target, .optimize = optimize });
+        const jit_imports: []const std.Build.Module.Import = &.{
+            .{ .name = "mirage-memory", .module = memory },
+            .{ .name = "mirage-backend", .module = backend },
+            .{ .name = "mirage-arm64", .module = arm64 },
+            .{ .name = "vulcan-ir", .module = vulcan.module("vulcan-ir") },
+            .{ .name = "vulcan-target", .module = vulcan.module("vulcan-target") },
+            .{ .name = "vulcan-opt", .module = vulcan.module("vulcan-opt") },
+            .{ .name = "vulcan-link", .module = vulcan.module("vulcan-link") },
+        };
+        const jit = add.lib("mirage-jit", jit_imports);
+        const jit_tests = b.addTest(.{ .name = "mirage-jit", .root_module = b.createModule(.{
+            .root_source_file = b.path("lib/mirage-jit/aarch64/tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "mirage-jit", .module = jit },
+                .{ .name = "mirage-testing", .module = mirage_testing },
+                .{ .name = "mirage-memory", .module = memory },
+                .{ .name = "mirage-backend", .module = backend },
+                .{ .name = "mirage-arm64", .module = arm64 },
+            },
+        }) });
+        b.step("test-jit", "Run native AArch64 JIT tests").dependOn(&b.addRunArtifact(jit_tests).step);
+        const launch_tests = b.addTest(.{ .name = "mirage-jit-launch", .root_module = b.createModule(.{
+            .root_source_file = b.path("test/jit-launch.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "mirage-jit", .module = jit },
+                .{ .name = "mirage-core", .module = core },
+                .{ .name = "mirage-device", .module = device },
+                .{ .name = "mirage-arm64", .module = arm64 },
+                .{ .name = "mirage-memory", .module = memory },
+            },
+        }) });
+        b.step("test-jit-launch", "Run JIT guest through the Mirage launch loop").dependOn(&b.addRunArtifact(launch_tests).step);
+        const boot = b.addExecutable(.{ .name = "mirage-jit-boot", .root_module = b.createModule(.{
+            .root_source_file = b.path("test/jit-boot.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "mirage-jit", .module = jit },
+                .{ .name = "mirage-core", .module = core },
+                .{ .name = "mirage-device", .module = device },
+                .{ .name = "mirage-arm64", .module = arm64 },
+                .{ .name = "mirage-attest", .module = attest },
+                .{ .name = "mirage-memory", .module = memory },
+            },
+        }) });
+        b.step("jit-boot", "Build the kernel boot runner for the AArch64 JIT").dependOn(&b.addInstallArtifact(boot, .{}).step);
+    }
     if (target.result.os.tag == .macos) {
         const mac_options = b.addOptions();
         mac_options.addOption([]const u8, "kernel_path", kernel_path);
