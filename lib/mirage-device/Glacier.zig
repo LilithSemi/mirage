@@ -17,6 +17,10 @@ const testing = @import("mirage-testing");
 
 const Glacier = @This();
 
+/// One compute core, which a host loads a program into and launches. A build may carry several,
+/// and the table says where each window went.
+pub const Core = @import("glacier/Core.zig");
+
 /// What the card reports in config space. Read off the generated hardware for
 /// `chenega_v1_ax7203`, so these are facts and not intent.
 pub const vendor: u16 = 0x10ee;
@@ -58,6 +62,10 @@ pub const prototype_pool: Pool = .{
 
 /// The window, and a page each for the two register blocks past it.
 pub const prototype_fabric_size = prototype_window_size + 0x2000;
+
+/// Where the core window sits. The board puts it here, and the card keeps nothing in the fabric
+/// behind it, so a window this far from the rest needs no memory to answer with.
+pub const prototype_core_at = 0x1001_0000;
 
 /// What the engine answers at the first word. A driver that reads anything else has found a
 /// different card.
@@ -280,6 +288,11 @@ aperture: ?Aperture = null,
 /// card built with nothing left over has neither, and its table names no memory block.
 pool: ?Pool = null,
 pool_at: u64 = 0,
+/// The core, where the card was built with one, and where its window sits in the fabric. A host
+/// reaches it over the engine rather than through the aperture, because the window the board gives
+/// a core is nowhere near the one it gives a frame buffer.
+core: ?Core = null,
+core_at: u64 = 0,
 /// The one display this card reports, where it has one. A card with none is a build with no
 /// aperture to paint into, and a driver refuses it rather than publishing an address.
 display: ?Display = null,
@@ -386,6 +399,7 @@ fn entryCount(self: *const Glacier) usize {
     if (self.aperture != null) count += 1;
     if (self.display != null) count += 1;
     if (self.pool != null) count += 1;
+    if (self.core != null) count += 1;
     return count;
 }
 
@@ -412,6 +426,14 @@ fn entryAt(self: *const Glacier, index: usize) ?Entry {
             .kind = memory_kind,
             .base = @truncate(self.pool_at),
             .size = ranges_at + range_stride,
+        };
+        count += 1;
+    }
+    if (self.core != null) {
+        if (index == count) return .{
+            .kind = Core.kind,
+            .base = @truncate(self.core_at),
+            .size = Core.window_size,
         };
         count += 1;
     }
@@ -442,6 +464,22 @@ fn poolWord(self: *const Glacier, at: u64) ?u32 {
         0x08 => range_usable,
         else => 0,
     };
+}
+
+/// Whether an address is inside the core window, and how far into it.
+fn withinCore(self: *const Glacier, at: u64) ?u64 {
+    if (self.core == null) return null;
+    if (at < self.core_at) return null;
+    const within = at - self.core_at;
+    if (within >= Core.window_size) return null;
+    return within;
+}
+
+/// One word of the core window, or nothing where the address is not inside it. A read moves the
+/// core on, because reading a counter captures its high half for the read that follows.
+fn coreWord(self: *Glacier, at: u64) ?u32 {
+    const within = self.withinCore(at) orelse return null;
+    return self.core.?.read(within);
 }
 
 /// One word of the display block, or nothing where the address is not inside it.
@@ -654,6 +692,7 @@ fn memoryWord(self: *Glacier, at: u64) ?*[4]u8 {
 fn fabricRead(self: *Glacier, at: u64) ?u32 {
     if (self.displayWord(at)) |value| return value;
     if (self.poolWord(at)) |value| return value;
+    if (self.coreWord(at)) |value| return value;
     const word = self.memoryWord(at) orelse return null;
     return std.mem.readInt(u32, word, .little);
 }
@@ -663,6 +702,12 @@ fn fabricRead(self: *Glacier, at: u64) ?u32 {
 fn fabricWrite(self: *Glacier, at: u64, value: u32) bool {
     // What the card has left over is the card's to say. A driver reads it and does not write it.
     if (self.poolWord(at) != null) return true;
+    // The core window takes writes: a program is written into it, and a launch is a write to one
+    // of its registers.
+    if (self.withinCore(at)) |within| {
+        self.core.?.write(within, value);
+        return true;
+    }
     if (self.displayWord(at) != null) {
         // The one register in the block a driver writes. Firmware asks for a mode through the
         // protocol the driver published, and this is the only way that ask reaches the card.
@@ -1512,4 +1557,57 @@ test "the table names the memory a driver may hand out" {
     try std.testing.expect(prototype_pool.at >= prototype_display.framebuffer +
         @as(u64, prototype_display.pitch) * prototype_display.height);
     try std.testing.expect(prototype_pool.at + prototype_pool.len <= one.aperture.?.at + one.aperture.?.len);
+}
+
+test "the table names the core, and a host drives it over the engine" {
+    var fixture: Fixture = .{};
+    var words: [4]u32 = @splat(0);
+    var one = fixture.card();
+    one.aperture = .{ .at = Fixture.fabric_at, .len = prototype_window_size };
+    one.display = prototype_display;
+    one.display_at = Fixture.fabric_at + prototype_window_size;
+    one.pool_at = Fixture.fabric_at + prototype_window_size + 0x1000;
+    one.pool = prototype_pool;
+    one.core_at = prototype_core_at;
+    one.core = .{ .shape = Core.gc1mi, .program = &words };
+
+    // Four entries now, and the core is the fourth.
+    try testing.expectEqual(@as(u32, 4), peek(&one, table_at + 0x08));
+    const fourth = table_at + entries_at + 3 * entry_stride;
+    try testing.expectEqual(Core.kind, peek(&one, fourth));
+    try testing.expectEqual(@as(u32, prototype_core_at), peek(&one, fourth + 0x04));
+    try testing.expectEqual(@as(u32, Core.window_size), peek(&one, fourth + 0x08));
+
+    // The window answers the engine and nothing else, because the board puts it a long way from
+    // the aperture. A driver reads the name first, as it does with every other block.
+    put(&one, reg.host_low, Fixture.host_at);
+    put(&one, reg.local_low, prototype_core_at);
+    put(&one, reg.length, 1);
+    put(&one, reg.control, control_start | control_to_host);
+    try testing.expectEqual(Core.kind, std.mem.readInt(u32, fixture.host_bytes[0..4], .little));
+
+    // The sequence a host uses: the program into the aperture, then the launch registers, then run
+    // and the strobe in one write.
+    std.mem.writeInt(u32, fixture.host_bytes[0..4], 0x0010_0073, .little);
+    put(&one, reg.host_low, Fixture.host_at);
+    put(&one, reg.local_low, prototype_core_at + Core.program_at);
+    put(&one, reg.length, 1);
+    put(&one, reg.control, control_start);
+    try testing.expectEqual(@as(u32, 0x0010_0073), words[0]);
+
+    std.mem.writeInt(u32, fixture.host_bytes[0..4], Core.control_run | Core.control_launch, .little);
+    put(&one, reg.local_low, prototype_core_at + Core.reg.control);
+    put(&one, reg.control, control_start);
+    try testing.expectEqual(@as(u64, 1), one.core.?.launches);
+
+    // And the status it leaves: running, a warp issued, and nothing of it still live.
+    put(&one, reg.host_low, Fixture.host_at + 0x10);
+    put(&one, reg.local_low, prototype_core_at + Core.reg.status);
+    put(&one, reg.control, control_start | control_to_host);
+    const status = std.mem.readInt(u32, fixture.host_bytes[0x10..0x14], .little);
+    try testing.expectEqual(Core.status_run | Core.status_issued | Core.status_idle, status);
+
+    // The core keeps no fabric behind its window, so none of this touched the card's memory.
+    try testing.expectEqual(@as(u64, 0), one.outside_framebuffer);
+    try testing.expectEqual(@as(u64, 0), one.painted);
 }

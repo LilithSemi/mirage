@@ -720,6 +720,24 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     defer if (wanted != null) gpa.free(fabric);
     if (wanted != null) @memset(fabric, 0);
 
+    // The core's instruction aperture and the private scratch its warps spill into. Neither is
+    // fabric: nothing on the bus reaches the scratch, and the aperture answers only the core's own
+    // window.
+    const program = if (wanted != null)
+        try gpa.alloc(u32, device.Glacier.Core.max_program_words)
+    else
+        @as([]u32, &.{});
+    defer if (wanted != null) gpa.free(program);
+    const scratch = if (wanted != null)
+        try gpa.alloc(u8, device.Glacier.Core.gc1mi.warps * device.Glacier.Core.gc1mi.scratch_per_warp)
+    else
+        @as([]u8, &.{});
+    defer if (wanted != null) gpa.free(scratch);
+    if (wanted != null) {
+        @memset(program, 0);
+        @memset(scratch, 0);
+    }
+
     const option_rom: []const u8 = if (wanted_rom) |path|
         try cwd.readFileAlloc(io, path, gpa, file_limit)
     else
@@ -759,6 +777,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         .display_at = device.Glacier.prototype_display_at,
         .pool = device.Glacier.prototype_pool,
         .pool_at = device.Glacier.prototype_pool_at,
+        .core = .{ .shape = device.Glacier.Core.gc1mi, .program = program, .scratch = scratch },
+        .core_at = device.Glacier.prototype_core_at,
         .rom = option_rom,
     };
     // A window that does not cover every row of the frame buffer is a card firmware refuses. The

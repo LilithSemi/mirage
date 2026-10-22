@@ -84,7 +84,7 @@ fn line(self: *Trace, comptime shape: []const u8, args: anytype) void {
 /// reader of this file and a reader of the code are reading the same words.
 pub fn summary(self: *Trace, bridge: *const device.PciHost, gpu: *const device.Glacier) void {
     self.line(
-        \\{{"event":"summary","rom_reads":{d},"unclaimed":{d},"refused":{d},"unanswered":{d},"command":{d},"registers_at":{d},"aperture_at":{d},"aperture_base_reads":{d},"read_through_window":{d},"written_through_window":{d},"transfers":{d},"table_reads":{d},"table_found":{d},"mode_selects":{d},"painted_by_engine":{d},"painted_through_window":{d},"painted_outside_framebuffer":{d},"strayed":{d}}}
+        \\{{"event":"summary","rom_reads":{d},"unclaimed":{d},"refused":{d},"unanswered":{d},"command":{d},"registers_at":{d},"aperture_at":{d},"aperture_base_reads":{d},"read_through_window":{d},"written_through_window":{d},"transfers":{d},"table_reads":{d},"table_found":{d},"mode_selects":{d},"painted_by_engine":{d},"painted_through_window":{d},"painted_outside_framebuffer":{d},"strayed":{d},"launches":{d},"program_writes":{d}}}
     , .{
         bridge.rom_reads,
         bridge.unclaimed,
@@ -104,6 +104,8 @@ pub fn summary(self: *Trace, bridge: *const device.PciHost, gpu: *const device.G
         gpu.painted_through_window,
         gpu.outside_framebuffer,
         gpu.strayed,
+        if (gpu.core) |one| one.launches else 0,
+        if (gpu.core) |one| one.program_writes else 0,
     });
 }
 

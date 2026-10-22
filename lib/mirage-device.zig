@@ -99,6 +99,7 @@ test {
     _ = Tpm;
     _ = PciHost;
     _ = Glacier;
+    _ = Glacier.Core;
     _ = FwCfg;
     _ = NorFlash;
     _ = virtio.Queue;
