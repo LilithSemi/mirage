@@ -250,6 +250,23 @@ pub fn build(b: *std.Build) void {
         });
         b.installArtifact(mirage);
 
+        // What a caller may ask for, held to the same gate as everything else. The runner is a
+        // program and not a library, so its own tests need naming here or they never run.
+        const option_tests = b.addTest(.{
+            .name = "options",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/Options.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "mirage-device", .module = device }},
+            }),
+        });
+        const run_option_tests = b.addRunArtifact(option_tests);
+        // Built for whichever target was asked for, so let Zig decide whether this machine can run
+        // the binary. The analysis happened either way.
+        run_option_tests.skip_foreign_checks = true;
+        test_step.dependOn(&run_option_tests.step);
+
         // A session as a caller holds it: the runner is a program this starts, so the gate drives
         // the same two processes a harness would rather than a loop of its own.
         const session_options = b.addOptions();
