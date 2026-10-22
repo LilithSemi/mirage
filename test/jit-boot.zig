@@ -59,6 +59,11 @@ pub fn main(init: std.process.Init) !void {
     const w = &out.interface;
     defer w.flush() catch {};
 
+    // The serial console writes through unbuffered, so guest output appears as the
+    // guest produces it instead of when the 4 KiB buffer above fills or the run ends.
+    var console_out = std.Io.File.stdout().writer(io, &.{});
+    const console = &console_out.interface;
+
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 2) return error.ExpectedKernelPath;
     const seconds: u32 = if (args.len > 2) try std.fmt.parseInt(u32, args[2], 10) else 20;
@@ -89,7 +94,7 @@ pub fn main(init: std.process.Init) !void {
     var gic: device.Gicv2 = .{ .cpus = 1 };
     const gic_devices = gic.devices(arm64.fdt.gicd_base, arm64.fdt.gicv2_cpu_base);
     var serial: device.Pl011 = .{
-        .sink = w,
+        .sink = console,
         .line = .{ .controller = gic.controller(), .intid = arm64.fdt.uart_intid },
     };
     var devices = [_]device.Bus.Device{ serial.device(uart_base), gic_devices[0], gic_devices[1] };
