@@ -40,8 +40,18 @@ pub const usage =
     \\  --tpm <path>          a socket a security chip is listening on
     \\  --pci yes             give the guest a pci host bridge
     \\  --device <spec>       add a device, as `name,setting=value`
-    \\                        glacier-pci[,romfile=<path>]
+    \\                        glacier-pci[,board=<name>][,romfile=<path>]
+    \\                          [,window=<addr>][,windowsize=<size>][,wide]
+    \\                          [,res=<width>x<height>|none][,fb=<addr>][,pitch=<bytes>]
+    \\                          [,format=xr24|ar24][,out=hdmi|dvi|rgb][,edid][,hotplug]
+    \\                          [,clock=<hz>][,ddc=<addr>]
+    \\                          [,pool=<addr>|none][,poolsize=<size>]
+    \\                          [,core=<profile>|none][,core-at=<addr>][,perf=no]
+    \\                          [,warps=<n>][,lanes=<n>][,width=<n>][,scratch=<bytes>]
     \\                          [,screendump=<dir>][,screendump-ms=<n>]
+    \\                        boards: prototype, chenega-v1-ax7203
+    \\                        cores: gc1.n, gc1.mi, gc1.s, gc1.f, gc1.ma
+    \\                        a size takes K, M or G, and an address takes 0x
     \\  --trace <path>        write what the devices did, one json line each
     \\  --stop-on <text>      stop once the guest has printed this
     \\  --share <name>=<dir>  offer that directory under that name, read only
@@ -171,22 +181,16 @@ pub const Device = struct {
         return std.fmt.parseInt(u64, said, 10);
     }
 
-    /// What a setting says, or nothing where it was not given. A setting written with no value
-    /// reads as `yes`, which is how a machine takes one that is only on or off.
+    /// What a setting says, or nothing where it was not given. The device library reads these,
+    /// because a device is what knows which settings it has.
     pub fn get(self: Device, key: []const u8) ?[]const u8 {
-        var rest = self.settings;
-        while (rest.len != 0) {
-            const end = std.mem.indexOfScalar(u8, rest, ',') orelse rest.len;
-            const one = rest[0..end];
-            rest = if (end == rest.len) &.{} else rest[end + 1 ..];
+        return device.Settings.get(self.settings, key);
+    }
 
-            const split = std.mem.indexOfScalar(u8, one, '=') orelse {
-                if (std.mem.eql(u8, one, key)) return "yes";
-                continue;
-            };
-            if (std.mem.eql(u8, one[0..split], key)) return one[split + 1 ..];
-        }
-        return null;
+    /// The card these settings describe, for the device that takes a card. One place reads them,
+    /// so what a runner builds and what this program refuses cannot differ.
+    pub fn glacier(self: Device) device.Glacier.Build.Error!device.Glacier.Build {
+        return device.Glacier.Build.parse(self.settings);
     }
 };
 
@@ -390,6 +394,14 @@ pub fn complain(self: Options, out: *std.Io.Writer, cpu_room: u64) !bool {
             for (known_devices) |name| try out.print("  {s}\n", .{name});
             return true;
         }
+        // A card is described by numbers the caller gives, and one nobody could build is the
+        // caller being wrong. Said here, before the guest starts, rather than asserted at launch.
+        if (std.mem.eql(u8, each.name, "glacier-pci")) {
+            _ = each.glacier() catch |what| {
+                try out.print("glacier-pci: {s}\n", .{device.Glacier.Build.trouble(what)});
+                return true;
+            };
+        }
     }
     if (self.cpus > cpu_room) {
         try out.print("the machine this describes has room for {d} cpus\n", .{cpu_room});
@@ -444,4 +456,35 @@ test "a device nobody builds is refused by name" {
     const options = try parse(&.{ "--kernel", "/tmp/Image", "--device", "nvme" });
     try std.testing.expect(try options.complain(&said, 64));
     try std.testing.expect(std.mem.indexOf(u8, said.buffered(), "no device called nvme") != null);
+}
+
+test "a card is written as settings, and the shape they describe is the one it gets" {
+    const options = try parse(&.{
+        "--device",
+        "glacier-pci,board=chenega-v1-ax7203,res=800x600,core=gc1.s,romfile=/tmp/a.rom",
+    });
+
+    const card = options.asked("glacier-pci").?;
+    const shape = try card.glacier();
+    try std.testing.expectEqual(@as(u64, 32 * 1024 * 1024), shape.window.len);
+    try std.testing.expectEqual(@as(u32, 800), shape.display.?.width);
+    try std.testing.expectEqual(@as(u8, 8), shape.core.?.lanes);
+    // The rom is read where the card is made, so it stays a path here.
+    try std.testing.expectEqualSlices(u8, "/tmp/a.rom", card.romFile().?);
+
+    // And a card with nothing said about it is the one this runner has always made.
+    const plain = try parse(&.{ "--device", "glacier-pci" });
+    try std.testing.expectEqual(device.Glacier.Build.prototype, try plain.asked("glacier-pci").?.glacier());
+}
+
+test "a card nobody could build is refused by what is wrong with it" {
+    var room: [256]u8 = undefined;
+    var said: std.Io.Writer = .fixed(&room);
+
+    const options = try parse(&.{
+        "--kernel", "/tmp/Image",
+        "--device", "glacier-pci,res=1024x768,windowsize=1M",
+    });
+    try std.testing.expect(try options.complain(&said, 64));
+    try std.testing.expect(std.mem.indexOf(u8, said.buffered(), "every row of the frame buffer") != null);
 }

@@ -60,6 +60,10 @@ const pci_on = options.pci or options.glacier;
 /// Whether a glacier card sits behind the bridge. A card needs a bridge, so this brings one.
 const glacier_on = options.glacier;
 
+/// The shape of that card, written the way `--device glacier-pci` is written. Nothing given is the
+/// card this gate has always driven.
+const glacier_card = options.glacier_card;
+
 /// Whether the guest is offered a directory on this machine to mount. Needs a kernel with the
 /// filesystem driver built in, so it is a gate of its own rather than part of every boot.
 const share_on = options.share;
@@ -538,23 +542,37 @@ test "a real linux kernel boots far enough to speak" {
     // A bridge is three devices on the bus for one bridge: config space, the window below four
     // gigabytes and the window above it. All three or none, because config space says where a
     // region is and the windows are where it answers.
-    // The card's own memory: the window the guest reaches directly, and a page past it for the
-    // block that describes the display.
-    const fabric = if (glacier_on) try gpa.alloc(u8, device.Glacier.prototype_fabric_size) else @as([]u8, &.{});
-    defer if (glacier_on) gpa.free(fabric);
-    if (glacier_on) @memset(fabric, 0);
+    // The card this gate drives. Nothing asked for is the display alone, which is what this gate
+    // has always driven. A caller may give the settings of any board instead, in the same words
+    // `--device glacier-pci` takes, so a driver can be held to a card nobody has built here yet.
+    const shape: device.Glacier.Build = if (glacier_card.len == 0)
+        .{ .display = device.Glacier.prototype_display }
+    else
+        try device.Glacier.Build.parse(glacier_card);
 
-    var gpu: device.Glacier = .{
+    // The card's own memory: the window the guest reaches directly, the two blocks past it, and
+    // the aperture and scratch of a core where the shape asks for one.
+    const fabric = if (glacier_on) try gpa.alloc(u8, @intCast(shape.fabricSize())) else @as([]u8, &.{});
+    defer if (glacier_on) gpa.free(fabric);
+    const program = if (glacier_on) try gpa.alloc(u32, shape.programWords()) else @as([]u32, &.{});
+    defer if (glacier_on) gpa.free(program);
+    const scratch = if (glacier_on) try gpa.alloc(u8, shape.scratchBytes()) else @as([]u8, &.{});
+    defer if (glacier_on) gpa.free(scratch);
+    if (glacier_on) {
+        @memset(fabric, 0);
+        @memset(program, 0);
+        @memset(scratch, 0);
+    }
+
+    var gpu: device.Glacier = shape.card(.{
         .memory = &memory,
         .fabric = fabric,
-        .fabric_at = device.Glacier.prototype_window_at,
-        .aperture = .{
-            .at = device.Glacier.prototype_window_at,
-            .len = device.Glacier.prototype_window_size,
-        },
-        .display = device.Glacier.prototype_display,
-        .display_at = device.Glacier.prototype_display_at,
-    };
+        .program = program,
+        .scratch = scratch,
+    });
+    // A core runs its warps on threads of their own, so the card stops before the memory they
+    // write into goes away.
+    defer if (gpu.core) |*each| each.quiet();
 
     var bridge: device.PciHost = .{};
     var bridge_memory: device.PciHost.Window = .{ .host = &bridge, .at = arm64.fdt.pci_memory_base };

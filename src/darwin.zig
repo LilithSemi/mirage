@@ -384,9 +384,12 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     // the device is made rather than turned into fields of its own.
     const wanted = options.asked("glacier-pci");
     const wanted_rom = if (wanted) |each| each.romFile() else null;
+    // The shape of the card the caller asked for. Every address the card answers with comes from
+    // this, so the card a guest sees is the card the caller wrote and nothing else.
+    const shape = if (wanted) |each| try each.glacier() else device.Glacier.Build.prototype;
 
     const fabric = if (wanted != null)
-        try gpa.alloc(u8, device.Glacier.prototype_fabric_size)
+        try gpa.alloc(u8, @intCast(shape.fabricSize()))
     else
         @as([]u8, &.{});
     defer if (wanted != null) gpa.free(fabric);
@@ -396,12 +399,12 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     // fabric: nothing on the bus reaches the scratch, and the aperture answers only the core's own
     // window.
     const program = if (wanted != null)
-        try gpa.alloc(u32, device.Glacier.Core.max_program_words)
+        try gpa.alloc(u32, shape.programWords())
     else
         @as([]u32, &.{});
     defer if (wanted != null) gpa.free(program);
     const scratch = if (wanted != null)
-        try gpa.alloc(u8, device.Glacier.Core.gc1mi.warps * device.Glacier.Core.gc1mi.scratch_per_warp)
+        try gpa.alloc(u8, shape.scratchBytes())
     else
         @as([]u8, &.{});
     defer if (wanted != null) gpa.free(scratch);
@@ -416,22 +419,13 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         &.{};
     defer if (wanted_rom != null) gpa.free(@constCast(option_rom));
 
-    var gpu: device.Glacier = .{
+    var gpu: device.Glacier = shape.card(.{
         .memory = &memory,
         .fabric = fabric,
-        .fabric_at = device.Glacier.prototype_window_at,
-        .aperture = .{
-            .at = device.Glacier.prototype_window_at,
-            .len = device.Glacier.prototype_window_size,
-        },
-        .display = device.Glacier.prototype_display,
-        .display_at = device.Glacier.prototype_display_at,
-        .pool = device.Glacier.prototype_pool,
-        .pool_at = device.Glacier.prototype_pool_at,
-        .core = .{ .shape = device.Glacier.Core.gc1mi, .program = program, .scratch = scratch },
-        .core_at = device.Glacier.prototype_core_at,
+        .program = program,
+        .scratch = scratch,
         .rom = option_rom,
-    };
+    });
     // A core runs its warps on threads of their own, so the card has to be stopped before the
     // memory they write into goes away. Declared here, which is after the memory, so it runs
     // before it.

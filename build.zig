@@ -346,6 +346,9 @@ pub fn build(b: *std.Build) void {
         // And a glacier card behind it, so the guest sizes real regions and firmware places them.
         const glacier_on = b.option(bool, "glacier", "Put a glacier card behind the bridge") orelse false;
         boot_options.addOption(bool, "glacier", glacier_on);
+        // And which card, in the same settings the runner takes, so one gate covers any board.
+        const glacier_card = b.option([]const u8, "glacier-card", "The card, as --device writes one") orelse "";
+        boot_options.addOption([]const u8, "glacier_card", glacier_card);
         // Whether the guest is offered a directory on this machine to mount. Needs a kernel with the
         // filesystem driver built in, which the default kernel here does not have.
         boot_options.addOption(bool, "share", share_on);

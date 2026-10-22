@@ -173,6 +173,33 @@ pub const Shape = struct {
 /// made here.
 pub const gc1mi: Shape = .{ .warps = 8, .lanes = 4, .width = 4 };
 
+/// The rest of the generation, smallest to largest, from the same place. A profile is a build of
+/// the hardware and not a dial, so a caller asks for one of these rather than for any pair of
+/// numbers.
+///
+/// The warp width is what a kernel is compiled against, so a kernel built for one width does not
+/// run on another. The resident warp count is not: it changes how much latency a core hides.
+pub const gc1n: Shape = .{ .warps = 4, .lanes = 4, .width = 4 };
+pub const gc1s: Shape = .{ .warps = 8, .lanes = 8, .width = 8 };
+pub const gc1f: Shape = .{ .warps = 8, .lanes = 16, .width = 16 };
+pub const gc1ma: Shape = .{ .warps = 16, .lanes = 16, .width = 16 };
+
+/// The profile of this name, spelled the way `devices.nix` spells it. A name that is not one of
+/// these is a core nobody builds.
+pub fn profile(name: []const u8) ?Shape {
+    const every = [_]struct { []const u8, Shape }{
+        .{ "gc1.n", gc1n },
+        .{ "gc1.mi", gc1mi },
+        .{ "gc1.s", gc1s },
+        .{ "gc1.f", gc1f },
+        .{ "gc1.ma", gc1ma },
+    };
+    for (every) |each| {
+        if (std.mem.eql(u8, each[0], name)) return each[1];
+    }
+    return null;
+}
+
 shape: Shape,
 /// The instruction aperture. The caller owns it, and a build may hold fewer words than the
 /// aperture addresses.
@@ -873,7 +900,6 @@ test "an offset the window does not decode reads zero" {
     try testing.expectEqual(@as(u32, 0), one.read(0x100));
     try testing.expectEqual(@as(u32, 5), one.staged.warp);
 }
-
 
 /// The tests that need threads, which a freestanding build has none of. A comptime false branch is
 /// never analysed, so this is how they compile for a target that could not run them.

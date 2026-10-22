@@ -1934,23 +1934,16 @@ test "a real x86 kernel enumerates a pci bus and the card behind it" {
     var serial: device.Uart16550 = .{ .sink = &sink };
     var acpi_shutdown: device.AcpiShutdown = .{ .slp_typ = acpi.s5_slp_typ };
 
+    // The prototype card with the display alone: this gate drives a mode, and nothing in it hands
+    // out memory or launches a kernel.
+    const shape: device.Glacier.Build = .{ .display = device.Glacier.prototype_display };
     // The card's own memory: the window the guest reaches directly, and a page past it for the
     // block that describes the display.
-    const fabric = try gpa.alloc(u8, device.Glacier.prototype_fabric_size);
+    const fabric = try gpa.alloc(u8, @intCast(shape.fabricSize()));
     defer gpa.free(fabric);
     @memset(fabric, 0);
 
-    var gpu: device.Glacier = .{
-        .memory = &memory,
-        .fabric = fabric,
-        .fabric_at = device.Glacier.prototype_window_at,
-        .aperture = .{
-            .at = device.Glacier.prototype_window_at,
-            .len = device.Glacier.prototype_window_size,
-        },
-        .display = device.Glacier.prototype_display,
-        .display_at = device.Glacier.prototype_display_at,
-    };
+    var gpu: device.Glacier = shape.card(.{ .memory = &memory, .fabric = fabric });
 
     const where = arch.platform.pci.?;
     var bridge: device.PciHost = .{};

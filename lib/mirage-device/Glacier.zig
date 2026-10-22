@@ -12,6 +12,7 @@
 const std = @import("std");
 const Bus = @import("Bus.zig");
 const PciHost = @import("PciHost.zig");
+const Settings = @import("Settings.zig");
 const GuestMemory = @import("mirage-memory").GuestMemory;
 const testing = @import("mirage-testing");
 
@@ -63,9 +64,9 @@ pub const prototype_pool: Pool = .{
 /// The window, and a page each for the two register blocks past it.
 pub const prototype_fabric_size = prototype_window_size + 0x2000;
 
-/// Where the core window sits. The board puts it here, and the card keeps nothing in the fabric
+/// Where a core window sits. Every board puts it here, and the card keeps nothing in the fabric
 /// behind it, so a window this far from the rest needs no memory to answer with.
-pub const prototype_core_at = 0x1001_0000;
+pub const core_window_at = 0x1001_0000;
 
 /// What the engine answers at the first word. A driver that reads anything else has found a
 /// different card.
@@ -179,6 +180,14 @@ const display_stride = 0x40;
 pub const xr24: u32 = 0x34325258;
 pub const ar24: u32 = 0x34325241;
 
+/// What a display says it can drive, and what it says is there. A driver with neither output bit
+/// set reports DVI rather than refusing.
+pub const caps_hdmi: u32 = 1 << 0;
+pub const caps_dvi: u32 = 1 << 1;
+/// There is an EDID to read over the sideband controller.
+pub const caps_edid: u32 = 1 << 2;
+pub const status_hotplug: u32 = 1 << 0;
+
 /// One display, as its registers report it. The geometry is the caller's to state: a model that
 /// invented it would be a card nobody built.
 pub const Display = struct {
@@ -191,10 +200,7 @@ pub const Display = struct {
     /// Where the frame buffer sits in the fabric.
     framebuffer: u64,
     format: u32 = xr24,
-    /// Bit zero says HDMI, bit one DVI, bit two that there is an EDID to read. A driver with none
-    /// of them set reports DVI rather than refusing.
     caps: u32 = 0,
-    /// Bit zero is hot plug detect.
     status: u32 = 0,
     /// Hertz of the dot clock the mode needs. A driver may refuse a mode whose clock is zero,
     /// because no board can make one.
@@ -273,6 +279,367 @@ pub const Event = union(enum) {
 pub const Watcher = struct {
     ctx: *anyopaque,
     saw: *const fn (ctx: *anyopaque, what: Event) void,
+};
+
+/// What a card was built with: the aperture onto its fabric, the mode it reports, the memory a
+/// driver may hand out, and the core behind all of it.
+///
+/// Glacier describes a board in `devices.nix`, one line for each block the fabric carries. This is
+/// that description as one value, so a caller can ask for a board that exists or for one nobody
+/// has built, and the model holds no board of its own. Every address the card answers with is
+/// placed from here, which is why a runner and a test cannot place them differently.
+pub const Build = struct {
+    /// The window onto the fabric, which is also the region a guest sees.
+    window: Aperture = .{ .at = prototype_window_at, .len = prototype_window_size },
+    /// The one mode the card reports, or nothing for a build with no display.
+    display: ?Display = null,
+    /// The memory a driver may hand out, or nothing for a build with none left over.
+    pool: ?Pool = null,
+    /// The core, or nothing for a build without one.
+    core: ?Core.Shape = null,
+    /// Where the core's window sits in the fabric. Nowhere near the aperture on any board, because
+    /// a core's registers and a frame buffer are not near each other.
+    core_at: u64 = core_window_at,
+
+    /// A page for the block that reports the mode and a page for the block that reports the
+    /// memory, both past the window so a guest painting the frame buffer cannot write over what
+    /// describes it.
+    pub const blocks_size = 0x2000;
+
+    /// What this runner has carried from the start: two megabytes of window at 640x480. Smaller
+    /// than any board, and the card the boot gates hold a driver against.
+    pub const prototype: Build = .{
+        .window = .{ .at = prototype_window_at, .len = prototype_window_size },
+        .display = prototype_display,
+        .pool = prototype_pool,
+        .core = Core.gc1mi,
+    };
+
+    /// `chenega-v1-ax7203`, as `devices.nix` writes it: thirty two megabytes of window into the
+    /// board's gigabyte of dram, and the mode its parallel rgb output drives. The raster block the
+    /// board carries is left out, because nothing models one yet.
+    pub const ax7203: Build = .{
+        .window = .{ .at = 0x8000_0000, .len = 32 * 1024 * 1024 },
+        .display = .{
+            .width = 1024,
+            .height = 768,
+            .pitch = 1024 * 4,
+            .framebuffer = 0x8000_0000,
+            // The VESA dot clock for this mode at sixty hertz.
+            .pixel_clock = 65_000_000,
+        },
+        .pool = .{ .at = 0x8030_0000, .len = 32 * 1024 * 1024 - 0x30_0000 },
+        .core = Core.gc1mi,
+    };
+
+    /// The board of this name. `prototype` is this runner's own card, and the rest are spelled the
+    /// way `devices.nix` spells them.
+    pub fn named(name: []const u8) ?Build {
+        const every = [_]struct { []const u8, Build }{
+            .{ "prototype", prototype },
+            .{ "chenega-v1-ax7203", ax7203 },
+        };
+        for (every) |each| {
+            if (std.mem.eql(u8, each[0], name)) return each[1];
+        }
+        return null;
+    }
+
+    /// How much memory the fabric needs: the window, and the two blocks past it.
+    pub fn fabricSize(self: Build) u64 {
+        return self.window.len + blocks_size;
+    }
+
+    /// Where the block that reports the mode sits, and where the one that reports the memory sits.
+    pub fn displayAt(self: Build) u64 {
+        return self.window.at + self.window.len;
+    }
+
+    pub fn poolAt(self: Build) u64 {
+        return self.displayAt() + 0x1000;
+    }
+
+    /// Words of instruction aperture a core needs, and bytes of private scratch. The aperture is
+    /// the same size whatever the profile; the scratch is a region for each resident warp.
+    pub fn programWords(self: Build) usize {
+        return if (self.core == null) 0 else Core.max_program_words;
+    }
+
+    pub fn scratchBytes(self: Build) usize {
+        const shape = self.core orelse return 0;
+        return @as(usize, shape.warps) * shape.scratch_per_warp;
+    }
+
+    /// The memory this build has left over: the window above the frame buffer, to the page. A
+    /// build whose mode fills the window has none, and neither has one whose frame buffer the
+    /// window does not reach.
+    pub fn spare(self: Build) ?Pool {
+        const end = self.window.at + self.window.len;
+        var from = self.window.at;
+        if (self.display) |shown| {
+            if (shown.framebuffer < self.window.at) return null;
+            const rows = @as(u64, shown.pitch) * shown.height;
+            from = std.mem.alignForward(u64, shown.framebuffer + rows, 0x1000);
+        }
+        if (from >= end) return null;
+        return .{ .at = from, .len = end - from };
+    }
+
+    /// What a card needs that a shape cannot carry: the guest's memory, and the memory a runner
+    /// allocated for the card's own blocks.
+    pub const Parts = struct {
+        memory: *GuestMemory,
+        /// `fabricSize()` bytes.
+        fabric: []u8,
+        /// `programWords()` words and `scratchBytes()` bytes, for a build with a core.
+        program: []u32 = &.{},
+        scratch: []u8 = &.{},
+        rom: []const u8 = &.{},
+        watching: ?Watcher = null,
+    };
+
+    /// The card this build describes.
+    pub fn card(self: Build, parts: Parts) Glacier {
+        return .{
+            .memory = parts.memory,
+            .watching = parts.watching,
+            .fabric = parts.fabric,
+            .fabric_at = self.window.at,
+            .aperture = self.window,
+            .display = self.display,
+            .display_at = self.displayAt(),
+            .pool = self.pool,
+            .pool_at = self.poolAt(),
+            .core = if (self.core) |shape| .{
+                .shape = shape,
+                .program = parts.program,
+                .scratch = parts.scratch,
+            } else null,
+            .core_at = self.core_at,
+            .rom = parts.rom,
+        };
+    }
+
+    pub const Error = error{
+        UnknownBoard,
+        UnknownCore,
+        UnknownFormat,
+        UnknownOutput,
+        BadNumber,
+        BadResolution,
+        BadPitch,
+        BadWindow,
+        BadCoreShape,
+        BadScratch,
+        WindowTooLarge,
+        WindowTooSmall,
+        PoolOutside,
+        PoolPainted,
+        TooManyWarps,
+        CoreInWindow,
+    };
+
+    /// A card written the way a caller writes one: a board to start from, then what to change
+    /// about it. `board=chenega-v1-ax7203,res=800x600,core=gc1.f` is a board with another mode and
+    /// a wider core.
+    ///
+    /// A caller who moves the window or the mode and says nothing about the memory to hand out
+    /// gets the fabric above the frame buffer, because the board's own pool was placed for the
+    /// board's own mode.
+    pub fn parse(settings: []const u8) Error!Build {
+        var self: Build = prototype;
+        if (Settings.get(settings, "board")) |name| {
+            self = named(name) orelse return error.UnknownBoard;
+        }
+
+        self.window.at = try Settings.numberOr(settings, "window", self.window.at);
+        self.window.len = try Settings.numberOr(settings, "windowsize", self.window.len);
+        self.window.wide = Settings.flag(settings, "wide", self.window.wide);
+
+        if (Settings.get(settings, "res")) |said| {
+            if (std.mem.eql(u8, said, "none")) {
+                self.display = null;
+            } else {
+                const split = std.mem.indexOfScalar(u8, said, 'x') orelse return error.BadResolution;
+                const across = try Settings.number(said[0..split]);
+                const down = try Settings.number(said[split + 1 ..]);
+                if (across == 0 or down == 0 or across > 0xffff or down > 0xffff) return error.BadResolution;
+                // Everything the board said about its display but the geometry stays: a caller
+                // asking for another mode is asking for the same wires to carry it.
+                var shown: Display = self.display orelse .{
+                    .width = 0,
+                    .height = 0,
+                    .pitch = 0,
+                    .framebuffer = self.window.at,
+                };
+                shown.width = @intCast(across);
+                shown.height = @intCast(down);
+                // A row of this mode with no padding. `pitch` is how a caller asks for some.
+                shown.pitch = @intCast(across * 4);
+                self.display = shown;
+            }
+        }
+        if (self.display) |*shown| {
+            shown.framebuffer = try Settings.numberOr(settings, "fb", shown.framebuffer);
+            const pitch = try Settings.numberOr(settings, "pitch", shown.pitch);
+            if (pitch > std.math.maxInt(u32)) return error.BadPitch;
+            shown.pitch = @intCast(pitch);
+            const clock = try Settings.numberOr(settings, "clock", shown.pixel_clock);
+            if (clock > std.math.maxInt(u32)) return error.BadNumber;
+            shown.pixel_clock = @intCast(clock);
+            const ddc = try Settings.numberOr(settings, "ddc", shown.ddc);
+            if (ddc > std.math.maxInt(u32)) return error.BadNumber;
+            shown.ddc = @intCast(ddc);
+
+            if (Settings.get(settings, "format")) |said| {
+                if (std.mem.eql(u8, said, "xr24")) {
+                    shown.format = xr24;
+                } else if (std.mem.eql(u8, said, "ar24")) {
+                    shown.format = ar24;
+                } else return error.UnknownFormat;
+            }
+            if (Settings.get(settings, "out")) |said| {
+                shown.caps &= ~(caps_hdmi | caps_dvi);
+                if (std.mem.eql(u8, said, "hdmi")) {
+                    shown.caps |= caps_hdmi;
+                } else if (std.mem.eql(u8, said, "dvi")) {
+                    shown.caps |= caps_dvi;
+                } else if (!std.mem.eql(u8, said, "rgb") and !std.mem.eql(u8, said, "parallelRgb")) {
+                    return error.UnknownOutput;
+                }
+            }
+            if (Settings.flag(settings, "edid", shown.caps & caps_edid != 0)) {
+                shown.caps |= caps_edid;
+            } else {
+                shown.caps &= ~caps_edid;
+            }
+            if (Settings.flag(settings, "hotplug", shown.status & status_hotplug != 0)) {
+                shown.status |= status_hotplug;
+            } else {
+                shown.status &= ~status_hotplug;
+            }
+        }
+
+        const said_at = Settings.get(settings, "pool");
+        const said_len = Settings.get(settings, "poolsize");
+        if (said_at) |said| {
+            if (std.mem.eql(u8, said, "none")) {
+                self.pool = null;
+            } else {
+                const at = try Settings.number(said);
+                const end = self.window.at + self.window.len;
+                self.pool = .{
+                    .at = at,
+                    .len = if (said_len) |much| try Settings.number(much) else (end -| at),
+                };
+            }
+        } else if (said_len) |much| {
+            var each = self.pool orelse self.spare() orelse return error.PoolOutside;
+            each.len = try Settings.number(much);
+            self.pool = each;
+        } else if (moved(settings)) {
+            self.pool = self.spare();
+        }
+
+        if (Settings.get(settings, "core")) |name| {
+            self.core = if (std.mem.eql(u8, name, "none"))
+                null
+            else
+                Core.profile(name) orelse return error.UnknownCore;
+        }
+        if (self.core) |*shape| {
+            shape.warps = try lane(settings, "warps", shape.warps);
+            shape.lanes = try lane(settings, "lanes", shape.lanes);
+            shape.width = try lane(settings, "width", shape.width);
+            const scratch = try Settings.numberOr(settings, "scratch", shape.scratch_per_warp);
+            if (scratch > std.math.maxInt(u32)) return error.BadScratch;
+            shape.scratch_per_warp = @intCast(scratch);
+            shape.perf = Settings.flag(settings, "perf", shape.perf);
+            self.core_at = try Settings.numberOr(settings, "core-at", self.core_at);
+        }
+
+        try self.check();
+        return self;
+    }
+
+    /// Whether the caller moved anything the board's own pool was placed around.
+    fn moved(settings: []const u8) bool {
+        for ([_][]const u8{ "window", "windowsize", "res", "fb", "pitch" }) |each| {
+            if (Settings.get(settings, each) != null) return true;
+        }
+        return false;
+    }
+
+    fn lane(settings: []const u8, key: []const u8, unless: u8) Error!u8 {
+        const value = try Settings.numberOr(settings, key, unless);
+        if (value == 0 or value > std.math.maxInt(u8)) return error.BadCoreShape;
+        return @intCast(value);
+    }
+
+    /// Whether this is a card someone could build. A caller gives the numbers, so every one of
+    /// these is the caller being wrong and not the guest.
+    pub fn check(self: Build) Error!void {
+        // A region is a power of two and at least sixteen bytes, which is the bus and not a choice
+        // made here.
+        if (self.window.len < 16 or !std.math.isPowerOfTwo(self.window.len)) return error.BadWindow;
+        // The table describes the card in thirty two bit fields, so a card placed where it cannot
+        // be described is one nobody can build.
+        if (self.window.at + self.fabricSize() > std.math.maxInt(u32)) return error.WindowTooLarge;
+
+        if (self.display) |shown| {
+            if (shown.width == 0 or shown.height == 0) return error.BadResolution;
+            if (shown.pitch < @as(u64, shown.width) * 4) return error.BadPitch;
+            if (shown.format != xr24 and shown.format != ar24) return error.UnknownFormat;
+            if (shown.framebuffer < self.window.at) return error.WindowTooSmall;
+            const offset = shown.framebuffer - self.window.at;
+            if (offset >= self.window.len) return error.WindowTooSmall;
+            if (@as(u64, shown.pitch) * shown.height > self.window.len - offset) return error.WindowTooSmall;
+        }
+
+        if (self.pool) |each| {
+            if (each.len == 0 or each.at < self.window.at) return error.PoolOutside;
+            if (each.at + each.len > self.window.at + self.window.len) return error.PoolOutside;
+            if (self.display) |shown| {
+                const rows = @as(u64, shown.pitch) * shown.height;
+                if (each.at < shown.framebuffer + rows and shown.framebuffer < each.at + each.len) {
+                    return error.PoolPainted;
+                }
+            }
+        }
+
+        if (self.core) |shape| {
+            if (shape.warps == 0 or shape.warps > Core.max_warps) return error.TooManyWarps;
+            if (shape.lanes == 0 or shape.width == 0) return error.BadCoreShape;
+            // A narrow store on this core writes a whole word, so a spill slot is four bytes and a
+            // warp's region has to start word aligned or one warp would write over another's.
+            if (shape.scratch_per_warp == 0 or shape.scratch_per_warp % 4 != 0) return error.BadScratch;
+            if (self.core_at < self.window.at + self.fabricSize() and
+                self.window.at < self.core_at + Core.window_size) return error.CoreInWindow;
+        }
+    }
+
+    /// What to tell a caller who asked for a card nobody can build. One sentence each: a caller
+    /// wrote one setting wrongly, not a program.
+    pub fn trouble(what: Error) []const u8 {
+        return switch (what) {
+            error.UnknownBoard => "no board is called that, and this models prototype and chenega-v1-ax7203",
+            error.UnknownCore => "no core is called that, and the profiles are gc1.n, gc1.mi, gc1.s, gc1.f and gc1.ma",
+            error.UnknownFormat => "a format is xr24 or ar24",
+            error.UnknownOutput => "an output is hdmi, dvi or rgb",
+            error.BadNumber => "a number is decimal, or hex behind 0x, with K, M or G after it",
+            error.BadResolution => "a mode is written as 1024x768",
+            error.BadPitch => "a row holds at least four bytes for each pixel",
+            error.BadWindow => "a window is a power of two, and at least sixteen bytes",
+            error.BadCoreShape => "a core has at least one warp, one lane and one lane of width",
+            error.BadScratch => "scratch is a multiple of four bytes, because a narrow store writes a whole word",
+            error.WindowTooLarge => "the card is described in thirty two bits, so the window and the two blocks past it fit below four gigabytes",
+            error.WindowTooSmall => "the window does not cover every row of the frame buffer",
+            error.PoolOutside => "the memory the card hands out sits inside the window",
+            error.PoolPainted => "the memory the card hands out covers the frame buffer",
+            error.TooManyWarps => "a core holds between one and sixteen warps",
+            error.CoreInWindow => "the core's window lands inside the aperture",
+        };
+    }
 };
 
 watching: ?Watcher = null,
@@ -1568,20 +1935,20 @@ test "the table names the core, and a host drives it over the engine" {
     one.display_at = Fixture.fabric_at + prototype_window_size;
     one.pool_at = Fixture.fabric_at + prototype_window_size + 0x1000;
     one.pool = prototype_pool;
-    one.core_at = prototype_core_at;
+    one.core_at = core_window_at;
     one.core = .{ .shape = Core.gc1mi, .program = &words };
 
     // Four entries now, and the core is the fourth.
     try testing.expectEqual(@as(u32, 4), peek(&one, table_at + 0x08));
     const fourth = table_at + entries_at + 3 * entry_stride;
     try testing.expectEqual(Core.kind, peek(&one, fourth));
-    try testing.expectEqual(@as(u32, prototype_core_at), peek(&one, fourth + 0x04));
+    try testing.expectEqual(@as(u32, core_window_at), peek(&one, fourth + 0x04));
     try testing.expectEqual(@as(u32, Core.window_size), peek(&one, fourth + 0x08));
 
     // The window answers the engine and nothing else, because the board puts it a long way from
     // the aperture. A driver reads the name first, as it does with every other block.
     put(&one, reg.host_low, Fixture.host_at);
-    put(&one, reg.local_low, prototype_core_at);
+    put(&one, reg.local_low, core_window_at);
     put(&one, reg.length, 1);
     put(&one, reg.control, control_start | control_to_host);
     try testing.expectEqual(Core.kind, std.mem.readInt(u32, fixture.host_bytes[0..4], .little));
@@ -1590,19 +1957,19 @@ test "the table names the core, and a host drives it over the engine" {
     // and the strobe in one write.
     std.mem.writeInt(u32, fixture.host_bytes[0..4], 0x0010_0073, .little);
     put(&one, reg.host_low, Fixture.host_at);
-    put(&one, reg.local_low, prototype_core_at + Core.program_at);
+    put(&one, reg.local_low, core_window_at + Core.program_at);
     put(&one, reg.length, 1);
     put(&one, reg.control, control_start);
     try testing.expectEqual(@as(u32, 0x0010_0073), words[0]);
 
     std.mem.writeInt(u32, fixture.host_bytes[0..4], Core.control_run | Core.control_launch, .little);
-    put(&one, reg.local_low, prototype_core_at + Core.reg.control);
+    put(&one, reg.local_low, core_window_at + Core.reg.control);
     put(&one, reg.control, control_start);
     try testing.expectEqual(@as(u64, 1), one.core.?.launches);
 
     // And the status it leaves: running, a warp issued, and nothing of it still live.
     put(&one, reg.host_low, Fixture.host_at + 0x10);
-    put(&one, reg.local_low, prototype_core_at + Core.reg.status);
+    put(&one, reg.local_low, core_window_at + Core.reg.status);
     put(&one, reg.control, control_start | control_to_host);
     const status = std.mem.readInt(u32, fixture.host_bytes[0x10..0x14], .little);
     try testing.expectEqual(Core.status_run | Core.status_issued | Core.status_idle, status);
@@ -1610,4 +1977,125 @@ test "the table names the core, and a host drives it over the engine" {
     // The core keeps no fabric behind its window, so none of this touched the card's memory.
     try testing.expectEqual(@as(u64, 0), one.outside_framebuffer);
     try testing.expectEqual(@as(u64, 0), one.painted);
+}
+
+test "the prototype shape is the card this runner always had" {
+    const shape = Build.prototype;
+    try shape.check();
+
+    try testing.expectEqual(@as(u64, prototype_window_at), shape.window.at);
+    try testing.expectEqual(@as(u64, prototype_window_size), shape.window.len);
+    try testing.expectEqual(@as(u64, prototype_fabric_size), shape.fabricSize());
+    try testing.expectEqual(@as(u64, prototype_display_at), shape.displayAt());
+    try testing.expectEqual(@as(u64, prototype_pool_at), shape.poolAt());
+    try testing.expectEqual(@as(usize, Core.max_program_words), shape.programWords());
+    try testing.expectEqual(@as(usize, 8 * 2048), shape.scratchBytes());
+
+    // And the board, which is the card the gateware is built for. Both are cards someone could
+    // build, which is the whole of what `check` answers.
+    try Build.ax7203.check();
+    try testing.expectEqual(@as(u32, 1024), Build.ax7203.display.?.width);
+    try testing.expectEqual(@as(u64, 32 * 1024 * 1024), Build.ax7203.window.len);
+}
+
+test "a caller writes a card the way a board is written" {
+    const shape = try Build.parse("board=chenega-v1-ax7203,res=800x600,out=hdmi,edid,core=gc1.f");
+
+    try testing.expectEqual(@as(u64, 32 * 1024 * 1024), shape.window.len);
+    try testing.expectEqual(@as(u32, 800), shape.display.?.width);
+    try testing.expectEqual(@as(u32, 600), shape.display.?.height);
+    // A row with no padding, until a caller asks for some.
+    try testing.expectEqual(@as(u32, 3200), shape.display.?.pitch);
+    try testing.expectEqual(caps_hdmi | caps_edid, shape.display.?.caps);
+    try testing.expectEqual(@as(u8, 16), shape.core.?.lanes);
+
+    // Settings nobody gave are the board's own, so the clock of the mode it was written with
+    // stays. A caller changing a mode without its clock is asking for the same wires.
+    try testing.expectEqual(@as(u32, 65_000_000), shape.display.?.pixel_clock);
+
+    const bare = try Build.parse("res=none,core=none,pool=none");
+    try testing.expectEqual(@as(?Display, null), bare.display);
+    try testing.expectEqual(@as(?Pool, null), bare.pool);
+    try testing.expectEqual(@as(?Core.Shape, null), bare.core);
+    try testing.expectEqual(@as(usize, 0), bare.scratchBytes());
+
+    try testing.expectError(error.UnknownBoard, Build.parse("board=chenega-v1-ulx3s"));
+    try testing.expectError(error.UnknownCore, Build.parse("core=gc2.n"));
+    try testing.expectError(error.BadResolution, Build.parse("res=1024"));
+    try testing.expectError(error.BadNumber, Build.parse("windowsize=big"));
+}
+
+test "the memory to hand out follows a mode the caller moved" {
+    // The board's own pool was placed under the board's own mode, so a larger mode in a smaller
+    // window has to move it. A pool left where it was would be memory a driver hands out and the
+    // display is painting.
+    const shape = try Build.parse("windowsize=4M,res=1024x768");
+    try shape.check();
+
+    const rows = @as(u64, shape.display.?.pitch) * shape.display.?.height;
+    try testing.expectEqual(shape.display.?.framebuffer + rows, shape.pool.?.at);
+    try testing.expectEqual(shape.window.at + shape.window.len, shape.pool.?.at + shape.pool.?.len);
+
+    // A caller who names the pool gets the one they named, and one that reaches over the frame
+    // buffer is refused rather than handed out.
+    const named = try Build.parse("windowsize=4M,res=1024x768,pool=0x80300000,poolsize=1M");
+    try testing.expectEqual(@as(u64, 0x8030_0000), named.pool.?.at);
+    try testing.expectError(error.PoolPainted, Build.parse("pool=0x80000000,poolsize=1M"));
+    try testing.expectError(error.PoolOutside, Build.parse("pool=0x90000000,poolsize=1M"));
+}
+
+test "a card nobody could build is refused by what is wrong with it" {
+    // A window that does not reach the last row of the mode, which is the arithmetic firmware
+    // does before it publishes an address.
+    try testing.expectError(error.WindowTooSmall, Build.parse("res=1024x768,windowsize=1M"));
+    // A region is a power of two on this bus.
+    try testing.expectError(error.BadWindow, Build.parse("windowsize=3M"));
+    // The table describes the card in thirty two bit fields.
+    try testing.expectError(error.WindowTooLarge, Build.parse("window=0xffff0000"));
+    // A spill slot is four bytes, so a warp's scratch starts word aligned or one warp writes over
+    // another's.
+    try testing.expectError(error.BadScratch, Build.parse("scratch=1023"));
+    try testing.expectError(error.TooManyWarps, Build.parse("warps=32"));
+    // The core window answers from nothing, so it may not land where the fabric already answers.
+    try testing.expectError(error.CoreInWindow, Build.parse("window=0x10000000,windowsize=1M,res=none"));
+
+    // Each one says what to do about it rather than naming itself.
+    try std.testing.expect(std.mem.indexOf(u8, Build.trouble(error.BadWindow), "power of two") != null);
+}
+
+test "a card is placed where its shape says, and nothing else places it" {
+    var fixture: Fixture = .{};
+    _ = fixture.card();
+
+    // Small on purpose. The fabric is memory this test holds, so the window and the mode are the
+    // smallest pair that still names every block the board has.
+    const shape = try Build.parse("board=chenega-v1-ax7203,windowsize=16K,res=64x32");
+    var fabric: [0x4000 + Build.blocks_size]u8 = @splat(0);
+    var program: [Core.max_program_words]u32 = @splat(0);
+    var scratch: [8 * 2048]u8 = @splat(0);
+
+    // What a runner allocates comes from the shape, so these three are what it would have asked
+    // for and not what this test chose.
+    try testing.expectEqual(fabric.len, shape.fabricSize());
+    try testing.expectEqual(program.len, shape.programWords());
+    try testing.expectEqual(scratch.len, shape.scratchBytes());
+
+    var one = shape.card(.{
+        .memory = &fixture.memory,
+        .fabric = &fabric,
+        .program = &program,
+        .scratch = &scratch,
+    });
+
+    // The window covers the mode, and the table names all four blocks the shape asked for.
+    try std.testing.expect(one.covers());
+    try testing.expectEqual(@as(u32, 4), peek(&one, table_at + 0x08));
+
+    const second = table_at + entries_at + entry_stride;
+    try testing.expectEqual(display_kind, peek(&one, second));
+    try testing.expectEqual(@as(u32, @truncate(shape.displayAt())), peek(&one, second + 0x04));
+
+    const fourth = table_at + entries_at + 3 * entry_stride;
+    try testing.expectEqual(Core.kind, peek(&one, fourth));
+    try testing.expectEqual(@as(u32, @truncate(shape.core_at)), peek(&one, fourth + 0x04));
 }
