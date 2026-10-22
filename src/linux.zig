@@ -781,6 +781,10 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         .core_at = device.Glacier.prototype_core_at,
         .rom = option_rom,
     };
+    // A core runs its warps on threads of their own, so the card has to be stopped before the
+    // memory they write into goes away. Declared here, which is after the memory, so it runs
+    // before it.
+    defer if (gpu.core) |*each| each.quiet();
     // A window that does not cover every row of the frame buffer is a card firmware refuses. The
     // numbers are this runner's, not the guest's, so this is a mistake here or nowhere.
     if (wanted != null) std.debug.assert(gpu.covers());
