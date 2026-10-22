@@ -127,7 +127,13 @@ pub fn Cache(comptime Guest: type) type {
             for (0..64) |_| {
                 const at = std.math.add(u64, Guest.pc(cpu), count) catch return error.AddressOverflow;
                 const room = bytes[count..][0..Guest.max_instruction_bytes];
-                const length = try Guest.fetch(memory, cpu, tlb, at, room);
+                const length = Guest.fetch(memory, cpu, tlb, at, room) catch |err| switch (err) {
+                    error.TranslationFault, error.PermissionFault => {
+                        if (count > 0) break;
+                        return err;
+                    },
+                    else => return err,
+                };
                 if (length == 0 or length > room.len) return error.InvalidInstructionLength;
                 count += length;
                 if (try Guest.terminates(room[0..length])) break;
