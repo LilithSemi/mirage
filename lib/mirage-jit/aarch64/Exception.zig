@@ -29,12 +29,14 @@ pub const Kind = enum(u2) { sync = 0, irq = 1, fiq = 2, serror = 3 };
 pub const Reason = struct {
     kind: Kind = .sync,
     /// The exception class, at bits 31:26. A data abort from the current level
-    /// is `0b100001` and from a lower one `0b100000`; the two differ only in
-    /// which level the faulting access was made from.
+    /// is `0b100101` and from a lower one `0b100100`; an instruction abort from
+    /// the current level is `0b100001` and from a lower one `0b100000`.
     ec: u6 = 0,
     /// True when the faulting address was being fetched as an instruction,
-    /// which is bit 25 and changes which status codes are legal.
+    /// which sets bit 25.
     instruction: bool = false,
+    /// Write not Read for data aborts, at bit 6.
+    write: bool = false,
     /// The fault status code, in the low bits.
     status: u6 = 0b000100,
 };
@@ -65,6 +67,7 @@ pub fn take(cpu: *Cpu, reason: Reason, fault_address: u64) u64 {
     cpu.system.elr_el1 = cpu.pc;
     cpu.system.esr_el1 = (@as(u64, reason.ec) << 26) |
         (@as(u64, @intFromBool(reason.instruction)) << 25) |
+        (@as(u64, @intFromBool(reason.write)) << 6) |
         reason.status;
     cpu.system.far_el1 = fault_address;
 

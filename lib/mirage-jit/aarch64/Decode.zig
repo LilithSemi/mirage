@@ -843,14 +843,16 @@ pub fn decode(word: u32) Error!Instruction {
     if ((word & 0x3e00_0000) == 0x3800_0000) {
         const opc = (word >> 22) & 3;
         const size: Size = @fromBackingInt(@intCast(@as(u8, 1) << @intCast(word >> 30)));
+        // `opc` 2 with a doubleword is the prefetch (`PRFM`, `PRFUM`), which is a
+        // hint and not a load.
+        if (opc == 2 and size == .double) return .nop;
         // `opc` 0 is a store and 1 a load. 2 and 3 are the sign-extending loads, to a
         // 64-bit and a 32-bit register, except that a word can only be extended to 64
-        // bits, and that 2 with a doubleword is the prefetch, which is a hint and not
-        // a load. The extension is a property of the access, not of the address, so
+        // bits. The extension is a property of the access, not of the address, so
         // it is settled here before the addressing form is.
         const signed: SignExtend = switch (opc) {
             0, 1 => .none,
-            2 => if (size == .double) return error.UnsupportedInstruction else .to64,
+            2 => .to64,
             3 => if (size == .byte or size == .half) .to32 else return error.UnsupportedInstruction,
             else => unreachable,
         };
@@ -881,10 +883,12 @@ pub fn decode(word: u32) Error!Instruction {
                 .amount = if (scaled) @intCast(@ctz(@backingInt(size))) else 0,
             } };
         } else switch ((word >> 10) & 3) {
-            0 => .{ .offset = signExtend9(word) },
+            // `2` is the unprivileged form (LDTR/STTR), which Linux uses for user memory. It
+            // addresses like the unscaled form. Its access is not yet checked as EL0.
+            0, 2 => .{ .offset = signExtend9(word) },
             1 => .{ .post_index = signExtend9(word) },
             3 => .{ .pre_index = signExtend9(word) },
-            else => return error.UnsupportedInstruction, // unprivileged, which Linux does not use
+            else => unreachable, // masked to two bits above
         };
         return .{ .memory = .{
             .op = if (opc == 0) .store else .load,
@@ -1082,10 +1086,11 @@ pub fn decode(word: u32) Error!Instruction {
         const raw: i7 = @bitCast(@as(u7, @truncate(word >> 15)));
         const displacement = @as(i64, raw) * scale;
         const addressing: Addressing = switch ((word >> 23) & 7) {
-            2 => .{ .offset = displacement },
+            // 0 is the non-temporal hint form (STNP/LDNP), which addresses like 2 (offset).
+            0, 2 => .{ .offset = displacement },
             3 => .{ .pre_index = displacement },
             1 => .{ .post_index = displacement },
-            else => return error.UnsupportedInstruction, // unprivileged and the reserved encodings
+            else => return error.UnsupportedInstruction,
         };
         return .{ .pair = .{
             .op = if (is_load) .load else .store,

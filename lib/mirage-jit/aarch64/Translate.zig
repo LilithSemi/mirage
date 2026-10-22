@@ -132,7 +132,8 @@ pub const Entry = struct {
     /// What the descriptor said about access, checked again on a hit: making a
     /// page read-only and keeping the entry would let the write through.
     ap: u2 = 0,
-    executable: bool = false,
+    pxn: bool = false,
+    uxn: bool = false,
     /// True when the entry records a fault, so that an address in no table is
     /// not walked again on every access to it.
     faulted: bool = false,
@@ -189,7 +190,8 @@ pub const Tlb = struct {
 const Mapped = struct {
     physical: u64,
     ap: u2,
-    executable: bool,
+    pxn: bool,
+    uxn: bool,
 };
 
 /// Translate one virtual address. A fault is returned rather than a sentinel, so
@@ -214,20 +216,14 @@ pub fn translate(
 
     if (tlb.find(virtual)) |entry| {
         if (entry.faulted) return error.TranslationFault;
-        try permitted(entry.ap, entry.executable, access);
+        try permitted(cpu.system.el, entry.ap, entry.pxn, entry.uxn, access);
         return entry.physical;
     }
 
     const found = walk(cpu, memory, virtual, access, cfg) catch |fault_kind| {
         // An address in no table would otherwise be walked again on the next
         // access, which for a faulting instruction stream is every instruction.
-        // Only faults that do not depend on the kind of access are remembered:
-        // a page that refuses execution is a real page, and remembering that as
-        // a fault would go on refusing the reads that are perfectly allowed.
-        if (fault_kind != error.PermissionFault) {
-            tlb.entries[Tlb.slot(virtual)] = .{ .virtual = virtual, .generation = tlb.generation, .faulted = true };
-            tlb.negatives +|= 1;
-        }
+        // Do not cache TranslationFault across demand paging without TLBI:
         return fault_kind;
     };
     tlb.entries[Tlb.slot(virtual)] = .{
@@ -235,7 +231,8 @@ pub fn translate(
         .physical = found.physical,
         .generation = tlb.generation,
         .ap = found.ap,
-        .executable = found.executable,
+        .pxn = found.pxn,
+        .uxn = found.uxn,
     };
     return found.physical;
 }
@@ -272,11 +269,14 @@ fn markAccessed(memory: *GuestMemory, at: u64, entry: u64) void {
 /// and there is no privileged-access-never, which the guest is not told exists, so
 /// EL1 may read anything and may write what is not read-only. A kernel maps its own
 /// code and constants `10`, so refusing them a read would refuse it its own text.
-fn permitted(ap: u2, executable: bool, access: Access) Fault!void {
+fn permitted(el: u8, ap: u2, pxn: bool, uxn: bool, access: Access) Fault!void {
     switch (access) {
         .read => {},
         .write => if (ap & 0b10 != 0) return error.PermissionFault,
-        .execute => if (!executable) return error.PermissionFault,
+        .execute => {
+            const forbidden = if (el == 0) uxn else pxn;
+            if (forbidden) return error.PermissionFault;
+        },
     }
 }
 
@@ -306,7 +306,8 @@ fn walk(
     if (granule == 0) return error.MalformedTables; // the reserved encoding
     const root = if (upper) cpu.system.ttbr1_el1 else cpu.system.ttbr0_el1;
 
-    var table = root & ~@as(u64, 0xfff);
+    // Bits 63:48 of TTBR0 and TTBR1 hold the ASID, not part of the table address.
+    var table = root & 0x0000_ffff_ffff_f000;
     var level: i8 = 3;
     while (level >= 0) : (level -= 1) {
         // The index is the address above what this level covers, which is the
@@ -346,12 +347,11 @@ fn walk(
         const found = Mapped{
             .physical = output | (virtual & ((@as(u64, 1) << shift) - 1)),
             .ap = @truncate(entry >> 6),
-            // PXN is bit 53, and this walk is at EL1, which is the level that bit
-            // governs. UXN at bit 54 is not consulted: it is the EL0 half of the same
-            // question, and nothing here runs at EL0.
-            .executable = (entry & (@as(u64, 1) << 53)) == 0,
+            // PXN is bit 53 (governs EL1) and UXN is bit 54 (governs EL0).
+            .pxn = (entry & (@as(u64, 1) << 53)) != 0,
+            .uxn = (entry & (@as(u64, 1) << 54)) != 0,
         };
-        try permitted(found.ap, found.executable, access);
+        try permitted(cpu.system.el, found.ap, found.pxn, found.uxn, access);
         // The access flag records that the page has been touched. A hardware walker
         // sets it on the first access and lets that access through, so a guest that
         // allocated a page without setting it is not punished for it.

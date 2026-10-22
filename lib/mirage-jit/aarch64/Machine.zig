@@ -121,10 +121,26 @@ fn run(ctx: *anyopaque, vcpu: Backend.VcpuId) Backend.Error!Backend.Exit {
             _ = Exception.take(&self.cpu, .{ .kind = .irq }, self.cpu.pc);
         }
         if (self.trace) |recorded| recorded.push(self.cpu.pc, self.cpu.sp);
-        _ = self.cache.runBlock(self.memory, &self.cpu, &self.tlb) catch |err| {
-            self.stalled_at = self.cpu.pc;
-            self.stalled = @errorName(err);
-            return error.HypervisorFault;
+        _ = self.cache.runBlock(self.memory, &self.cpu, &self.tlb) catch |err| switch (err) {
+            error.TranslationFault, error.PermissionFault => {
+                const ec: u6 = if (self.cpu.system.el == 1) 0b100001 else 0b100000;
+                const status: u6 = if (err == error.PermissionFault)
+                    Exception.status.permission_fetch
+                else
+                    Exception.status.translation;
+                _ = Exception.take(&self.cpu, .{
+                    .kind = .sync,
+                    .ec = ec,
+                    .instruction = true,
+                    .status = status,
+                }, self.cpu.pc);
+                continue;
+            },
+            else => {
+                self.stalled_at = self.cpu.pc;
+                self.stalled = @errorName(err);
+                return error.HypervisorFault;
+            },
         };
         switch (self.cpu.trap) {
             .none => {},
@@ -215,22 +231,17 @@ fn run(ctx: *anyopaque, vcpu: Backend.VcpuId) Backend.Error!Backend.Exit {
                 // that it cannot leak onto the next block's plain load.
                 const exclusive = self.cpu.exclusive;
                 self.cpu.exclusive = .none;
+                self.faulted = false;
                 const outcome = switch (exclusive) {
                     .none => try self.access(self.cpu.address, self.cpu.width, self.cpu.dest, self.cpu.value),
                     .load => try self.loadExclusive(),
                     .store => try self.storeExclusive(),
                 };
-                // A post-index access updates its base register only now that the
-                // access it described has retired.
-                if (self.cpu.writeback) {
-                    // Register 31 is the stack pointer for an access, as it is
-                    // for the base the translated block read.
-                    if (self.cpu.writeback_dest == 31) {
-                        self.cpu.sp = self.cpu.writeback_value;
-                    } else {
-                        self.cpu.x[self.cpu.writeback_dest] = self.cpu.writeback_value;
-                    }
+                if (self.faulted) {
                     self.cpu.writeback = false;
+                    self.cpu.second_pending = false;
+                    self.cpu.second_signed = .none;
+                    continue;
                 }
                 if (self.cpu.second_pending) {
                     // The second half waits for the first to retire, so if the
@@ -248,7 +259,23 @@ fn run(ctx: *anyopaque, vcpu: Backend.VcpuId) Backend.Error!Backend.Exit {
                     self.cpu.load_signed = second.signed;
                     self.cpu.second_signed = .none;
                     if (try self.access(second.address, second.width, second.dest, second.value)) |exit| return exit;
+                    if (self.faulted) {
+                        self.cpu.writeback = false;
+                        continue;
+                    }
                 } else if (outcome) |exit| return exit;
+                // A post-index access updates its base register only now that the
+                // access it described has retired without faulting.
+                if (self.cpu.writeback) {
+                    // Register 31 is the stack pointer for an access, as it is
+                    // for the base the translated block read.
+                    if (self.cpu.writeback_dest == 31) {
+                        self.cpu.sp = self.cpu.writeback_value;
+                    } else {
+                        self.cpu.x[self.cpu.writeback_dest] = self.cpu.writeback_value;
+                    }
+                    self.cpu.writeback = false;
+                }
             },
         }
     }
@@ -273,7 +300,8 @@ fn zeroLine(self: *Machine, virtual: u64) Backend.Error!void {
             Exception.status.translation;
         _ = Exception.take(&self.cpu, .{
             .kind = .sync,
-            .ec = if (self.cpu.system.el == 1) 0b100001 else 0b100000,
+            .ec = if (self.cpu.system.el == 1) 0b100101 else 0b100100,
+            .write = true,
             .status = status,
         }, virtual);
         return;
@@ -301,7 +329,10 @@ fn access(self: *Machine, address: u64, width: u8, dest: u8, value: u64) Backend
         // working out what went wrong after the fact.
         // A data abort, whose class says whether the access was made at the
         // level now running or a lower one.
-        const ec: u6 = if (self.cpu.system.el == 1) 0b100001 else 0b100000;
+        const ec: u6 = if (kind == .execute)
+            (if (self.cpu.system.el == 1) 0b100001 else 0b100000)
+        else
+            (if (self.cpu.system.el == 1) 0b100101 else 0b100100);
         const status: u6 = switch (fault_kind) {
             error.PermissionFault => if (kind == .execute) Exception.status.permission_fetch else Exception.status.permission,
             else => Exception.status.translation,
@@ -311,7 +342,13 @@ fn access(self: *Machine, address: u64, width: u8, dest: u8, value: u64) Backend
         // made the access, and a handler that returns without changing anything must
         // retry it rather than skip it.
         self.cpu.pc -%= 4;
-        _ = Exception.take(&self.cpu, .{ .kind = .sync, .ec = ec, .instruction = kind == .execute, .status = status }, address);
+        _ = Exception.take(&self.cpu, .{
+            .kind = .sync,
+            .ec = ec,
+            .instruction = kind == .execute,
+            .write = kind == .write,
+            .status = status,
+        }, address);
         self.faulted = true;
         return null;
     };

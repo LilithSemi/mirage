@@ -1,4 +1,4 @@
-//! Boots a raw arm64 Linux `Image` on the AArch64 JIT with a serial port and an
+//! Boots a raw arm64 Linux `Image` (and an optional initramfs) on the AArch64 JIT with a serial port and an
 //! interrupt controller, and says exactly where and why it stopped.
 //!
 //! This is a driver for working towards a boot, not a gate: a kernel that has
@@ -33,17 +33,6 @@ const Deadline = struct {
     fn step(ctx: *anyopaque) bool {
         const self: *Deadline = @ptrCast(@alignCast(ctx));
         self.exits += 1;
-        // A stack pointer that is neither in RAM nor in the kernel's own address space
-        // is already wrong, and every instruction after it only hides where. Stopping
-        // here keeps the block that did it inside the trace. Zero is the state before
-        // the kernel has set one up.
-        const sp = self.machine.cpu.sp;
-        const in_ram = sp >= ram_base and sp <= ram_base + ram_size;
-        const in_kernel = (sp >> 48) == 0xffff;
-        if (sp != 0 and !in_ram and !in_kernel) {
-            self.lost_stack = true;
-            return false;
-        }
         // Reading the clock on every exit would cost more than the exit.
         if (self.exits % 4096 != 0) return true;
         return std.Io.Clock.awake.now(self.io).nanoseconds < self.until;
@@ -71,6 +60,8 @@ pub fn main(init: std.process.Init) !void {
 
     const kernel = try std.Io.Dir.cwd().readFileAlloc(io, args[1], gpa, .limited(256 << 20));
     defer gpa.free(kernel);
+    const initrd: ?[]const u8 = if (args.len > 4) try std.Io.Dir.cwd().readFileAlloc(io, args[4], gpa, .limited(256 << 20)) else null;
+    defer if (initrd) |bytes| gpa.free(bytes);
 
     const ram = try gpa.alloc(u8, ram_size);
     defer gpa.free(ram);
@@ -83,6 +74,7 @@ pub fn main(init: std.process.Init) !void {
     const layout = try Launch.prepare(gpa, &memory, &manifest, .{
         .kernel = kernel,
         .cmdline = cmdline,
+        .initrd = initrd,
         .controller = .{ .gic_v2 = .{ .cpu_base = arm64.fdt.gicv2_cpu_base } },
         .block_device = false,
         .ram_base = ram_base,
