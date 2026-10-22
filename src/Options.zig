@@ -372,9 +372,9 @@ pub fn complain(self: Options, out: *std.Io.Writer, cpu_room: u64) !bool {
         }
     }
     if (self.stop_on) |text| {
-        if (text.len == 0 or text.len > device.Pl011.max_watch) {
+        if (text.len == 0 or text.len > device.max_watch) {
             try out.print("what a guest is waited on to print is between 1 and {d} characters\n", .{
-                device.Pl011.max_watch,
+                device.max_watch,
             });
             return true;
         }

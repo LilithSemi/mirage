@@ -58,6 +58,19 @@ pub const Service = struct {
     pub const Error = virtio.Queue.Error;
 };
 
+/// Another reader of what a guest says, beside wherever its serial port already writes. One byte
+/// at a time, as the guest writes it, because a guest that stops half way through a line still
+/// said the half. Here rather than on a port because a machine has one of several kinds of port
+/// and whoever is listening does not care which.
+pub const Echo = struct {
+    ctx: *anyopaque,
+    byte: *const fn (ctx: *anyopaque, said: u8) void,
+};
+
+/// The longest thing a serial port can be asked to watch the guest say. A caller asking for more
+/// is refused where the ask is made rather than left with a guest that never stops.
+pub const max_watch = 64;
+
 pub const AcpiShutdown = @import("mirage-device/AcpiShutdown.zig");
 pub const Gicv2 = @import("mirage-device/Gicv2.zig");
 pub const Pl011 = @import("mirage-device/Pl011.zig");

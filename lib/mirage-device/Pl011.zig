@@ -67,11 +67,11 @@ watch: []const u8 = &.{},
 said: bool = false,
 /// Somewhere else the bytes go, beside the sink. What a guest says is part of the account of a
 /// run, and a caller writing that account down wants it in the same place as everything else.
-echo: ?Echo = null,
+echo: ?@import("../mirage-device.zig").Echo = null,
 /// The last bytes the guest said, as many as the thing being watched for is long. Compared whole
 /// each time rather than carried as a position: a match that can begin again inside itself is
 /// easy to get wrong that way, and `aab` really is inside `aaab`.
-recent: [max_watch]u8 = @splat(0),
+recent: [@import("../mirage-device.zig").max_watch]u8 = @splat(0),
 heard: usize = 0,
 /// Where to say an interrupt has happened, and which one. A port with nowhere to
 /// report is still usable by a driver that polls, which is what an early console
@@ -136,17 +136,6 @@ fn read(ctx: *anyopaque, offset: u64, size: Bus.Size) u64 {
         else => 0,
     };
 }
-
-/// Another reader of what the guest says. One byte at a time, as the guest writes it, because a
-/// guest that stops half way through a line still said the half.
-pub const Echo = struct {
-    ctx: *anyopaque,
-    byte: *const fn (ctx: *anyopaque, said: u8) void,
-};
-
-/// The longest thing that can be watched for. A caller asking for more is refused where the ask
-/// is made rather than left with a guest that never stops.
-pub const max_watch = 64;
 
 /// Take one byte of what the guest said and see whether it has now said the thing being watched
 /// for. The match runs over the stream rather than over a line, so the thing may be split across
@@ -408,7 +397,7 @@ test "what the guest says reaches whoever else is listening" {
         bytes: [32]u8 = @splat(0),
         count: usize = 0,
 
-        fn echo(self: *@This()) Pl011.Echo {
+        fn echo(self: *@This()) @import("../mirage-device.zig").Echo {
             return .{ .ctx = self, .byte = @This().took };
         }
 

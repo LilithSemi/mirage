@@ -689,7 +689,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     // Firmware reads this before it reaches any of its own code. A guest booting a kernel is told
     // of no such device and is given none.
     var settings: device.FwCfg = .{};
-    if (options.firmware != null) attached.add(settings.device(platform.fw_cfg.addr));
+    if (options.firmware != null) {
+        if (platform.fw_cfg) |where| attached.add(settings.device(where.addr));
+    }
 
     var store: device.NorFlash = .{ .store = if (vars) |bytes| bytes else &.{} };
     if (vars != null) attached.add(store.device(vars_at, vars_room));

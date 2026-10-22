@@ -85,7 +85,7 @@ pub fn summary(self: *Trace, bridge: *const device.PciHost, gpu: *const device.G
 /// arrives without a newline, so a line that never ends is written out rather than lost.
 const line_room = 512;
 
-pub fn echo(self: *Trace) device.Pl011.Echo {
+pub fn echo(self: *Trace) device.Echo {
     return .{ .ctx = self, .byte = Trace.heard };
 }
 
