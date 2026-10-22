@@ -94,6 +94,20 @@ pub fn build(b: *std.Build) void {
         .{ .name = "mirage-arch", .module = arch },
         .{ .name = "mirage-attest", .module = attest },
     });
+    // Experimental DBT is hosted-only: Vulcan's native JIT emits code for the build host.
+    if (has_os and target.result.cpu.arch == .x86_64) {
+        const vulcan = b.dependency("vulcan", .{ .target = target, .optimize = optimize });
+        const jit_imports: []const std.Build.Module.Import = &.{
+            .{ .name = "mirage-memory", .module = memory },
+            .{ .name = "mirage-backend", .module = backend },
+            .{ .name = "mirage-arm64", .module = arm64 },
+            .{ .name = "vulcan-ir", .module = vulcan.module("vulcan-ir") },
+            .{ .name = "vulcan-target", .module = vulcan.module("vulcan-target") },
+            .{ .name = "vulcan-opt", .module = vulcan.module("vulcan-opt") },
+            .{ .name = "vulcan-link", .module = vulcan.module("vulcan-link") },
+        };
+        _ = add.lib("mirage-jit", jit_imports);
+    }
     if (target.result.os.tag == .macos) {
         const mac_options = b.addOptions();
         mac_options.addOption([]const u8, "kernel_path", kernel_path);
