@@ -10,7 +10,8 @@
 
 const std = @import("std");
 const testing = @import("mirage-testing");
-const Backend = @import("mirage-backend").Backend;
+const backend_lib = @import("mirage-backend");
+const Backend = backend_lib.Backend;
 const GuestMemory = @import("mirage-memory").GuestMemory;
 const attest = @import("mirage-attest");
 const Manifest = attest.Manifest;
@@ -18,37 +19,176 @@ const arm64 = @import("mirage-arm64");
 const arch = @import("mirage-arch");
 const device = @import("mirage-device");
 
-/// What is being started, named in the terms of the architecture this is built for. A Linux kernel
-/// is placed where its header asks; firmware is placed where it was built to run.
-pub const Kind = arch.boot.Kind;
+/// Launching a guest of the architecture `Guest`, a module such as `mirage-arm64`. What a guest is
+/// told, where it is placed, how it is entered and how its power calls are answered are properties of
+/// that architecture, and none of them is a property of the host: a translator runs a guest the host
+/// is not. The names below this one are the same for every guest.
+pub fn For(comptime Guest: type) type {
+    return struct {
+        const Of = @This();
+        const B = backend_lib.For(Guest);
 
-/// The launch request. Its fields are the architecture's own, because what a guest is told it has and
-/// where it sits are properties of the machine. The runner fills the ones that matter to it; the rest
-/// take their defaults.
-pub const Config = arch.boot.Config;
+        /// What is being started, named in the terms of the architecture this is built for. A Linux kernel
+        /// is placed where its header asks; firmware is placed where it was built to run.
+        pub const Kind = Guest.boot.Kind;
 
-/// Where the guest starts and where it finds what it was told about. An architecture reads these back
-/// out when it enters the guest, so neither this module nor the runner names what they mean.
-pub const Layout = arch.boot.Layout;
+        /// The launch request. Its fields are the architecture's own, because what a guest is told it has and
+        /// where it sits are properties of the machine. The runner fills the ones that matter to it; the rest
+        /// take their defaults.
+        pub const Config = Guest.boot.Config;
 
-pub const Error = arch.boot.PrepareError;
+        /// Where the guest starts and where it finds what it was told about. An architecture reads these back
+        /// out when it enters the guest, so neither this module nor the runner names what they mean.
+        pub const Layout = Guest.boot.Layout;
 
-/// Place the guest in memory and measure every input on the way in, the way the architecture under
-/// this build asks. Loading and measuring are one pass on purpose: nothing reaches guest memory
-/// without being hashed, and the manifest seals before the first instruction.
-pub fn prepare(
-    gpa: std.mem.Allocator,
-    memory: *GuestMemory,
-    manifest: *Manifest,
-    config: Config,
-) Error!Layout {
-    return arch.boot.prepare(gpa, memory, manifest, config);
+        pub const Error = Guest.boot.PrepareError;
+
+        /// Place the guest in memory and measure every input on the way in, the way the architecture under
+        /// this build asks. Loading and measuring are one pass on purpose: nothing reaches guest memory
+        /// without being hashed, and the manifest seals before the first instruction.
+        pub fn prepare(
+            gpa: std.mem.Allocator,
+            memory: *GuestMemory,
+            manifest: *Manifest,
+            config: Of.Config,
+        ) Of.Error!Of.Layout {
+            return Guest.boot.prepare(gpa, memory, manifest, config);
+        }
+
+        /// Put the guest at its entry point, the way the architecture under this build asks.
+        pub fn enter(hv: B, vcpu: B.VcpuId, layout: Of.Layout) B.Error!void {
+            try Guest.enter(hv, vcpu, layout);
+        }
+
+        pub const RunError = B.Error || device.Service.Error || error{
+            /// The guest used every exit it was given. Either it is spinning, or the caller
+            /// asked for fewer exits than a boot takes.
+            ExitsExhausted,
+        };
+
+        /// Run until the guest stops, it exhausts its budget, or a device finds the guest has
+        /// published something impossible.
+        pub fn run(hv: B, vcpu: B.VcpuId, options: Run) Of.RunError!Reason {
+            // A service reaches guest memory, so asking for one without memory is a mistake
+            // in the caller rather than something the guest can cause.
+            std.debug.assert(options.services.len == 0 or options.memory != null);
+
+            var left = options.exits;
+            while (left > 0) : (left -= 1) {
+                // The line is set before the guest is entered, so it sees the state the
+                // controller is in rather than the state it was in an exit ago. A backend
+                // whose controller lives in the kernel ignores this.
+                if (options.controller) |each| {
+                    take(options);
+                    const signalled = each.signalled(each.ctx, vcpu);
+                    release(options);
+                    try hv.setInterrupt(vcpu, signalled);
+                }
+
+                // Entering the guest is the one thing that must not be done holding anything: it does not
+                // come back until the guest leaves, and a CPU waiting inside the hypervisor holding the lock
+                // would stop every other CPU getting at a device.
+                switch (try hv.run(vcpu)) {
+                    .mmio_write => |write| {
+                        take(options);
+                        defer release(options);
+                        acting(options, vcpu);
+                        options.bus.write(write.gpa, write.size, write.value);
+                    },
+                    .mmio_read => |read| {
+                        take(options);
+                        acting(options, vcpu);
+                        const value = options.bus.read(read.gpa, read.size);
+                        release(options);
+                        try hv.completeMmioRead(vcpu, value);
+                    },
+                    .shutdown => return .shutdown,
+                    .reset => return .reset,
+
+                    // KVM answers these in the kernel and never sends one. Apple answers
+                    // none of them, so they are answered here and the guest cannot tell
+                    // which hypervisor it is on. Only an architecture with a power interface
+                    // reaches these; the x86 hypervisor never emits one.
+                    .psci => |call| if (comptime Guest.has_power) switch (Guest.psci.handle(.{ .function = call.function, .args = call.args })) {
+                        .value => |value| try hv.setRegister(vcpu, Guest.psci_result, value),
+                        .power_off => return .shutdown,
+                        .reset => return .reset,
+                        // Starting a CPU belongs to whoever runs them. A caller that gave nobody to ask
+                        // answers no, which is honest: a guest told no runs on the CPU it has.
+                        .start_cpu => |asked| {
+                            const answer = if (options.power) |who| once: {
+                                take(options);
+                                defer release(options);
+                                break :once who.start(who.ctx, asked.target, asked.entry, asked.context);
+                            } else false;
+                            try hv.setRegister(vcpu, Guest.psci_result, if (answer) Guest.psci.success else Guest.psci.not_supported);
+                        },
+                    } else unreachable,
+
+                    // Only Apple sends this. The program counter has already moved past
+                    // the instruction, so the guest carries on around its idle loop and
+                    // makes progress whenever an interrupt arrives.
+                    .wfi => {},
+
+                    // Only Apple sends this too, because KVM delivers the timer interrupt
+                    // itself. Here the VMM has to.
+                    .timer => if (comptime Guest.has_power) {
+                        if (options.controller) |each| {
+                            take(options);
+                            defer release(options);
+                            // The timer belongs to this CPU and to no other, so it is raised for this one.
+                            each.raiseOn(each.ctx, vcpu, Guest.timer.virtual_intid);
+                        }
+                    } else unreachable,
+
+                    // The guest was taken back so this loop could run. Serving the devices and
+                    // giving the host its turn is the whole point, and both happen below.
+                    .interrupted => {},
+
+                    // Port exits reach a port bus when one is present. Without one the exit is
+                    // unexpected: aarch64 never produces port exits, and x86 before a serial is
+                    // attached has nothing to route to.
+                    .port_out => |w| if (options.ports) |ports| {
+                        take(options);
+                        defer release(options);
+                        acting(options, vcpu);
+                        ports.write(w.port, w.size, w.value);
+                        if (options.shutdown) |flag| if (flag.*) return .shutdown;
+                    } else return B.Error.HypervisorFault,
+                    .port_in => |r| if (options.ports) |ports| {
+                        take(options);
+                        acting(options, vcpu);
+                        const value = ports.read(r.port, r.size);
+                        release(options);
+                        try hv.completeMmioRead(vcpu, value);
+                    } else return B.Error.HypervisorFault,
+                }
+
+                // The host gets its turn before the devices are served, so anything it hands to
+                // a device goes out on this pass rather than waiting for the next exit.
+                take(options);
+                defer release(options);
+                if (options.host) |each| {
+                    if (!each.step(each.ctx)) return .stopped;
+                }
+                if (options.memory) |memory| try poll(options.services, memory, options.controller);
+            }
+            return Of.RunError.ExitsExhausted;
+        }
+    };
 }
 
-/// Put the guest at its entry point, the way the architecture under this build asks.
-pub fn enter(hv: Backend, vcpu: Backend.VcpuId, layout: Layout) Backend.Error!void {
-    try arch.enter(hv, vcpu, layout);
-}
+/// The guest this build's hypervisor runs. A hardware hypervisor can only run a guest of its own
+/// architecture, so the runners that name no guest get this one.
+const host = For(arch);
+pub const Kind = host.Kind;
+pub const Config = host.Config;
+pub const Layout = host.Layout;
+pub const Error = host.Error;
+pub const prepare = host.prepare;
+pub const enter = host.enter;
+pub const RunError = host.RunError;
+pub const run = host.run;
 
 pub const Reason = enum {
     shutdown,
@@ -127,125 +267,9 @@ pub const Host = struct {
     step: *const fn (ctx: *anyopaque) bool,
 };
 
-pub const RunError = Backend.Error || device.Service.Error || error{
-    /// The guest used every exit it was given. Either it is spinning, or the caller
-    /// asked for fewer exits than a boot takes.
-    ExitsExhausted,
-};
-
-/// Run until the guest stops, it exhausts its budget, or a device finds the guest has
-/// published something impossible.
-pub fn run(hv: Backend, vcpu: Backend.VcpuId, options: Run) RunError!Reason {
-    // A service reaches guest memory, so asking for one without memory is a mistake
-    // in the caller rather than something the guest can cause.
-    std.debug.assert(options.services.len == 0 or options.memory != null);
-
-    var left = options.exits;
-    while (left > 0) : (left -= 1) {
-        // The line is set before the guest is entered, so it sees the state the
-        // controller is in rather than the state it was in an exit ago. A backend
-        // whose controller lives in the kernel ignores this.
-        if (options.controller) |each| {
-            take(options);
-            const signalled = each.signalled(each.ctx, vcpu);
-            release(options);
-            try hv.setInterrupt(vcpu, signalled);
-        }
-
-        // Entering the guest is the one thing that must not be done holding anything: it does not
-        // come back until the guest leaves, and a CPU waiting inside the hypervisor holding the lock
-        // would stop every other CPU getting at a device.
-        switch (try hv.run(vcpu)) {
-            .mmio_write => |write| {
-                take(options);
-                defer release(options);
-                acting(options, vcpu);
-                options.bus.write(write.gpa, write.size, write.value);
-            },
-            .mmio_read => |read| {
-                take(options);
-                acting(options, vcpu);
-                const value = options.bus.read(read.gpa, read.size);
-                release(options);
-                try hv.completeMmioRead(vcpu, value);
-            },
-            .shutdown => return .shutdown,
-            .reset => return .reset,
-
-            // KVM answers these in the kernel and never sends one. Apple answers
-            // none of them, so they are answered here and the guest cannot tell
-            // which hypervisor it is on. Only an architecture with a power interface
-            // reaches these; the x86 hypervisor never emits one.
-            .psci => |call| if (comptime arch.has_power) switch (arch.psci.handle(.{ .function = call.function, .args = call.args })) {
-                .value => |value| try hv.setRegister(vcpu, .x0, value),
-                .power_off => return .shutdown,
-                .reset => return .reset,
-                // Starting a CPU belongs to whoever runs them. A caller that gave nobody to ask
-                // answers no, which is honest: a guest told no runs on the CPU it has.
-                .start_cpu => |asked| {
-                    const answer = if (options.power) |who| once: {
-                        take(options);
-                        defer release(options);
-                        break :once who.start(who.ctx, asked.target, asked.entry, asked.context);
-                    } else false;
-                    try hv.setRegister(vcpu, .x0, if (answer) arch.psci.success else arch.psci.not_supported);
-                },
-            } else unreachable,
-
-            // Only Apple sends this. The program counter has already moved past
-            // the instruction, so the guest carries on around its idle loop and
-            // makes progress whenever an interrupt arrives.
-            .wfi => {},
-
-            // Only Apple sends this too, because KVM delivers the timer interrupt
-            // itself. Here the VMM has to.
-            .timer => if (comptime arch.has_power) {
-                if (options.controller) |each| {
-                    take(options);
-                    defer release(options);
-                    // The timer belongs to this CPU and to no other, so it is raised for this one.
-                    each.raiseOn(each.ctx, vcpu, arch.timer.virtual_intid);
-                }
-            } else unreachable,
-
-            // The guest was taken back so this loop could run. Serving the devices and
-            // giving the host its turn is the whole point, and both happen below.
-            .interrupted => {},
-
-            // Port exits reach a port bus when one is present. Without one the exit is
-            // unexpected: aarch64 never produces port exits, and x86 before a serial is
-            // attached has nothing to route to.
-            .port_out => |w| if (options.ports) |ports| {
-                take(options);
-                defer release(options);
-                acting(options, vcpu);
-                ports.write(w.port, w.size, w.value);
-                if (options.shutdown) |flag| if (flag.*) return .shutdown;
-            } else return Backend.Error.HypervisorFault,
-            .port_in => |r| if (options.ports) |ports| {
-                take(options);
-                acting(options, vcpu);
-                const value = ports.read(r.port, r.size);
-                release(options);
-                try hv.completeMmioRead(vcpu, value);
-            } else return Backend.Error.HypervisorFault,
-        }
-
-        // The host gets its turn before the devices are served, so anything it hands to
-        // a device goes out on this pass rather than waiting for the next exit.
-        take(options);
-        defer release(options);
-        if (options.host) |each| {
-            if (!each.step(each.ctx)) return .stopped;
-        }
-        if (options.memory) |memory| try poll(options.services, memory, options.controller);
-    }
-    return RunError.ExitsExhausted;
-}
-
 /// Say which CPU is about to touch a device, for a controller that banks part of itself per CPU.
 /// Held under the same lock as the access it belongs to, or another CPU could say so in between.
-fn acting(options: Run, vcpu: Backend.VcpuId) void {
+fn acting(options: Run, vcpu: backend_lib.shared.VcpuId) void {
     const each = options.controller orelse return;
     each.acting(each.ctx, vcpu);
 }
@@ -275,6 +299,11 @@ pub fn poll(
 // Where a guest's memory starts, for the run loop tests below. Placing and measuring a launch is the
 // architecture's own, and the tests that prove it live beside it; what remains here is the run loop.
 const ram_base = 0x4000_0000;
+
+// The aarch64 guest, whatever this host is: the power interface and its timer are that guest's, and a
+// test of them should not depend on which machine runs it.
+const arm64_launch = For(arm64);
+const arm64_backend = backend_lib.For(arm64);
 
 test "the run loop carries an mmio write to the bus and stops on shutdown" {
     var mock: Backend.Mock = .init(&.{
@@ -314,10 +343,9 @@ test "the run loop answers an mmio read with what the device gave" {
 }
 
 test "a guest asking to power off stops the loop" {
-    // The power interface is arm's; the x86 hypervisor never emits this exit, so the
-    // whole test is compiled out there rather than naming a register x86 does not have.
-    if (comptime !arch.has_power) return error.SkipZigTest else {
-        var mock: Backend.Mock = .init(&.{
+    // The power interface is arm's, so this runs the aarch64 guest whatever the host is.
+    {
+        var mock: arm64_backend.Mock = .init(&.{
             .{ .psci = .{ .function = arm64.psci.function.system_off, .args = @splat(0) } },
         });
         const hv = mock.backend();
@@ -326,13 +354,13 @@ test "a guest asking to power off stops the loop" {
         var devices = [_]device.Device{};
         var bus: device.Bus = .{ .devices = &devices };
 
-        try testing.expectEqual(Reason.shutdown, try run(hv, id, .{ .bus = &bus }));
+        try testing.expectEqual(Reason.shutdown, try arm64_launch.run(hv, id, .{ .bus = &bus }));
     }
 }
 
 test "a guest asking for the psci version is answered and carries on" {
-    if (comptime !arch.has_power) return error.SkipZigTest else {
-        var mock: Backend.Mock = .init(&.{
+    {
+        var mock: arm64_backend.Mock = .init(&.{
             .{ .psci = .{ .function = arm64.psci.function.version, .args = @splat(0) } },
             .shutdown,
         });
@@ -342,7 +370,7 @@ test "a guest asking for the psci version is answered and carries on" {
         var devices = [_]device.Device{};
         var bus: device.Bus = .{ .devices = &devices };
 
-        _ = try run(hv, id, .{ .bus = &bus });
+        _ = try arm64_launch.run(hv, id, .{ .bus = &bus });
 
         // The answer goes back in x0, which is where the guest looks for it.
         try testing.expectEqual(arm64.psci.version_number, mock.register(id, .x0));
@@ -350,8 +378,8 @@ test "a guest asking for the psci version is answered and carries on" {
 }
 
 test "a guest asking to start a second cpu is told no rather than ignored" {
-    if (comptime !arch.has_power) return error.SkipZigTest else {
-        var mock: Backend.Mock = .init(&.{
+    {
+        var mock: arm64_backend.Mock = .init(&.{
             .{ .psci = .{ .function = arm64.psci.function.cpu_on, .args = .{ 1, 0x4008_0000, 0 } } },
             .shutdown,
         });
@@ -361,7 +389,7 @@ test "a guest asking to start a second cpu is told no rather than ignored" {
         var devices = [_]device.Device{};
         var bus: device.Bus = .{ .devices = &devices };
 
-        _ = try run(hv, id, .{ .bus = &bus });
+        _ = try arm64_launch.run(hv, id, .{ .bus = &bus });
         try testing.expectEqual(arm64.psci.not_supported, mock.register(id, .x0));
     }
 }
@@ -406,10 +434,7 @@ test "the interrupt line is released when the controller has nothing waiting" {
 }
 
 test "a timer exit becomes the timer interrupt in the controller" {
-    // Only an architecture with its timer in the VMM reaches this exit; x86's is in the
-    // hypervisor.
-    if (comptime !arch.has_power) return error.SkipZigTest;
-
+    // Only an architecture with its timer in the VMM reaches this exit, so this runs the aarch64 guest.
     var gic: device.Gicv2 = .{};
     var on_bus = gic.devices(0x0800_0000, 0x0801_0000);
     var bus: device.Bus = .{ .devices = &on_bus };
@@ -420,11 +445,11 @@ test "a timer exit becomes the timer interrupt in the controller" {
     // Enable the timer interrupt, which is private to this CPU and numbered 27.
     bus.write(0x0800_0100, .word, @as(u64, 1) << arm64.timer.virtual_intid);
 
-    var mock: Backend.Mock = .init(&.{ .timer, .shutdown });
+    var mock: arm64_backend.Mock = .init(&.{ .timer, .shutdown });
     const hv = mock.backend();
     const id = try hv.addVcpu();
 
-    _ = try run(hv, id, .{ .bus = &bus, .controller = gic.controller() });
+    _ = try arm64_launch.run(hv, id, .{ .bus = &bus, .controller = gic.controller() });
 
     // Raised by the loop, then acknowledged here to prove it really arrived.
     try testing.expectEqual(@as(u64, arm64.timer.virtual_intid), bus.read(0x0801_000c, .word));
