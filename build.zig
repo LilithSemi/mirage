@@ -272,6 +272,21 @@ pub fn build(b: *std.Build) void {
         }) });
         b.step("test-jit-launch", "Run JIT guest through the Mirage launch loop").dependOn(&b.addRunArtifact(launch_tests).step);
 
+        const boot = b.addExecutable(.{ .name = "mirage-jit-boot", .root_module = b.createModule(.{
+            .root_source_file = b.path("test/jit-boot.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "mirage-jit", .module = jit },
+                .{ .name = "mirage-core", .module = core },
+                .{ .name = "mirage-device", .module = device },
+                .{ .name = "mirage-arm64", .module = arm64 },
+                .{ .name = "mirage-attest", .module = attest },
+                .{ .name = "mirage-memory", .module = memory },
+            },
+        }) });
+        b.step("jit-boot", "Build the kernel boot runner for the AArch64 JIT").dependOn(&b.addInstallArtifact(boot, .{}).step);
+
         const mirage = b.addExecutable(.{
             .name = "mirage",
             .root_module = b.createModule(.{
