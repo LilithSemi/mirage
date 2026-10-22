@@ -245,6 +245,33 @@ pub fn build(b: *std.Build) void {
             .{ .name = "vulcan-target", .module = vulcan.module("vulcan-target") },
         });
 
+        const jit_tests = b.addTest(.{ .name = "mirage-jit", .root_module = b.createModule(.{
+            .root_source_file = b.path("lib/mirage-jit/aarch64/tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "mirage-jit", .module = jit },
+                .{ .name = "mirage-testing", .module = mirage_testing },
+                .{ .name = "mirage-memory", .module = memory },
+                .{ .name = "mirage-backend", .module = backend },
+                .{ .name = "mirage-arm64", .module = arm64 },
+            },
+        }) });
+        b.step("test-jit", "Run native AArch64 JIT tests").dependOn(&b.addRunArtifact(jit_tests).step);
+        const launch_tests = b.addTest(.{ .name = "mirage-jit-launch", .root_module = b.createModule(.{
+            .root_source_file = b.path("test/jit-launch.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "mirage-jit", .module = jit },
+                .{ .name = "mirage-core", .module = core },
+                .{ .name = "mirage-device", .module = device },
+                .{ .name = "mirage-arm64", .module = arm64 },
+                .{ .name = "mirage-memory", .module = memory },
+            },
+        }) });
+        b.step("test-jit-launch", "Run JIT guest through the Mirage launch loop").dependOn(&b.addRunArtifact(launch_tests).step);
+
         const mirage = b.addExecutable(.{
             .name = "mirage",
             .root_module = b.createModule(.{

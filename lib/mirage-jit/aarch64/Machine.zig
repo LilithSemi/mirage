@@ -408,6 +408,8 @@ fn setRegister(ctx: *anyopaque, vcpu: Backend.VcpuId, reg: Backend.Register, val
         .x1 => self.cpu.x[1] = value,
         .x2 => self.cpu.x[2] = value,
         .x3 => self.cpu.x[3] = value,
+        .esr => self.cpu.system.esr_el1 = value,
+        .far => self.cpu.system.far_el1 = value,
     }
 }
 
@@ -420,6 +422,8 @@ fn getRegister(ctx: *anyopaque, vcpu: Backend.VcpuId, reg: Backend.Register) Bac
         .x1 => self.cpu.x[1],
         .x2 => self.cpu.x[2],
         .x3 => self.cpu.x[3],
+        .esr => self.cpu.system.esr_el1,
+        .far => self.cpu.system.far_el1,
     };
 }
 
