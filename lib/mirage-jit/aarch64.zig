@@ -37,9 +37,25 @@ pub fn fetch(
     return max_instruction_bytes;
 }
 
+/// The physical address of a fetch, for noticing writes to code.
+pub fn locate(memory: *GuestMemory, cpu: *const Cpu, tlb: *Translate.Tlb, at: u64) Error!u64 {
+    return Translate.translate(tlb, cpu, memory, at, .execute);
+}
+
+/// What a remembered block address depends on besides the bytes: the
+/// translation regime as the TLB knows it, and the exception level, which decides
+/// whether `PXN` or `UXN` forbids the fetch.
+pub fn context(cpu: *const Cpu, tlb: *const Translate.Tlb) u64 {
+    return tlb.generation << 2 | cpu.system.el;
+}
+
 pub fn terminates(instruction: []const u8) Error!bool {
     const word = std.mem.readInt(u32, instruction[0..4], .little);
     return (try Decode.decode(word)).terminates();
+}
+
+pub fn compileIn(scratch: std.mem.Allocator, allocator: std.mem.Allocator, guest_pc: u64, bytes: []const u8) Error!Block {
+    return lowering.compileIn(scratch, allocator, guest_pc, bytes);
 }
 
 pub fn compile(allocator: std.mem.Allocator, guest_pc: u64, bytes: []const u8) Error!Block {

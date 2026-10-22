@@ -147,9 +147,24 @@ pub const Tlb = struct {
     /// older generation never matches, which makes a flush one addition rather
     /// than a sweep of the array.
     generation: u64 = 1,
+    /// How many entries record a fault. A fault is remembered so a bad address is
+    /// not walked on every access, but a mapping made since then must be seen.
+    negatives: u32 = 0,
+
+    /// Forget remembered faults and nothing else, which is what an `ISB` after a
+    /// table was written needs: it makes new mappings visible, and leaves the
+    /// translations that were already good alone.
+    pub fn dropFaults(self: *Tlb) void {
+        if (self.negatives == 0) return;
+        for (&self.entries) |*entry| {
+            if (entry.faulted) entry.* = .{};
+        }
+        self.negatives = 0;
+    }
 
     pub fn flush(self: *Tlb) void {
         self.generation +%= 1;
+        self.negatives = 0;
         // Wrapping would let an entry from a very old regime match again, so on
         // the way back to the start the array is cleared instead. Failing that
         // way is the safe one: a missed entry is walked again, a wrong one is a
@@ -211,6 +226,7 @@ pub fn translate(
         // a fault would go on refusing the reads that are perfectly allowed.
         if (fault_kind != error.PermissionFault) {
             tlb.entries[Tlb.slot(virtual)] = .{ .virtual = virtual, .generation = tlb.generation, .faulted = true };
+            tlb.negatives +|= 1;
         }
         return fault_kind;
     };

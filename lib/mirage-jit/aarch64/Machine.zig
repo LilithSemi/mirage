@@ -20,6 +20,7 @@ cpu: Cpu = .{},
 /// two must agree: a page executable for one and not the other is not a state
 /// the architecture has.
 tlb: Translate.Tlb = .{},
+regime_seen: [5]u64 = @splat(0),
 pending_read: bool = false,
 /// The level of the external interrupt line, as the interrupt controller last set it.
 irq_line: bool = false,
@@ -178,6 +179,19 @@ fn run(ctx: *anyopaque, vcpu: Backend.VcpuId) Backend.Error!Backend.Exit {
                 // synchronised, and a kernel that changed a page table executes
                 // one straight afterwards. The trap is the whole signal: only
                 // the block that executed the `ISB` can have set it.
+                // Only a change to the registers the walk reads makes what is
+                // remembered wrong; the kernel executes one around every timer read.
+                // What a new mapping can make wrong is a remembered fault.
+                const regime = [_]u64{ self.cpu.system.sctlr_el1, self.cpu.system.ttbr0_el1, self.cpu.system.ttbr1_el1, self.cpu.system.tcr_el1, self.cpu.system.mair_el1 };
+                if (!std.mem.eql(u64, &regime, &self.regime_seen)) {
+                    self.regime_seen = regime;
+                    self.tlb.flush();
+                } else {
+                    self.tlb.dropFaults();
+                }
+                self.cpu.trap = .none;
+            },
+            .tlbi => {
                 self.tlb.flush();
                 self.cpu.trap = .none;
             },
@@ -266,6 +280,7 @@ fn zeroLine(self: *Machine, virtual: u64) Backend.Error!void {
     };
     var line: [64]u8 = @splat(0);
     self.memory.write(physical, &line) catch return error.HypervisorFault;
+    self.cache.written(physical);
 }
 
 fn access(self: *Machine, address: u64, width: u8, dest: u8, value: u64) Backend.Error!?Backend.Exit {
@@ -335,6 +350,8 @@ fn access(self: *Machine, address: u64, width: u8, dest: u8, value: u64) Backend
         error.OutOfBounds => return .{ .mmio_write = .{ .gpa = physical, .size = size, .value = truncated } },
         else => return error.HypervisorFault,
     };
+    self.cache.written(physical);
+    self.cache.written(physical +% (width - 1));
     return null;
 }
 
