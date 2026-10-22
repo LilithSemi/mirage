@@ -408,6 +408,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         },
         .display = device.Glacier.prototype_display,
         .display_at = device.Glacier.prototype_display_at,
+        .pool = device.Glacier.prototype_pool,
+        .pool_at = device.Glacier.prototype_pool_at,
         .rom = option_rom,
     };
     if (wanted != null) std.debug.assert(gpu.covers());

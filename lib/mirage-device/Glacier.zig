@@ -45,7 +45,19 @@ pub const prototype_window_size = 0x20_0000;
 /// The prototype mode, and where the block that reports it sits: past the window, so a guest
 /// painting its frame buffer cannot write over the registers that describe it.
 pub const prototype_display_at = prototype_window_at + prototype_window_size;
-pub const prototype_fabric_size = prototype_window_size + 0x1000;
+
+/// Where the block that reports allocatable memory sits, past the display block, and the pool it
+/// reports: the fabric above the prototype frame buffer, which needs 0x12c000 of the window. A
+/// driver builds its allocator over this, so a pool that overlapped the frame buffer would hand
+/// out memory something else is already painting.
+pub const prototype_pool_at = prototype_display_at + 0x1000;
+pub const prototype_pool: Pool = .{
+    .at = prototype_window_at + 0x14_0000,
+    .len = prototype_window_size - 0x14_0000,
+};
+
+/// The window, and a page each for the two register blocks past it.
+pub const prototype_fabric_size = prototype_window_size + 0x2000;
 
 /// What the engine answers at the first word. A driver that reads anything else has found a
 /// different card.
@@ -122,6 +134,28 @@ const entry_stride = 0x10;
 
 /// The window onto the fabric, as the table names it.
 pub const window_kind: u32 = 0x5744574e;
+
+/// The allocatable memory block, as the table names it and as the block answers at its own first
+/// word. A build with nothing left over leaves it out, and a driver that finds no entry has no
+/// memory to hand out rather than a fault to report.
+pub const memory_kind: u32 = 0x474d454d;
+pub const memory_version: u32 = 1;
+
+/// Where the ranges start inside the memory block, and how far apart they are. The stride is in
+/// the block's header because a driver reads it rather than assuming it.
+const ranges_at = 0x40;
+const range_stride = 0x10;
+
+/// Bit zero of a range's flags: whether a driver may hand the range out. A range without it is
+/// memory the card keeps for itself.
+const range_usable: u32 = 1;
+
+/// Memory the card has left over, which a driver hands out to whoever asks. The frame buffers and
+/// the card's own scratch are already taken out of this, so every byte of it is free.
+pub const Pool = struct {
+    at: u64,
+    len: u64,
+};
 
 /// The display block, as the table names it. The block answers the same fourcc at its own first
 /// word, and a driver that reads anything else there has found no display block.
@@ -242,6 +276,10 @@ memory: *GuestMemory,
 fabric: []u8,
 fabric_at: u64 = 0,
 aperture: ?Aperture = null,
+/// The memory a driver may hand out, and where the block that reports it sits in the fabric. A
+/// card built with nothing left over has neither, and its table names no memory block.
+pool: ?Pool = null,
+pool_at: u64 = 0,
 /// The one display this card reports, where it has one. A card with none is a build with no
 /// aperture to paint into, and a driver refuses it rather than publishing an address.
 display: ?Display = null,
@@ -291,9 +329,11 @@ painted_through_window: u64 = 0,
 /// fault from something arriving somewhere nobody expected.
 read_through_window: u64 = 0,
 written_through_window: u64 = 0,
-/// Bytes that landed in the aperture but outside the frame buffer, whichever way they came. A
-/// driver painting where it should not, which nothing is expected to do.
-outside: u64 = 0,
+/// Bytes that landed in the aperture and not in the frame buffer, whichever way they came. The
+/// pool sits there, so a driver writing into memory it was handed counts here and is doing nothing
+/// wrong. Named for the frame buffer and not for the fabric, because the bytes are inside the
+/// card's memory either way.
+outside_framebuffer: u64 = 0,
 
 /// What the bridge puts in config space for this card.
 pub fn function(self: *Glacier, at: PciHost.Address) PciHost.Function {
@@ -345,6 +385,7 @@ fn entryCount(self: *const Glacier) usize {
     var count: usize = 0;
     if (self.aperture != null) count += 1;
     if (self.display != null) count += 1;
+    if (self.pool != null) count += 1;
     return count;
 }
 
@@ -366,7 +407,41 @@ fn entryAt(self: *const Glacier, index: usize) ?Entry {
         };
         count += 1;
     }
+    if (self.pool != null) {
+        if (index == count) return .{
+            .kind = memory_kind,
+            .base = @truncate(self.pool_at),
+            .size = ranges_at + range_stride,
+        };
+        count += 1;
+    }
     return null;
+}
+
+/// One word of the memory block, or nothing where the address is not inside it.
+///
+/// One range, because the card has one pool. A driver reads the count and the stride first, so a
+/// card with more would answer here and need nothing else changed.
+fn poolWord(self: *const Glacier, at: u64) ?u32 {
+    const pool = self.pool orelse return null;
+    if (at < self.pool_at) return null;
+    const within = at - self.pool_at;
+    if (within >= ranges_at + range_stride) return null;
+
+    if (within < ranges_at) return switch (within) {
+        0x00 => memory_kind,
+        0x04 => memory_version,
+        0x08 => 1,
+        0x0c => range_stride,
+        else => 0,
+    };
+
+    return switch (within - ranges_at) {
+        0x00 => @truncate(pool.at),
+        0x04 => @truncate(pool.len),
+        0x08 => range_usable,
+        else => 0,
+    };
 }
 
 /// One word of the display block, or nothing where the address is not inside it.
@@ -578,6 +653,7 @@ fn memoryWord(self: *Glacier, at: u64) ?*[4]u8 {
 /// memory everywhere else. There is one fabric, and the engine and the window are two ways in.
 fn fabricRead(self: *Glacier, at: u64) ?u32 {
     if (self.displayWord(at)) |value| return value;
+    if (self.poolWord(at)) |value| return value;
     const word = self.memoryWord(at) orelse return null;
     return std.mem.readInt(u32, word, .little);
 }
@@ -585,6 +661,8 @@ fn fabricRead(self: *Glacier, at: u64) ?u32 {
 /// Returns whether the write landed. A write into the display block reaches a register rather than
 /// memory, and nothing here changes a mode, so it is taken and dropped.
 fn fabricWrite(self: *Glacier, at: u64, value: u32) bool {
+    // What the card has left over is the card's to say. A driver reads it and does not write it.
+    if (self.poolWord(at) != null) return true;
     if (self.displayWord(at) != null) {
         // The one register in the block a driver writes. Firmware asks for a mode through the
         // protocol the driver published, and this is the only way that ask reaches the card.
@@ -612,7 +690,7 @@ fn landed(self: *Glacier, at: u64, bytes: u64, through_window: bool) void {
     }
 
     const each = self.aperture orelse return;
-    if (at >= each.at and at < each.at + each.len) self.outside += bytes;
+    if (at >= each.at and at < each.at + each.len) self.outside_framebuffer += bytes;
 }
 
 fn move(self: *Glacier) void {
@@ -1214,19 +1292,19 @@ test "the card says how far a driver got with it" {
     // the driver published. The engine's own painting is counted apart from it.
     try testing.expectEqual(@as(u64, 4), one.painted_through_window);
     try testing.expectEqual(@as(u64, 0), one.painted);
-    try testing.expectEqual(@as(u64, 0), one.outside);
+    try testing.expectEqual(@as(u64, 0), one.outside_framebuffer);
 
     // One word past the last row, which is the aperture and not the screen. A driver painting
     // here is painting where it should not.
     handler.vtable.write(handler.ctx, window_region, rows, .word, 0);
     try testing.expectEqual(@as(u64, 4), one.painted_through_window);
-    try testing.expectEqual(@as(u64, 4), one.outside);
+    try testing.expectEqual(@as(u64, 4), one.outside_framebuffer);
 
     // And the last word of the screen is still the screen, so the boundary is where the rows end
     // and not a word either side of it.
     handler.vtable.write(handler.ctx, window_region, rows - 4, .word, 0);
     try testing.expectEqual(@as(u64, 8), one.painted_through_window);
-    try testing.expectEqual(@as(u64, 4), one.outside);
+    try testing.expectEqual(@as(u64, 4), one.outside_framebuffer);
 
     // The engine writing the same place is the driver painting, and counts on its own side.
     @memcpy(fixture.host_bytes[0..4], &[_]u8{ 1, 2, 3, 4 });
@@ -1391,4 +1469,47 @@ test "a frame buffer painted through the bridge lands in the fabric the display 
     try testing.expectEqual(@as(u64, 4), one.painted_through_window);
     try testing.expectEqual(@as(u64, 2), host.refused);
     try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, fixture.fabric_bytes[4..8], .little));
+}
+
+test "the table names the memory a driver may hand out" {
+    var fixture: Fixture = .{};
+    var one = fixture.card();
+    one.aperture = .{ .at = Fixture.fabric_at, .len = prototype_window_size };
+    one.display = prototype_display;
+    one.display_at = Fixture.fabric_at + prototype_window_size;
+    one.pool_at = Fixture.fabric_at + prototype_window_size + 0x1000;
+    one.pool = prototype_pool;
+
+    // Three entries, and the pool is the third.
+    try testing.expectEqual(@as(u32, 3), peek(&one, table_at + 0x08));
+    const third = table_at + entries_at + 2 * entry_stride;
+    try testing.expectEqual(memory_kind, peek(&one, third));
+    try testing.expectEqual(@as(u32, @truncate(one.pool_at)), peek(&one, third + 0x04));
+    try testing.expectEqual(@as(u32, ranges_at + range_stride), peek(&one, third + 0x08));
+
+    // The block itself answers through the engine, which is the only way a driver reaches it: it
+    // sits past the window, so nothing painting a frame buffer can reach these words.
+    put(&one, reg.host_low, Fixture.host_at);
+    put(&one, reg.local_low, @truncate(one.pool_at));
+    put(&one, reg.length, 4);
+    put(&one, reg.control, control_start | control_to_host);
+    try testing.expectEqual(memory_kind, std.mem.readInt(u32, fixture.host_bytes[0x00..0x04], .little));
+    try testing.expectEqual(memory_version, std.mem.readInt(u32, fixture.host_bytes[0x04..0x08], .little));
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, fixture.host_bytes[0x08..0x0c], .little));
+    try testing.expectEqual(@as(u32, range_stride), std.mem.readInt(u32, fixture.host_bytes[0x0c..0x10], .little));
+
+    // The one range: where it is, how much of it there is, and that a driver may have it.
+    put(&one, reg.host_low, Fixture.host_at + 0x10);
+    put(&one, reg.local_low, @truncate(one.pool_at + ranges_at));
+    put(&one, reg.length, 3);
+    put(&one, reg.control, control_start | control_to_host);
+    try testing.expectEqual(@as(u32, @truncate(prototype_pool.at)), std.mem.readInt(u32, fixture.host_bytes[0x10..0x14], .little));
+    try testing.expectEqual(@as(u32, @truncate(prototype_pool.len)), std.mem.readInt(u32, fixture.host_bytes[0x14..0x18], .little));
+    try testing.expectEqual(range_usable, std.mem.readInt(u32, fixture.host_bytes[0x18..0x1c], .little));
+
+    // The pool is inside the window and clear of the frame buffer, so a driver handing out its
+    // first byte hands out memory a host can map and nothing else is painting.
+    try std.testing.expect(prototype_pool.at >= prototype_display.framebuffer +
+        @as(u64, prototype_display.pitch) * prototype_display.height);
+    try std.testing.expect(prototype_pool.at + prototype_pool.len <= one.aperture.?.at + one.aperture.?.len);
 }

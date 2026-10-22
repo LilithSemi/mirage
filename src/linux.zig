@@ -757,6 +757,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         },
         .display = device.Glacier.prototype_display,
         .display_at = device.Glacier.prototype_display_at,
+        .pool = device.Glacier.prototype_pool,
+        .pool_at = device.Glacier.prototype_pool_at,
         .rom = option_rom,
     };
     // A window that does not cover every row of the frame buffer is a card firmware refuses. The
@@ -1025,9 +1027,6 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     // is where whoever cares reads it, and a caller who asked for a trace or for pictures knows
     // where they asked for them to go. Only what went wrong is worth a line here.
     if (options.pci and wanted != null) {
-        if (gpu.outside != 0) {
-            try say.print("glacier: {d} bytes were painted outside the frame buffer\n", .{gpu.outside});
-        }
         if (gpu.strayed != 0) {
             try say.print("glacier: {d} accesses named fabric the card does not have\n", .{gpu.strayed});
         }
