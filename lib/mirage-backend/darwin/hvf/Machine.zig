@@ -12,7 +12,7 @@
 
 const std = @import("std");
 const testing = @import("mirage-testing");
-const Backend = @import("../../Backend.zig");
+const Backend = @import("../../Backend.zig").For(@import("mirage-arch"));
 const arm64 = @import("mirage-arm64");
 const hv = @import("binding.zig");
 

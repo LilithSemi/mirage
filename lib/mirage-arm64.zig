@@ -16,6 +16,9 @@ pub const registers = @import("mirage-arm64/registers.zig");
 pub const Register = registers.Register;
 pub const enter = @import("mirage-arm64/enter.zig").enter;
 
+/// The register a power call is answered in: PSCI returns its result in the first argument register.
+pub const psci_result: Register = .x0;
+
 /// Whether this architecture has a power interface the VMM answers. arm does; the run
 /// loop routes the power and timer exits through here.
 pub const has_power = true;
