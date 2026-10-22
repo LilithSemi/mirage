@@ -238,6 +238,8 @@ pub fn build(b: *std.Build) void {
         const jit = add.lib("mirage-jit", &.{
             .{ .name = "mirage-device", .module = device },
             .{ .name = "mirage-memory", .module = memory },
+            .{ .name = "mirage-backend", .module = backend },
+            .{ .name = "mirage-arm64", .module = arm64 },
             .{ .name = "vulcan-ir", .module = vulcan.module("vulcan-ir") },
             .{ .name = "vulcan-opt", .module = vulcan.module("vulcan-opt") },
             .{ .name = "vulcan-target", .module = vulcan.module("vulcan-target") },
