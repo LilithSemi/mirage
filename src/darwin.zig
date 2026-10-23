@@ -17,6 +17,7 @@ const device = @import("mirage-device");
 const netmod = @import("mirage-net");
 const sessionmod = @import("mirage-session");
 const fsmod = @import("mirage-fs");
+const jit = @import("mirage-jit");
 const Options = @import("Options.zig");
 const GuestMemory = @import("mirage-memory").GuestMemory;
 const attest = @import("mirage-attest");
@@ -388,30 +389,39 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     // this, so the card a guest sees is the card the caller wrote and nothing else.
     const shape = if (wanted) |each| try each.glacier() else device.Glacier.Build.prototype;
 
-    const fabric = if (wanted != null)
-        try gpa.alloc(u8, @intCast(shape.fabricSize()))
+    // The fabric and the scratch are aligned to a word, because an atomic a kernel does against
+    // either reads and writes a whole word at once, which a host cannot do through a pointer it
+    // holds unaligned. A run with no card asks for nothing and frees nothing.
+    const fabric = try gpa.alignedAlloc(u8, .fromByteUnits(4), if (wanted != null)
+        @intCast(shape.fabricSize())
     else
-        @as([]u8, &.{});
-    defer if (wanted != null) gpa.free(fabric);
-    if (wanted != null) @memset(fabric, 0);
+        0);
+    defer gpa.free(fabric);
+    @memset(fabric, 0);
 
     // The core's instruction aperture and the private scratch its warps spill into. Neither is
     // fabric: nothing on the bus reaches the scratch, and the aperture answers only the core's own
     // window.
-    const program = if (wanted != null)
-        try gpa.alloc(u32, shape.programWords())
+    const program = try gpa.alloc(u32, if (wanted != null) shape.programWords() else 0);
+    defer gpa.free(program);
+    const scratch = try gpa.alignedAlloc(u8, .fromByteUnits(4), if (wanted != null)
+        shape.scratchBytes()
     else
-        @as([]u32, &.{});
-    defer if (wanted != null) gpa.free(program);
-    const scratch = if (wanted != null)
-        try gpa.alloc(u8, shape.scratchBytes())
-    else
-        @as([]u8, &.{});
-    defer if (wanted != null) gpa.free(scratch);
-    if (wanted != null) {
-        @memset(program, 0);
-        @memset(scratch, 0);
-    }
+        0);
+    defer gpa.free(scratch);
+    @memset(program, 0);
+    @memset(scratch, 0);
+
+    // Whoever runs the words of a kernel, where the card has a core to run them. Declared before
+    // the card, so the warps are stopped before the code they are inside goes away.
+    var runner: ?jit.Glacier = if (wanted != null and shape.core != null) try .init(gpa, .{
+        .fabric = fabric,
+        .fabric_at = shape.window.at,
+        .scratch = scratch,
+        .scratch_at = shape.scratchAt(),
+        .warps = shape.core.?.warps,
+    }) else null;
+    defer if (runner) |*each| each.deinit();
 
     const option_rom: []const u8 = if (wanted_rom) |path|
         try cwd.readFileAlloc(io, path, gpa, file_limit)
@@ -424,6 +434,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         .fabric = fabric,
         .program = program,
         .scratch = scratch,
+        .engine = if (runner) |*each| each.engine(io) else null,
+        .room = if (runner) |each| each.room else &.{},
         .rom = option_rom,
     });
     // A core runs its warps on threads of their own, so the card has to be stopped before the
@@ -595,6 +607,13 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     }
     if (gic.dropped != 0) try say.print("{d} interrupts were dropped\n", .{gic.dropped});
     if (bus.unmapped != 0) try say.print("{d} guest accesses matched no device\n", .{bus.unmapped});
+    // A kernel this host could not compile reads to a guest like a kernel that faulted, so the
+    // difference is said here. The vector set and the float set are what reach it today.
+    if (runner) |each| {
+        if (each.refused != 0) {
+            try say.print("glacier: {d} kernels used words this host cannot run\n", .{each.refused});
+        }
+    }
     if (options.nat) {
         try say.print("nat: {d} datagrams out, {d} back, {d} in flight\n", .{ nat.sent, nat.received, nat.inFlight() });
         if (nat.streams_opened != 0) try say.print("nat: {d} connections carried\n", .{nat.streams_opened});

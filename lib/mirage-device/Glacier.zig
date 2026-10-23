@@ -370,6 +370,15 @@ pub const Build = struct {
         return @as(usize, shape.warps) * shape.scratch_per_warp;
     }
 
+    /// Where the private scratch is reported, which is the first address past the fabric.
+    ///
+    /// A board carves the scratch out of the top of its dram, which the window does not cover, so
+    /// an address past the fabric is where the hardware keeps it and nothing on the window can
+    /// reach it. A kernel reads this from `mscratch` rather than assuming it.
+    pub fn scratchAt(self: Build) u64 {
+        return self.window.at + self.fabricSize();
+    }
+
     /// The memory this build has left over: the window above the frame buffer, to the page. A
     /// build whose mode fills the window has none, and neither has one whose frame buffer the
     /// window does not reach.
@@ -396,6 +405,10 @@ pub const Build = struct {
         scratch: []u8 = &.{},
         rom: []const u8 = &.{},
         watching: ?Watcher = null,
+        /// Whoever runs the words of a kernel, and the room it made for the state every warp of it
+        /// keeps. A card with no engine answers its registers and runs nothing.
+        engine: ?Core.Engine = null,
+        room: []u8 = &.{},
     };
 
     /// The card this build describes.
@@ -414,6 +427,8 @@ pub const Build = struct {
                 .shape = shape,
                 .program = parts.program,
                 .scratch = parts.scratch,
+                .engine = parts.engine,
+                .room = parts.room,
             } else null,
             .core_at = self.core_at,
             .rom = parts.rom,
