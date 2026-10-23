@@ -227,6 +227,22 @@ pub fn build(b: *std.Build) void {
     // The runner itself, for whichever hypervisor this system has. Which one that is, is decided
     // inside `src/main.zig` and nowhere else.
     if (has_os) {
+        // Whoever runs the words of a kernel. Compiling them for this cpu is a compiler's work, so
+        // Vulcan does it, and this edge is why the models carry a seam instead of a decoder. Only a
+        // hosted build takes it: a build with no operating system under it has no threads to run a
+        // warp on and nowhere to map code it compiled.
+        const vulcan = b.dependency("vulcan", .{
+            .target = target,
+            .optimize = optimize,
+        });
+        const jit = add.lib("mirage-jit", &.{
+            .{ .name = "mirage-device", .module = device },
+            .{ .name = "mirage-memory", .module = memory },
+            .{ .name = "vulcan-ir", .module = vulcan.module("vulcan-ir") },
+            .{ .name = "vulcan-opt", .module = vulcan.module("vulcan-opt") },
+            .{ .name = "vulcan-target", .module = vulcan.module("vulcan-target") },
+        });
+
         const mirage = b.addExecutable(.{
             .name = "mirage",
             .root_module = b.createModule(.{
@@ -245,10 +261,28 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "mirage-attest", .module = attest },
                     .{ .name = "mirage-session", .module = session },
                     .{ .name = "mirage-fs", .module = filesystem },
+                    .{ .name = "mirage-jit", .module = jit },
                 },
             }),
         });
         b.installArtifact(mirage);
+
+        // What a caller may ask for, held to the same gate as everything else. The runner is a
+        // program and not a library, so its own tests need naming here or they never run.
+        const option_tests = b.addTest(.{
+            .name = "options",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/Options.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "mirage-device", .module = device }},
+            }),
+        });
+        const run_option_tests = b.addRunArtifact(option_tests);
+        // Built for whichever target was asked for, so let Zig decide whether this machine can run
+        // the binary. The analysis happened either way.
+        run_option_tests.skip_foreign_checks = true;
+        test_step.dependOn(&run_option_tests.step);
 
         // A session as a caller holds it: the runner is a program this starts, so the gate drives
         // the same two processes a harness would rather than a loop of its own.
@@ -329,6 +363,9 @@ pub fn build(b: *std.Build) void {
         // And a glacier card behind it, so the guest sizes real regions and firmware places them.
         const glacier_on = b.option(bool, "glacier", "Put a glacier card behind the bridge") orelse false;
         boot_options.addOption(bool, "glacier", glacier_on);
+        // And which card, in the same settings the runner takes, so one gate covers any board.
+        const glacier_card = b.option([]const u8, "glacier-card", "The card, as --device writes one") orelse "";
+        boot_options.addOption([]const u8, "glacier_card", glacier_card);
         // Whether the guest is offered a directory on this machine to mount. Needs a kernel with the
         // filesystem driver built in, which the default kernel here does not have.
         boot_options.addOption(bool, "share", share_on);

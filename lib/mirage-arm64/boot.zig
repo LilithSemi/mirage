@@ -152,6 +152,10 @@ pub const Config = struct {
     tpm: bool = false,
     /// Whether the guest is told it has a pci host bridge.
     pci: bool = false,
+    /// Where firmware keeps its variables, for a launch that starts firmware. Without it the tree
+    /// names one bank of flash, firmware passes over it as its own image, and finds nowhere to
+    /// put them.
+    vars: ?Range = null,
     ram_base: u64,
     ram_size: u64,
     cpus: u32,
@@ -382,6 +386,13 @@ fn prepareFirmware(
         .share = config.share,
         .tpm = config.tpm,
         .pci = config.pci,
+        // Firmware reads this device before it reaches any of its own code, so a machine that
+        // starts firmware has one and a machine that starts a kernel does not.
+        .fw_cfg = true,
+        .flash = if (config.vars) |store| .{
+            .code = .{ .start = where.at, .end = where.at + where.len },
+            .vars = .{ .start = store.start, .end = store.end },
+        } else null,
     };
 
     // What this launch measures, in order. One list, so what goes into the length and what goes into

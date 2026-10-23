@@ -647,6 +647,9 @@ pub const Config = struct {
     tpm: bool = false,
     /// Whether the guest is told it has a pci host bridge, which it learns of from ACPI here.
     pci: bool = false,
+    /// Where firmware keeps its variables. Taken and ignored: firmware on this architecture is
+    /// refused before a launch is built, so there is nothing here to keep them for.
+    vars: ?Range = null,
     ram_base: u64,
     ram_size: u64,
     cpus: u32,

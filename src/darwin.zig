@@ -17,6 +17,7 @@ const device = @import("mirage-device");
 const netmod = @import("mirage-net");
 const sessionmod = @import("mirage-session");
 const fsmod = @import("mirage-fs");
+const jit = @import("mirage-jit");
 const Options = @import("Options.zig");
 const GuestMemory = @import("mirage-memory").GuestMemory;
 const attest = @import("mirage-attest");
@@ -160,38 +161,44 @@ fn armDeadline(seconds: u64) void {
 }
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []const [:0]const u8) !void {
+    // Two streams, because they have two readers. What the guest says goes out as the guest said
+    // it, with nothing of this program's mixed in, so a caller may keep it or pipe it somewhere
+    // and get only the guest. What this program has to say about the run goes to the other one.
+    var said_room: [4096]u8 = undefined;
+    var said_file = std.Io.File.stderr().writer(io, &said_room);
+    const say = &said_file.interface;
+    defer say.flush() catch {};
+
     if (args.len == 0) {
-        try out.writeAll(usage);
+        try say.writeAll(usage);
         return;
     }
 
     const options = Options.parse(args) catch |err| {
-        try out.print("bad arguments: {t}\n\n", .{err});
-        try out.writeAll(usage);
+        try say.print("bad arguments: {t}\n\n", .{err});
+        try say.writeAll(usage);
         return;
     };
-    if (try options.complain(out, arm64.fdt.cpusThatFit(ram_base))) return;
+    if (try options.complain(say, arm64.fdt.cpusThatFit(ram_base))) return;
     if (options.restore != null or options.save != null) {
-        try out.writeAll("moving a guest is not written for this hypervisor yet\n");
+        try say.writeAll("moving a guest is not written for this hypervisor yet\n");
         return;
     }
     if (options.firmware != null) {
-        try out.writeAll("starting firmware is not written for this hypervisor yet\n");
+        try say.writeAll("starting firmware is not written for this hypervisor yet\n");
         return;
     }
     if (options.cpus > device.Gicv2.max_cpus) {
-        try out.print("a guest here gets a version 2 controller, which has no interface past {d} cpus\n", .{
+        try say.print("a guest here gets a version 2 controller, which has no interface past {d} cpus\n", .{
             device.Gicv2.max_cpus,
         });
         return;
     }
 
-    const began = std.Io.Clock.awake.now(io).nanoseconds;
     const cwd: std.Io.Dir = .cwd();
 
     const kernel = try cwd.readFileAlloc(io, options.kernel, gpa, file_limit);
     defer gpa.free(kernel);
-    const read_at = std.Io.Clock.awake.now(io).nanoseconds;
 
     const initrd = if (options.initrd) |path| try cwd.readFileAlloc(io, path, gpa, file_limit) else null;
     defer if (initrd) |bytes| gpa.free(bytes);
@@ -200,7 +207,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
 
     var machine = backend.hvf.Machine.create(gpa, options.cpus) catch |err| {
         // Either the framework is not there, or this process was not signed to be allowed a guest.
-        try out.print("no hypervisor: {t}\n", .{err});
+        try say.print("no hypervisor: {t}\n", .{err});
         return;
     };
     defer machine.deinit();
@@ -217,13 +224,13 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         -1,
         0,
     ) catch |err| {
-        try out.print("cannot set aside {d}MB for the guest: {t}\n", .{ ram_size / (1024 * 1024), err });
+        try say.print("cannot set aside {d}MB for the guest: {t}\n", .{ ram_size / (1024 * 1024), err });
         return;
     };
     defer std.posix.munmap(pages);
 
     machine.map(pages, ram_base) catch |err| {
-        try out.print("this hypervisor will not take that memory: {t}\n", .{err});
+        try say.print("this hypervisor will not take that memory: {t}\n", .{err});
         return;
     };
 
@@ -257,17 +264,17 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         .pci = options.pci,
         .share = options.share_count > 0,
     });
-    const ready_at = std.Io.Clock.awake.now(io).nanoseconds;
 
-    const root = manifest.root();
-    try out.print("launch measured, root {x}\n", .{root[0..8]});
+    // The parts that were measured, in the order they went in, which is part of the measurement.
+    // On the guest's stream because it is the answer to the asking rather than a fault.
     if (options.show_manifest) {
         for (manifest.entries.items, 0..) |entry, index| {
             try out.print("  {d}. {t} {x}\n", .{ index + 1, entry.tag, entry.digest });
         }
-        try out.print("  root {x}\n", .{root});
+        try out.print("  root {x}\n", .{manifest.root()});
     }
     try out.flush();
+    try say.flush();
 
     var gic: device.Gicv2 = .{ .cpus = options.cpus };
     const controller_devices = gic.devices(arm64.fdt.gicd_base, arm64.fdt.gicv2_cpu_base);
@@ -293,7 +300,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     const held: ?*sessionmod.Server = if (options.session) |path| room: {
         const one = try gpa.create(sessionmod.Server);
         one.* = sessionmod.Server.listen(path) catch {
-            try out.print("cannot hold a session at {s}\n", .{path});
+            try say.print("cannot hold a session at {s}\n", .{path});
             return;
         };
         break :room one;
@@ -325,7 +332,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     const sharing = options.share_count > 0;
     var offered: ?fsmod.Export = if (sharing)
         fsmod.Export.init(gpa, io) catch {
-            try out.writeAll("no room to offer a directory\n");
+            try say.writeAll("no room to offer a directory\n");
             return;
         }
     else
@@ -334,7 +341,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     if (offered) |*one| {
         for (options.shares[0..options.share_count]) |each| {
             one.offer(each.name, each.at, each.writable) catch {
-                try out.print("cannot offer {s}\n", .{each.name});
+                try say.print("cannot offer {s}\n", .{each.name});
                 return;
             };
         }
@@ -356,7 +363,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     var chip_socket: ?netmod.Socket = null;
     if (options.tpm) |path| {
         chip_socket = netmod.Socket.connect(io, path) catch |err| {
-            try out.print("cannot reach the security chip at {s}: {t}\n", .{ path, err });
+            try say.print("cannot reach the security chip at {s}: {t}\n", .{ path, err });
             return;
         };
     }
@@ -374,37 +381,73 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     // one bridge. They are separate devices on the bus because they are separate spaces.
     // The card's own memory: the window the guest reaches directly, and a page past it for the
     // block that describes the display.
-    const fabric = if (options.glacier)
-        try gpa.alloc(u8, device.Glacier.prototype_fabric_size)
-    else
-        @as([]u8, &.{});
-    defer if (options.glacier) gpa.free(fabric);
-    if (options.glacier) @memset(fabric, 0);
+    // The card the caller asked for, if they asked for one. A name and its settings, read where
+    // the device is made rather than turned into fields of its own.
+    const wanted = options.asked("glacier-pci");
+    const wanted_rom = if (wanted) |each| each.romFile() else null;
+    // The shape of the card the caller asked for. Every address the card answers with comes from
+    // this, so the card a guest sees is the card the caller wrote and nothing else.
+    const shape = if (wanted) |each| try each.glacier() else device.Glacier.Build.prototype;
 
-    const option_rom: []const u8 = if (options.glacier_rom) |path|
+    // The fabric and the scratch are aligned to a word, because an atomic a kernel does against
+    // either reads and writes a whole word at once, which a host cannot do through a pointer it
+    // holds unaligned. A run with no card asks for nothing and frees nothing.
+    const fabric = try gpa.alignedAlloc(u8, .fromByteUnits(4), if (wanted != null)
+        @intCast(shape.fabricSize())
+    else
+        0);
+    defer gpa.free(fabric);
+    @memset(fabric, 0);
+
+    // The core's instruction aperture and the private scratch its warps spill into. Neither is
+    // fabric: nothing on the bus reaches the scratch, and the aperture answers only the core's own
+    // window.
+    const program = try gpa.alloc(u32, if (wanted != null) shape.programWords() else 0);
+    defer gpa.free(program);
+    const scratch = try gpa.alignedAlloc(u8, .fromByteUnits(4), if (wanted != null)
+        shape.scratchBytes()
+    else
+        0);
+    defer gpa.free(scratch);
+    @memset(program, 0);
+    @memset(scratch, 0);
+
+    // Whoever runs the words of a kernel, where the card has a core to run them. Declared before
+    // the card, so the warps are stopped before the code they are inside goes away.
+    var runner: ?jit.Glacier = if (wanted != null and shape.core != null) try .init(gpa, .{
+        .fabric = fabric,
+        .fabric_at = shape.window.at,
+        .scratch = scratch,
+        .scratch_at = shape.scratchAt(),
+        .warps = shape.core.?.warps,
+    }) else null;
+    defer if (runner) |*each| each.deinit();
+
+    const option_rom: []const u8 = if (wanted_rom) |path|
         try cwd.readFileAlloc(io, path, gpa, file_limit)
     else
         &.{};
-    defer if (options.glacier_rom != null) gpa.free(@constCast(option_rom));
+    defer if (wanted_rom != null) gpa.free(@constCast(option_rom));
 
-    var gpu: device.Glacier = .{
+    var gpu: device.Glacier = shape.card(.{
         .memory = &memory,
         .fabric = fabric,
-        .fabric_at = device.Glacier.prototype_window_at,
-        .aperture = .{
-            .at = device.Glacier.prototype_window_at,
-            .len = device.Glacier.prototype_window_size,
-        },
-        .display = device.Glacier.prototype_display,
-        .display_at = device.Glacier.prototype_display_at,
+        .program = program,
+        .scratch = scratch,
+        .engine = if (runner) |*each| each.engine(io) else null,
+        .room = if (runner) |each| each.room else &.{},
         .rom = option_rom,
-    };
-    if (options.glacier) std.debug.assert(gpu.covers());
+    });
+    // A core runs its warps on threads of their own, so the card has to be stopped before the
+    // memory they write into goes away. Declared here, which is after the memory, so it runs
+    // before it.
+    defer if (gpu.core) |*each| each.quiet();
+    if (wanted != null) std.debug.assert(gpu.covers());
 
     var bridge: device.PciHost = .{};
     var bridge_memory: device.PciHost.Window = .{ .host = &bridge, .at = arm64.fdt.pci_memory_base };
     var bridge_memory64: device.PciHost.Window = .{ .host = &bridge, .at = arm64.fdt.pci_memory64_base };
-    if (options.glacier) std.debug.assert(bridge.add(gpu.function(.{ .device = 1 })));
+    if (wanted != null) std.debug.assert(bridge.add(gpu.function(.{ .device = 1 })));
     if (options.pci) {
         attached.add(bridge.device(arm64.fdt.ecam_base));
         attached.add(bridge_memory.device(arm64.fdt.pci_memory_size));
@@ -423,7 +466,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
 
     const hv = machine.backend();
     const id = hv.addVcpu() catch |err| {
-        try out.print("cannot make a cpu: {t}\n", .{err});
+        try say.print("cannot make a cpu: {t}\n", .{err});
         return;
     };
     try core.Launch.enter(hv, id, layout);
@@ -432,10 +475,10 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     if (chip_socket) |*link| {
         var folding: attest.Chain.Session(netmod.Socket) = .{ .transport = link };
         expected_chain = folding.measure(&manifest, launch_register) catch |err| {
-            try out.print("the chip would not take the launch: {t}, code {x}\n", .{ err, folding.refusal });
+            try say.print("the chip would not take the launch: {t}, code {x}\n", .{ err, folding.refusal });
             return;
         };
-        try out.print("launch folded into register {d}, which now holds {x}\n", .{
+        try say.print("launch folded into register {d}, which now holds {x}\n", .{
             launch_register,
             expected_chain.?[0..8],
         });
@@ -507,13 +550,14 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
 
     const reason = core.Launch.run(hv, id, driving) catch |err| stopped: {
         try out.flush();
+        try say.flush();
         // Running out of exits is how a caller stops a guest on purpose. It is not a fault, so the
         // run carries on to the writing below, the same as it does on the other hypervisor.
         if (err == error.ExitsExhausted) {
-            try out.print("\nthe guest used all {d} exits it was given\n", .{options.exits});
+            try say.print("the guest used all {d} exits it was given\n", .{options.exits});
             break :stopped core.Launch.Reason.stopped;
         }
-        try out.print("\nthe guest stopped badly: {t}, the framework said {?}\n", .{ err, machine.fault });
+        try say.print("the guest stopped badly: {t}, the framework said {?}\n", .{ err, machine.fault });
         // Every other CPU stops here too. A fault is not a reason to return while another CPU is
         // still inside the hypervisor holding pointers into this frame.
         stopOthers(threads[0..started], &end);
@@ -535,50 +579,52 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         one.close(&channel);
     }
 
-    const stopped_at = std.Io.Clock.awake.now(io).nanoseconds;
     try out.flush();
+    try say.flush();
 
-    try out.print("\ntook {d}ms to read {d}MB of kernel, {d}ms to measure and place it, {d}ms running, built {t}\n", .{
-        @divTrunc(read_at - began, std.time.ns_per_ms),
-        kernel.len / (1024 * 1024),
-        @divTrunc(ready_at - read_at, std.time.ns_per_ms),
-        @divTrunc(stopped_at - ready_at, std.time.ns_per_ms),
-        @import("builtin").mode,
-    });
     if (end.timed_out) {
-        try out.print("\nthe guest ran out of time after {?d} seconds\n", .{options.seconds});
+        try say.print("the guest ran out of time after {?d} seconds\n", .{options.seconds});
     } else {
-        try out.print("\nthe guest stopped: {t}\n", .{reason});
+        // A guest that powered itself off did what it was asked to. Anything else ended for a
+        // reason worth saying.
+        if (reason != .shutdown) try say.print("the guest stopped: {t}\n", .{reason});
     }
     if (offered) |one| {
-        try out.print("shares: {d} offered, {d} names handed over, {d}MB read, {d} refused\n", .{
+        try say.print("shares: {d} offered, {d} names handed over, {d}MB read, {d} refused\n", .{
             options.share_count,
             one.named + one.looked_up,
             one.read_bytes / (1024 * 1024),
             one.refused,
         });
         if (one.turned_away != 0) {
-            try out.print("{d} names would have left a shared directory\n", .{one.turned_away});
+            try say.print("{d} names would have left a shared directory\n", .{one.turned_away});
         }
         // What the guest finished with. A guest held up for a session makes and forgets files for hours,
         // and a number here that stays at zero while it works means this side is holding all of them.
         if (one.let_go_nodes != 0) {
-            try out.print("share: {d} files the guest finished with\n", .{one.let_go_nodes});
+            try say.print("share: {d} files the guest finished with\n", .{one.let_go_nodes});
         }
     }
-    if (gic.dropped != 0) try out.print("{d} interrupts were dropped\n", .{gic.dropped});
-    if (bus.unmapped != 0) try out.print("{d} guest accesses matched no device\n", .{bus.unmapped});
+    if (gic.dropped != 0) try say.print("{d} interrupts were dropped\n", .{gic.dropped});
+    if (bus.unmapped != 0) try say.print("{d} guest accesses matched no device\n", .{bus.unmapped});
+    // A kernel this host could not compile reads to a guest like a kernel that faulted, so the
+    // difference is said here. The vector set and the float set are what reach it today.
+    if (runner) |each| {
+        if (each.refused != 0) {
+            try say.print("glacier: {d} kernels used words this host cannot run\n", .{each.refused});
+        }
+    }
     if (options.nat) {
-        try out.print("nat: {d} datagrams out, {d} back, {d} in flight\n", .{ nat.sent, nat.received, nat.inFlight() });
-        if (nat.streams_opened != 0) try out.print("nat: {d} connections carried\n", .{nat.streams_opened});
+        try say.print("nat: {d} datagrams out, {d} back, {d} in flight\n", .{ nat.sent, nat.received, nat.inFlight() });
+        if (nat.streams_opened != 0) try say.print("nat: {d} connections carried\n", .{nat.streams_opened});
     }
     if (held) |one| {
-        try out.print("session: {d} streams handed out, {d} asked for and not given\n", .{
+        try say.print("session: {d} streams handed out, {d} asked for and not given\n", .{
             one.handed_out,
             one.turned_away,
         });
         if (one.asked_about != 0 or one.turned_back != 0) {
-            try out.print("session: asked about {d} names, {d} allowed, {d} refused, {d} it never asked for\n", .{
+            try say.print("session: asked about {d} names, {d} allowed, {d} refused, {d} it never asked for\n", .{
                 one.asked_about,
                 one.allowed,
                 one.denied,
@@ -587,12 +633,12 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         }
     }
     if (options.tpm != null) {
-        try out.print("security chip answered {d} commands\n", .{end.chip_relay.answered});
+        try say.print("security chip answered {d} commands\n", .{end.chip_relay.answered});
         if (end.chain_agreed) |agreed| {
             if (agreed) {
-                try out.writeAll("the guest agrees about what started it\n");
+                try say.writeAll("the guest agrees about what started it\n");
             } else {
-                try out.writeAll("the guest disagrees about what started it\n");
+                try say.writeAll("the guest disagrees about what started it\n");
             }
         }
     }

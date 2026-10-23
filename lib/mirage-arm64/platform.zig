@@ -19,6 +19,9 @@ pub const Device = struct {
 pub const serial: Device = .{ .addr = 0x0900_0000, .intid = fdt.uart_intid };
 pub const fs: Device = .{ .addr = fdt.fs_base, .intid = fdt.fs_intid };
 pub const tpm: Device = .{ .addr = fdt.tpm_base, .intid = 0 };
+/// The firmware configuration device, where this machine has one. Firmware reads it before it
+/// reaches any of its own code, and a machine that cannot describe one to a guest has none.
+pub const fw_cfg: ?Device = .{ .addr = fdt.fw_cfg_base, .intid = 0 };
 pub const virtio: Device = .{ .addr = fdt.virtio_base, .intid = fdt.virtio_intid };
 pub const vsock: Device = .{ .addr = fdt.vsock_base, .intid = fdt.vsock_intid };
 pub const balloon: Device = .{ .addr = fdt.balloon_base, .intid = fdt.balloon_intid };

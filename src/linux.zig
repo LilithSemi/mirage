@@ -9,7 +9,10 @@ const image = @import("mirage-image");
 const netmod = @import("mirage-net");
 const sessionmod = @import("mirage-session");
 const fsmod = @import("mirage-fs");
+const jit = @import("mirage-jit");
 const Options = @import("Options.zig");
+const Trace = @import("Trace.zig");
+const Screendump = @import("Screendump.zig");
 const GuestMemory = @import("mirage-memory").GuestMemory;
 const attest = @import("mirage-attest");
 const Manifest = attest.Manifest;
@@ -29,6 +32,31 @@ const usage = Options.usage;
 /// Where the launch is folded in. A register the guest can add to says nothing about what started
 /// it, so this one is written before the guest runs and never from inside.
 const launch_register = 0;
+
+/// Where a guest that never came back was, and what it last faulted on.
+///
+/// A guest that faults inside itself never leaves the hypervisor: the exception is taken to its own
+/// handler, and if that handler spins then the only account of it is in the registers. The syndrome
+/// is not cleared between exceptions, so it reads as the last one whether or not that is why the
+/// guest stopped, which is why this says "last" rather than "the".
+fn sayWhereItWas(say: *std.Io.Writer, hv: backend.Backend, id: backend.Backend.VcpuId) !void {
+    if (@import("builtin").cpu.arch != .aarch64) return;
+
+    const pc = hv.getRegister(id, .pc) catch return;
+    const esr = hv.getRegister(id, .esr) catch return;
+    const far = hv.getRegister(id, .far) catch return;
+    if (esr == 0) {
+        try say.print("cpu 0 was at {x}, having taken no exception\n", .{pc});
+        return;
+    }
+
+    try say.print("cpu 0 was at {x}, last exception class {x} syndrome {x} at {x}\n", .{
+        pc,
+        arch.esr.class(esr),
+        esr,
+        far,
+    });
+}
 
 /// Where firmware is placed. A machine like this one has its read only memory at the bottom of the
 /// address space, and firmware built for one starts there.
@@ -233,33 +261,37 @@ fn saveTo(
 }
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []const [:0]const u8) !void {
+    // What the guest says is the whole of the first stream, so a caller may keep it or pipe it
+    // somewhere and get the guest and nothing else. The second carries faults: a guest that would
+    // not start, a device that answered nothing, a run that ended without doing what it was run
+    // to do. A run that works says nothing on it, and what a run counted belongs in a trace rather
+    // than in either stream.
+    var said_room: [4096]u8 = undefined;
+    var said_file = std.Io.File.stderr().writer(io, &said_room);
+    const say = &said_file.interface;
+    defer say.flush() catch {};
+
     if (@import("builtin").os.tag != .linux) {
-        try out.writeAll("run only knows how to use KVM so far\n");
+        try say.writeAll("run only knows how to use KVM so far\n");
         return;
     }
 
     const options = Options.parse(args) catch |err| {
-        try out.print("bad arguments: {t}\n\n", .{err});
-        try out.writeAll(usage);
+        try say.print("bad arguments: {t}\n\n", .{err});
+        try say.writeAll(usage);
         return;
     };
-    if (try options.complain(out, arch.platform.cpusThatFit(ram_base))) return;
+    if (try options.complain(say, arch.platform.cpusThatFit(ram_base))) return;
     if (options.pci and arch.platform.pci == null) {
-        try out.writeAll("a pci bridge on this architecture is not described to a guest yet\n");
+        try say.writeAll("a pci bridge on this architecture is not described to a guest yet\n");
         return;
     }
     // Where firmware put each region lives in the bridge and not in a snapshot, so a guest that
     // came back would believe its card is somewhere the bridge no longer answers.
     if (options.pci and (options.save != null or options.restore != null)) {
-        try out.writeAll("a bridge is not in a snapshot, so a guest with one cannot be moved yet\n");
+        try say.writeAll("a bridge is not in a snapshot, so a guest with one cannot be moved yet\n");
         return;
     }
-
-    // A harness starts a guest for every session, so where the time goes before the guest
-    // runs matters as much as how fast the guest boots.
-    const began = std.Io.Clock.awake.now(io).nanoseconds;
-    var read_at: i96 = began;
-    var ready_at: i96 = began;
 
     const cwd: std.Io.Dir = .cwd();
 
@@ -272,7 +304,6 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     else
         &.{};
     defer if (kernel.len > 0) gpa.free(kernel);
-    read_at = std.Io.Clock.awake.now(io).nanoseconds;
 
     const initrd = if (options.restore != null) null else if (options.initrd) |path|
         try cwd.readFileAlloc(io, path, gpa, file_limit)
@@ -299,7 +330,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         // How many CPUs a guest may have is the kernel's answer, so a refusal is reported as the
         // machine's and not as a limit of this program.
         error.TooManyVcpus => {
-            try out.print("this machine will not give a guest {d} cpus\n", .{options.cpus});
+            try say.print("this machine will not give a guest {d} cpus\n", .{options.cpus});
             return;
         },
         else => return err,
@@ -317,7 +348,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     }) else starts_with;
 
     if (options.limit != null) {
-        try out.print("guest starts with {d}MB and may grow to {d}MB\n", .{
+        try say.print("guest starts with {d}MB and may grow to {d}MB\n", .{
             starts_with / (1024 * 1024),
             ram_size / (1024 * 1024),
         });
@@ -332,6 +363,22 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         try machine.vm.addMemory(options.firmware_at, firmware_room, .shared)
     else
         null;
+
+    // Where firmware keeps its variables: a second bank of flash, directly above the image. Not
+    // memory: firmware erases and programs it by writing commands to it and waiting for a status
+    // register to answer, and memory that took those commands as data would leave it reading its
+    // own command back forever.
+    const vars = if (options.firmware_vars) |path|
+        try cwd.readFileAlloc(io, path, gpa, file_limit)
+    else
+        null;
+    defer if (vars) |bytes| gpa.free(bytes);
+
+    const vars_at = options.firmware_at + firmware_room;
+    // As much of the store as firmware keeps anything in. It holds three regions there, a quarter
+    // of a megabyte each, and reads nothing above them: a bank declared as large as the file is
+    // sixty four megabytes of window that nobody reads and every read of which leaves the guest.
+    const vars_room = if (vars) |bytes| @min(std.mem.alignForward(u64, bytes.len, 64 * 1024), 1024 * 1024) else 0;
 
     var regions: [2]GuestMemory.Region = undefined;
     regions[0] = region;
@@ -375,7 +422,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     var restored_queues: [core.Snapshot.max_queues]core.Snapshot.QueueState = undefined;
     const came_back: ?core.Snapshot.Parts = if (resuming) |bytes|
         core.Snapshot.parse(bytes, &restored_queues) catch |err| {
-            try out.print("that is not a snapshot this can read: {t}\n", .{err});
+            try say.print("that is not a snapshot this can read: {t}\n", .{err});
             return;
         }
     else
@@ -383,7 +430,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
 
     if (came_back) |parts| {
         if (parts.memory.len > ram_size) {
-            try out.print("the snapshot holds {d}MB of memory and this guest has {d}MB\n", .{
+            try say.print("the snapshot holds {d}MB of memory and this guest has {d}MB\n", .{
                 parts.memory.len / (1024 * 1024),
                 ram_size / (1024 * 1024),
             });
@@ -394,7 +441,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         // A machine has to come back with the CPUs it went away with. One with fewer would leave a
         // CPU's registers unread, and one with more would start a CPU from nothing.
         if (parts.cpus != options.cpus) {
-            try out.print("the snapshot holds {d} cpus and this guest was given {d}\n", .{
+            try say.print("the snapshot holds {d} cpus and this guest was given {d}\n", .{
                 parts.cpus,
                 options.cpus,
             });
@@ -417,7 +464,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         }
 
         const attributes = try gic.load(parts.controller);
-        try out.print("resumed {d} registers across {d} cpus and {d} controller attributes from {s}\n", .{
+        try say.print("resumed {d} registers across {d} cpus and {d} controller attributes from {s}\n", .{
             put,
             parts.cpus,
             attributes,
@@ -426,6 +473,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     }
 
     var launch_config: core.Launch.Config = .{
+        .vars = if (vars != null) .{ .start = vars_at, .end = vars_at + vars_room } else null,
         .kind = if (options.firmware != null)
             .{ .firmware = .{ .at = options.firmware_at, .len = firmware_room } }
         else
@@ -458,7 +506,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     if (comptime @import("builtin").cpu.arch == .x86_64) {
         if (came_back == null and options.sev) {
             sev_dev = backend.kvm.Vm.openSev() orelse {
-                try out.print("sev needs /dev/sev, which this user cannot open\n", .{});
+                try say.print("sev needs /dev/sev, which this user cannot open\n", .{});
                 return error.SevUnavailable;
             };
             launch_config.sev_c_bit = arch.platform.hostCBit();
@@ -478,35 +526,32 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
                 try machine.sevUpdateData(region);
             } else {
                 if (try machine.sevSeal(region, &sev_measure_buf)) |got| {
-                    try out.print("sev launch sealed, measurement {d} bytes\n", .{got.len});
+                    try say.print("sev launch sealed, measurement {d} bytes\n", .{got.len});
                 }
             }
         }
     }
 
-    ready_at = std.Io.Clock.awake.now(io).nanoseconds;
-
-    if (came_back == null) {
-        const root = manifest.root();
-        try out.print("launch measured, root {x}\n", .{root[0..8]});
-
-        // The root says two launches differ. It does not say what they are, and a verifier needs
-        // that, so the parts are available on request in the order they went in. The order is part
-        // of the measurement: the same parts hashed in another order give another root.
-        if (options.show_manifest) {
-            for (manifest.entries.items, 0..) |entry, index| {
-                try out.print("  {d}. {t} {x}\n", .{ index + 1, entry.tag, entry.digest });
-            }
-            try out.print("  root {x}\n", .{root});
+    // The root says two launches differ. It does not say what they are, and a verifier needs that,
+    // so the parts go out in the order they went in, which is part of the measurement: the same
+    // parts hashed in another order give another root. Printed only when it was asked for, and on
+    // the guest's stream because it is the answer to the asking rather than a fault.
+    if (came_back == null and options.show_manifest) {
+        for (manifest.entries.items, 0..) |entry, index| {
+            try out.print("  {d}. {t} {x}\n", .{ index + 1, entry.tag, entry.digest });
         }
+        try out.print("  root {x}\n", .{manifest.root()});
     }
     try out.flush();
+    try say.flush();
 
     // The serial port. Where it sits and how the guest reaches it is the architecture's: a memory
     // mapped PL011 on arm, an I/O port 16550 on x86. The run loop is given a port bus only when the
     // serial is on one, because a bus with nothing on it still answers an access that matched nothing.
     const Serial = if (arch.platform.serial_is_port) device.Uart16550 else device.Pl011;
-    var serial: Serial = .{ .sink = out };
+    // What the guest has to print for the run to be over, where a caller named one. A test that
+    // knows what a working guest says waits for that rather than for a clock.
+    var serial: Serial = .{ .sink = out, .watch = options.stop_on orelse &.{} };
 
     var block: device.virtio.Block = undefined;
     if (disk) |bytes| block.init(bytes);
@@ -526,7 +571,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     const held: ?*sessionmod.Server = if (options.session) |path| room: {
         const one = try gpa.create(sessionmod.Server);
         one.* = sessionmod.Server.listen(path) catch {
-            try out.print("cannot hold a session at {s}\n", .{path});
+            try say.print("cannot hold a session at {s}\n", .{path});
             return;
         };
         break :room one;
@@ -552,11 +597,11 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         card.init(guest_mac);
         socket = switch (helper) {
             .path => |path| netmod.Socket.connect(io, path) catch |err| {
-                try out.print("cannot reach the network helper at {s}: {t}\n", .{ path, err });
+                try say.print("cannot reach the network helper at {s}: {t}\n", .{ path, err });
                 return;
             },
             .fd => |number| netmod.Socket.adopt(number) catch |err| {
-                try out.print("cannot use descriptor {d} for the network: {t}\n", .{ number, err });
+                try say.print("cannot use descriptor {d} for the network: {t}\n", .{ number, err });
                 return;
             },
         };
@@ -586,7 +631,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     const sharing = options.share_count > 0;
     var offered: ?fsmod.Export = if (sharing)
         fsmod.Export.init(gpa, io) catch {
-            try out.writeAll("no room to offer a directory\n");
+            try say.writeAll("no room to offer a directory\n");
             return;
         }
     else
@@ -595,7 +640,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     if (offered) |*one| {
         for (options.shares[0..options.share_count]) |each| {
             one.offer(each.name, each.at, each.writable) catch {
-                try out.print("cannot offer {s}\n", .{each.name});
+                try say.print("cannot offer {s}\n", .{each.name});
                 return;
             };
         }
@@ -617,7 +662,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     var chip_socket: ?netmod.Socket = null;
     if (options.tpm) |path| {
         chip_socket = netmod.Socket.connect(io, path) catch |err| {
-            try out.print("cannot reach the security chip at {s}: {t}\n", .{ path, err });
+            try say.print("cannot reach the security chip at {s}: {t}\n", .{ path, err });
             return;
         };
     }
@@ -641,6 +686,16 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         attached.addServed(shared_fs.device(platform.fs.addr), shared_fs.service(platform.fs.intid));
     }
     if (options.tpm != null) attached.add(chip.device(platform.tpm.addr));
+
+    // Firmware reads this before it reaches any of its own code. A guest booting a kernel is told
+    // of no such device and is given none.
+    var settings: device.FwCfg = .{};
+    if (options.firmware != null) {
+        if (platform.fw_cfg) |where| attached.add(settings.device(where.addr));
+    }
+
+    var store: device.NorFlash = .{ .store = if (vars) |bytes| bytes else &.{} };
+    if (vars != null) attached.add(store.device(vars_at, vars_room));
     // Config space says where a region is and the windows are the regions, so all three belong to
     // one bridge. They are separate devices on the bus because they are separate spaces.
     var bridge: device.PciHost = .{};
@@ -654,34 +709,92 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     };
     // The card's own memory. A region of the fabric rather than of the guest: the engine carries
     // words between the two, and the window lets the guest reach this much of it directly.
-    const fabric = if (options.glacier)
-        try gpa.alloc(u8, device.Glacier.prototype_fabric_size)
-    else
-        @as([]u8, &.{});
-    defer if (options.glacier) gpa.free(fabric);
-    if (options.glacier) @memset(fabric, 0);
+    // The card the caller asked for, if they asked for one. A name and its settings, read where
+    // the device is made rather than turned into fields of its own.
+    const wanted = options.asked("glacier-pci");
+    const wanted_rom = if (wanted) |each| each.romFile() else null;
+    // The shape of the card the caller asked for. Every address the card answers with comes from
+    // this, so the card a guest sees is the card the caller wrote and nothing else.
+    const shape = if (wanted) |each| try each.glacier() else device.Glacier.Build.prototype;
 
-    const option_rom: []const u8 = if (options.glacier_rom) |path|
+    // The fabric and the scratch are aligned to a word, because an atomic a kernel does against
+    // either reads and writes a whole word at once, which a host cannot do through a pointer it
+    // holds unaligned. A run with no card asks for nothing and frees nothing.
+    const fabric = try gpa.alignedAlloc(u8, .fromByteUnits(4), if (wanted != null)
+        @intCast(shape.fabricSize())
+    else
+        0);
+    defer gpa.free(fabric);
+    @memset(fabric, 0);
+
+    // The core's instruction aperture and the private scratch its warps spill into. Neither is
+    // fabric: nothing on the bus reaches the scratch, and the aperture answers only the core's own
+    // window.
+    const program = try gpa.alloc(u32, if (wanted != null) shape.programWords() else 0);
+    defer gpa.free(program);
+    const scratch = try gpa.alignedAlloc(u8, .fromByteUnits(4), if (wanted != null)
+        shape.scratchBytes()
+    else
+        0);
+    defer gpa.free(scratch);
+    @memset(program, 0);
+    @memset(scratch, 0);
+
+    // Whoever runs the words of a kernel, where the card has a core to run them. Declared before
+    // the card, so the warps are stopped before the code they are inside goes away.
+    var runner: ?jit.Glacier = if (wanted != null and shape.core != null) try .init(gpa, .{
+        .fabric = fabric,
+        .fabric_at = shape.window.at,
+        .scratch = scratch,
+        .scratch_at = shape.scratchAt(),
+        .warps = shape.core.?.warps,
+    }) else null;
+    defer if (runner) |*each| each.deinit();
+
+    const option_rom: []const u8 = if (wanted_rom) |path|
         try cwd.readFileAlloc(io, path, gpa, file_limit)
     else
         &.{};
-    defer if (options.glacier_rom != null) gpa.free(@constCast(option_rom));
+    defer if (wanted_rom != null) gpa.free(@constCast(option_rom));
 
-    var gpu: device.Glacier = .{
+    // Where what the devices did is written down, for a caller testing a driver. Opened before the
+    // guest runs so a device can be told about it as it is made.
+    var trace_file: ?std.Io.File = null;
+    var trace_room: [4096]u8 = undefined;
+    var trace_out: std.Io.File.Writer = undefined;
+    var trace: ?Trace = null;
+    if (options.trace) |path| {
+        trace_file = try cwd.createFile(io, path, .{});
+        trace_out = trace_file.?.writer(io, &trace_room);
+        trace = .{ .out = &trace_out.interface };
+        // What the guest says goes in the same file as what the devices did, so one reader has
+        // the whole account of a run rather than two halves of it.
+        serial.echo = trace.?.echo();
+    }
+    defer if (trace_file) |each| each.close(io);
+
+    // Where an access went nowhere is the other half of a driver's story, so the bridge writes
+    // into the same file the card does.
+    if (trace != null) bridge.watching = trace.?.bridgeWatcher();
+
+    var gpu: device.Glacier = shape.card(.{
         .memory = &memory,
+        .watching = if (trace != null) trace.?.cardWatcher() else null,
         .fabric = fabric,
-        .fabric_at = device.Glacier.prototype_window_at,
-        .aperture = .{
-            .at = device.Glacier.prototype_window_at,
-            .len = device.Glacier.prototype_window_size,
-        },
-        .display = device.Glacier.prototype_display,
-        .display_at = device.Glacier.prototype_display_at,
+        .program = program,
+        .scratch = scratch,
+        .engine = if (runner) |*each| each.engine(io) else null,
+        .room = if (runner) |each| each.room else &.{},
         .rom = option_rom,
-    };
+    });
+    // A core runs its warps on threads of their own, so the card has to be stopped before the
+    // memory they write into goes away. Declared here, which is after the memory, so it runs
+    // before it.
+    defer if (gpu.core) |*each| each.quiet();
     // A window that does not cover every row of the frame buffer is a card firmware refuses. The
-    // numbers are this runner's, not the guest's, so this is a mistake here or nowhere.
-    if (options.glacier) std.debug.assert(gpu.covers());
+    // settings were held to this before the guest started, so reaching it here is a mistake in
+    // how the card was placed and not in what the caller asked for.
+    if (wanted != null) std.debug.assert(gpu.covers());
 
     if (options.pci) {
         if (platform.pci) |each| {
@@ -690,7 +803,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
             attached.add(bridge_memory64.device(each.memory64.len));
         }
     }
-    if (options.glacier) {
+    if (wanted != null) {
         // The slot is the bridge's to hold and firmware's to configure. A table that is full or a
         // card that describes regions the registers cannot hold is this runner being wrong.
         std.debug.assert(bridge.add(gpu.function(.{ .device = 1 })));
@@ -729,7 +842,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
             if (options.sev_es) {
                 try machine.vm.launchUpdateVmsa();
                 if (try machine.sevMeasureFinish(&sev_measure_buf)) |got| {
-                    try out.print("sev-es launch sealed, measurement {d} bytes\n", .{got.len});
+                    try say.print("sev-es launch sealed, measurement {d} bytes\n", .{got.len});
                 }
             }
         }
@@ -743,18 +856,19 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         if (chip_socket) |*link| {
             var session: attest.Chain.Session(netmod.Socket) = .{ .transport = link };
             expected_chain = session.measure(&manifest, launch_register) catch |err| {
-                try out.print("the chip would not take the launch: {t}, code {x}\n", .{ err, session.refusal });
+                try say.print("the chip would not take the launch: {t}, code {x}\n", .{ err, session.refusal });
                 try out.flush();
+                try say.flush();
                 return;
             };
-            try out.print("launch folded into register {d}, which now holds {x}\n", .{
+            try say.print("launch folded into register {d}, which now holds {x}\n", .{
                 launch_register,
                 expected_chain.?[0..8],
             });
             // Where the guest will find the list of measurements. A register says two launches differ
             // and never what either was, so the guest is given the list as well and can fold it.
             if (layout.log) |where| {
-                try out.print("measurements listed at {x} over {d} bytes\n", .{
+                try say.print("measurements listed at {x} over {d} bytes\n", .{
                     where.start,
                     where.end - where.start,
                 });
@@ -775,11 +889,12 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
                 &seed,
                 expected_chain.?,
             ) catch |err| {
-                try out.print("the chip would not quote the register: {t}, code {x}\n", .{ err, session.refusal });
+                try say.print("the chip would not quote the register: {t}, code {x}\n", .{ err, session.refusal });
                 try out.flush();
+                try say.flush();
                 return;
             };
-            try out.print("the chip signed it with key {x}, over {d} bytes\n", .{
+            try say.print("the chip signed it with key {x}, over {d} bytes\n", .{
                 taken.key.point[1..9],
                 taken.answer.len,
             });
@@ -804,8 +919,28 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         }
     }
 
+    // Pictures of the screen, where a caller asked for them. The directory has to be there
+    // already: making one for a mistyped path is how a typo becomes a surprise directory.
+    var screens: ?Screendump = null;
+    if (wanted) |each| {
+        if (each.get("screendump")) |at| {
+            const into = cwd.openDir(io, at, .{}) catch {
+                try say.print("there is no directory at {s} to put pictures in\n", .{at});
+                return;
+            };
+            screens = .{
+                .into = into,
+                .card = &gpu,
+                .io = io,
+                .every = @as(i96, @intCast(try each.screendumpMs())) * std.time.ns_per_ms,
+            };
+        }
+    }
+
     var end: Host = .{
         .io = io,
+        .heard = if (options.stop_on != null) &serial.said else null,
+        .screens = if (screens != null) &screens.? else null,
         .deadline = if (options.seconds) |limit|
             std.Io.Clock.awake.now(io).nanoseconds + @as(i96, limit) * std.time.ns_per_s
         else
@@ -847,7 +982,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     var started: usize = 0;
     for (ids[1..], 0..) |each, index| {
         threads[index] = std.Thread.spawn(.{}, driveCpu, .{ hv, each, driving }) catch |err| {
-            try out.print("cannot start cpu {d}: {t}\n", .{ each, err });
+            try say.print("cannot start cpu {d}: {t}\n", .{ each, err });
             return;
         };
         started += 1;
@@ -855,13 +990,14 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
 
     const reason = core.Launch.run(hv, id, driving) catch |err| stopped: {
         try out.flush();
+        try say.flush();
         // Running out of exits is how a caller stops a guest on purpose, which is what taking a
         // snapshot needs. It is not a fault, so the run carries on to the writing below.
         if (err == error.ExitsExhausted) {
-            try out.print("\nthe guest used all {d} exits it was given\n", .{options.exits});
+            try say.print("the guest used all {d} exits it was given\n", .{options.exits});
             break :stopped core.Launch.Reason.stopped;
         }
-        try out.print("\nthe guest stopped badly: {t}, kvm said {?}\n", .{ err, machine.fault });
+        try say.print("the guest stopped badly: {t}, kvm said {?}\n", .{ err, machine.fault });
         // Every other CPU stops here too. A fault is not a reason to return while another CPU is
         // still inside the hypervisor holding pointers into this frame.
         stopOthers(threads[0..started], &end);
@@ -885,107 +1021,138 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         one.close(&channel);
     }
 
-    const stopped_at = std.Io.Clock.awake.now(io).nanoseconds;
     try out.flush();
+    try say.flush();
 
     // Write down everything the guest holds, so it can be started again from here. A guest that
     // has powered off has nothing worth keeping, but saying so is the caller's business and not
     // this one's: it asked for a snapshot and it gets one.
     if (options.save) |path| {
-        saveTo(gpa, io, out, path, &machine, &gic, &memory, ram_size, ids, if (disk != null) &block else null) catch |err| {
-            try out.print("could not write the snapshot: {t}\n", .{err});
+        saveTo(gpa, io, say, path, &machine, &gic, &memory, ram_size, ids, if (disk != null) &block else null) catch |err| {
+            try say.print("could not write the snapshot: {t}\n", .{err});
         };
     }
-    // The build mode is here because it is worth more than any of the numbers beside it. Measuring
-    // a `Debug` binary says the launch costs fifteen times what it really does, because that is how
-    // much slower the digest is without optimisation.
-    try out.print("\ntook {d}ms to read {d}MB of kernel, {d}ms to measure and place it, {d}ms running, built {t}\n", .{
-        @divTrunc(read_at - began, std.time.ns_per_ms),
-        kernel.len / (1024 * 1024),
-        @divTrunc(ready_at - read_at, std.time.ns_per_ms),
-        @divTrunc(stopped_at - ready_at, std.time.ns_per_ms),
-        @import("builtin").mode,
-    });
-
-    if (end.timed_out) {
+    if (end.said_it) {
+        // Nothing to say: the guest did what it was waited on to do, and the answer to that is
+        // the exit code rather than a line of text.
+    } else if (end.timed_out) {
         // `stopped` says the loop ended, not why. A guest that ran out of time and one
         // that was asked to stop look the same from inside the loop.
-        try out.print("\nthe guest ran out of time after {?d} seconds\n", .{options.seconds});
-    } else {
-        try out.print("\nthe guest stopped: {t}\n", .{reason});
+        try say.print("the guest ran out of time after {?d} seconds\n", .{options.seconds});
+        try sayWhereItWas(say, hv, ids[0]);
+    } else if (reason != .shutdown) {
+        // A guest that powered itself off did what it was asked to. Anything else ended for a
+        // reason worth saying.
+        try say.print("the guest stopped: {t}\n", .{reason});
+    }
+
+    // The last thing on the screen, which is the thing somebody wants to see, and the last line
+    // of the trace, which is where a test reads what happened.
+    if (screens) |*each| each.take();
+    if (trace) |*each| {
+        each.lastWord();
+        each.summary(&bridge, &gpu);
+    }
+
+    // Nothing is said about a bus that worked. What each device did is counted in the trace, which
+    // is where whoever cares reads it, and a caller who asked for a trace or for pictures knows
+    // where they asked for them to go. Only what went wrong is worth a line here.
+    if (options.pci and wanted != null) {
+        if (gpu.strayed != 0) {
+            try say.print("glacier: {d} accesses named fabric the card does not have\n", .{gpu.strayed});
+        }
+        // A kernel this host could not compile reads to a guest like a kernel that faulted, so the
+        // difference is said here. The vector set and the float set are what reach it today.
+        if (runner) |each| {
+            if (each.refused != 0) {
+                try say.print("glacier: {d} kernels used words this host cannot run\n", .{each.refused});
+            }
+        }
+    }
+    if (bridge.unanswered != 0) {
+        try say.print("pci: {d} accesses reached a region with nobody to answer them\n", .{bridge.unanswered});
+    }
+    if (bridge.refused != 0) {
+        try say.print("pci: {d} accesses reached a card the guest has not switched on\n", .{bridge.refused});
+    }
+    if (screens) |each| {
+        if (each.lost != 0) try say.print("glacier: {d} pictures could not be written\n", .{each.lost});
+    }
+    if (trace) |each| {
+        if (each.lost != 0) try say.print("trace: {d} lines could not be written\n", .{each.lost});
     }
 
     // A device that asked for an interrupt the kernel refused is why a guest waits
     // forever, so say so rather than leaving it to be guessed at.
     if (offered) |one| {
-        try out.print("shares: {d} offered, {d} names handed over, {d}MB read, {d} refused\n", .{
+        try say.print("shares: {d} offered, {d} names handed over, {d}MB read, {d} refused\n", .{
             options.share_count,
             one.named + one.looked_up,
             one.read_bytes / (1024 * 1024),
             one.refused,
         });
         if (one.turned_away != 0) {
-            try out.print("{d} names would have left a shared directory\n", .{one.turned_away});
+            try say.print("{d} names would have left a shared directory\n", .{one.turned_away});
         }
         // What was refused, the last few. A guest reports whatever its own library made of the
         // number, and a library with no name for one says only that it was unexpected.
         if (one.last_refusals.count != 0) {
             var room: [fsmod.Export.Refusals.room]fsmod.Export.Refusals.Refusal = undefined;
             for (one.last_refusals.held(&room)) |each| {
-                try out.print("share: refused {t} with {d} at {d}\n", .{ each.op, each.code, each.at });
+                try say.print("share: refused {t} with {d} at {d}\n", .{ each.op, each.code, each.at });
             }
         }
         // What the guest finished with. A guest held up for a session makes and forgets files for hours,
         // and a number here that stays at zero while it works means this side is holding all of them.
         if (one.let_go_nodes != 0) {
-            try out.print("share: {d} files the guest finished with\n", .{one.let_go_nodes});
+            try say.print("share: {d} files the guest finished with\n", .{one.let_go_nodes});
         }
     }
-    if (gic.dropped != 0) try out.print("{d} interrupts were dropped\n", .{gic.dropped});
-    if (bus.unmapped != 0) try out.print("{d} guest accesses matched no device\n", .{bus.unmapped});
+    if (gic.dropped != 0) try say.print("{d} interrupts were dropped\n", .{gic.dropped});
+    if (bus.unmapped != 0) try say.print("{d} guest accesses matched no device\n", .{bus.unmapped});
     if (options.net != null or options.nat) {
         // Whether the driver set the queues up says whether it probed at all, which a log line
         // does not: a network driver says nothing when it finds a device it is happy with.
-        try out.print("network: driver ready {}, {d} frames from the guest, {d} to it\n", .{
+        try say.print("network: driver ready {}, {d} frames from the guest, {d} to it\n", .{
             card.ready(),
             end.frames_out,
             end.frames_in,
         });
-        if (end.helper_gone) try out.writeAll("the network helper went away\n");
-        if (card.dropped != 0) try out.print("{d} frames were dropped\n", .{card.dropped});
-        if (relay.refused != 0) try out.print("{d} times the helper sent something unreadable\n", .{relay.refused});
+        if (end.helper_gone) try say.writeAll("the network helper went away\n");
+        if (card.dropped != 0) try say.print("{d} frames were dropped\n", .{card.dropped});
+        if (relay.refused != 0) try say.print("{d} times the helper sent something unreadable\n", .{relay.refused});
     }
     if (options.nat) {
         // What the built in network carried, and what it could not. A guest whose traffic vanishes in
         // silence looks the same as a guest with no network, so the refusals are named.
-        try out.print("nat: {d} datagrams out, {d} back, {d} in flight\n", .{ nat.sent, nat.received, nat.inFlight() });
-        if (nat.streams_opened != 0) try out.print("nat: {d} connections carried\n", .{nat.streams_opened});
-        if (nat.streams_refused != 0) try out.print("{d} connections were reset\n", .{nat.streams_refused});
-        if (nat.unknown != 0) try out.print("{d} frames were not understood\n", .{nat.unknown});
-        if (nat.no_room != 0) try out.print("{d} times the table was full\n", .{nat.no_room});
+        try say.print("nat: {d} datagrams out, {d} back, {d} in flight\n", .{ nat.sent, nat.received, nat.inFlight() });
+        if (nat.streams_opened != 0) try say.print("nat: {d} connections carried\n", .{nat.streams_opened});
+        if (nat.streams_refused != 0) try say.print("{d} connections were reset\n", .{nat.streams_refused});
+        if (nat.unknown != 0) try say.print("{d} frames were not understood\n", .{nat.unknown});
+        if (nat.no_room != 0) try say.print("{d} times the table was full\n", .{nat.no_room});
     }
     if (options.tpm != null) {
-        try out.print("security chip answered {d} commands\n", .{end.chip_relay.answered});
+        try say.print("security chip answered {d} commands\n", .{end.chip_relay.answered});
         if (end.chain_agreed) |agreed| {
             // The guest read the register and said what it holds. This side folded the launch in and
             // knows what it has to hold, so the two are compared rather than one being believed.
             if (agreed) {
-                try out.writeAll("the guest agrees about what started it\n");
+                try say.writeAll("the guest agrees about what started it\n");
             } else {
-                try out.writeAll("the guest disagrees about what started it\n");
+                try say.writeAll("the guest disagrees about what started it\n");
             }
         }
-        if (end.chip_relay.gone) try out.writeAll("whatever answers the chip went away\n");
-        if (chip.refused != 0) try out.print("{d} chip requests were refused\n", .{chip.refused});
+        if (end.chip_relay.gone) try say.writeAll("whatever answers the chip went away\n");
+        if (chip.refused != 0) try say.print("{d} chip requests were refused\n", .{chip.refused});
     }
     if (held) |one| {
-        try out.print("session: {d} streams handed out, {d} asked for and not given\n", .{
+        try say.print("session: {d} streams handed out, {d} asked for and not given\n", .{
             one.handed_out,
             one.turned_away,
         });
-        if (one.overflowed != 0) try out.print("{d} streams the guest opened had nowhere to go\n", .{one.overflowed});
+        if (one.overflowed != 0) try say.print("{d} streams the guest opened had nowhere to go\n", .{one.overflowed});
         if (one.asked_about != 0 or one.turned_back != 0) {
-            try out.print("session: asked about {d} names, {d} allowed, {d} refused, {d} it never asked for\n", .{
+            try say.print("session: asked about {d} names, {d} allowed, {d} refused, {d} it never asked for\n", .{
                 one.asked_about,
                 one.allowed,
                 one.denied,
@@ -994,24 +1161,40 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         }
     }
     if (options.vsock != null and channel.refused != 0) {
-        try out.print("{d} channel connections were refused\n", .{channel.refused});
+        try say.print("{d} channel connections were refused\n", .{channel.refused});
     }
     if (options.limit != null) {
         // What the guest says it gave up, which is what it really did rather than what it
         // was asked for. A guest that refused says so here by reporting less.
-        try out.print("balloon asked for {d}MB and the guest gave {d}MB\n", .{
+        try say.print("balloon asked for {d}MB and the guest gave {d}MB\n", .{
             balloon.targetBytes() / (1024 * 1024),
             @as(u64, balloon.reported()) * device.virtio.Balloon.page_size / (1024 * 1024),
         });
-        try out.print("{d}MB was handed back over {d} runs of pages\n", .{ end.released / (1024 * 1024), end.ranges_seen });
-        if (end.unmapped != 0) try out.print("{d} runs were not mapped here\n", .{end.unmapped});
-        if (end.unadvised != 0) try out.print("{d} runs the kernel would not take back\n", .{end.unadvised});
+        try say.print("{d}MB was handed back over {d} runs of pages\n", .{ end.released / (1024 * 1024), end.ranges_seen });
+        if (end.unmapped != 0) try say.print("{d} runs were not mapped here\n", .{end.unmapped});
+        if (end.unadvised != 0) try say.print("{d} runs the kernel would not take back\n", .{end.unadvised});
         if (end.too_small != 0) {
-            try out.print("{d} runs were shorter than one {d}K page of this machine\n", .{
+            try say.print("{d} runs were shorter than one {d}K page of this machine\n", .{
                 end.too_small,
                 std.heap.pageSize() / 1024,
             });
         }
-        if (balloon.refused != 0) try out.print("{d} balloon pages were refused\n", .{balloon.refused});
+        if (balloon.refused != 0) try say.print("{d} balloon pages were refused\n", .{balloon.refused});
+    }
+
+    // A caller that named something to wait for and never heard it has a guest that did not do
+    // what it was run to do. Said plainly and answered with a failure, because the one asking is
+    // a test and a test that passes when the guest never spoke is worse than no test.
+    //
+    // Leaving this way rather than returning an error: the run is over, everything worth writing
+    // has been written, and an error here would arrive wrapped in a stack trace of this program
+    // rather than as the plain answer a caller wants.
+    if (options.stop_on) |text| {
+        if (!end.said_it) {
+            try say.print("the guest never said {s}\n", .{text});
+            try out.flush();
+            try say.flush();
+            std.process.exit(1);
+        }
     }
 }

@@ -187,6 +187,13 @@ pub const Host = struct {
     answered: bool = false,
     /// True once the deadline stopped the guest, so the reason can say which it was.
     timed_out: bool = false,
+    /// Whether the guest has printed the thing it was waited on to print. Held by the serial
+    /// port, which is what sees the bytes, and read here because this is what ends a run.
+    heard: ?*const bool = null,
+    /// True once that stopped the guest.
+    said_it: bool = false,
+    /// Whoever is taking pictures of the screen, where a caller asked for them.
+    screens: ?*@import("Screendump.zig") = null,
     /// Counts the turns, so the serial output can be pushed out now and then. A guest that
     /// is killed before it stops would otherwise lose whatever is still buffered, which is
     /// exactly the output someone debugging needs.
@@ -340,6 +347,16 @@ pub const Host = struct {
                 return false;
             }
         }
+
+        // The guest said the thing it was waited on to say, so there is nothing left to wait for.
+        if (self.heard) |flag| {
+            if (flag.*) {
+                self.said_it = true;
+                return false;
+            }
+        }
+
+        if (self.screens) |each| each.maybe();
 
         self.drainBalloon();
         self.carryChip();

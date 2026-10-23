@@ -118,13 +118,25 @@ fn cpu(self: *Machine, id: Backend.VcpuId) Backend.Error!*Vcpu {
     return &self.vcpus[id];
 }
 
-fn register(reg: Backend.Register) hv.Reg {
+/// Which framework register a name means, or nothing for a name that is not a general register.
+fn register(reg: Backend.Register) ?hv.Reg {
     return switch (reg) {
         .pc => .pc,
         .x0 => .x0,
         .x1 => .x1,
         .x2 => .x2,
         .x3 => .x3,
+        .esr, .far => null,
+    };
+}
+
+/// The names that are system registers instead. The framework takes those through a call of their
+/// own, by the encoding the architecture gives them.
+fn systemRegister(reg: Backend.Register) ?hv.SysReg {
+    return switch (reg) {
+        .esr => .esr_el1,
+        .far => .far_el1,
+        else => null,
     };
 }
 
@@ -327,7 +339,10 @@ fn setInterrupt(ctx: *anyopaque, id: Backend.VcpuId, level: bool) Backend.Error!
 fn setRegister(ctx: *anyopaque, id: Backend.VcpuId, reg: Backend.Register, value: u64) Backend.Error!void {
     const self = cast(ctx);
     const target = try self.cpu(id);
-    const result = self.api.vcpu_set_reg(target.id, register(reg), value);
+    // A syndrome is the hypervisor's account of what the guest did, so there is nothing a VMM
+    // could mean by writing one.
+    const named = register(reg) orelse return Backend.Error.HypervisorFault;
+    const result = self.api.vcpu_set_reg(target.id, named, value);
     if (result != hv.success) return self.record(result);
 }
 
@@ -335,7 +350,13 @@ fn getRegister(ctx: *anyopaque, id: Backend.VcpuId, reg: Backend.Register) Backe
     const self = cast(ctx);
     const target = try self.cpu(id);
     var value: u64 = 0;
-    const result = self.api.vcpu_get_reg(target.id, register(reg), &value);
+    if (systemRegister(reg)) |named| {
+        const asked = self.api.vcpu_get_sys_reg(target.id, named, &value);
+        if (asked != hv.success) return self.record(asked);
+        return value;
+    }
+
+    const result = self.api.vcpu_get_reg(target.id, register(reg).?, &value);
     if (result != hv.success) return self.record(result);
     return value;
 }

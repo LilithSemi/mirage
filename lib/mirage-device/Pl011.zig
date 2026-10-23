@@ -60,6 +60,19 @@ const interrupt_tx: u32 = 1 << 5;
 const kept = [_]u64{ reg.ibrd, reg.fbrd, reg.lcr_h, reg.cr, reg.ifls };
 
 sink: *std.Io.Writer,
+/// Something to watch the guest say, and whether it has said it yet. A caller testing a guest
+/// runs it until it prints a thing it knows rather than until a clock runs out, which is the
+/// difference between a test that takes a second and one that takes a minute.
+watch: []const u8 = &.{},
+said: bool = false,
+/// Somewhere else the bytes go, beside the sink. What a guest says is part of the account of a
+/// run, and a caller writing that account down wants it in the same place as everything else.
+echo: ?@import("../mirage-device.zig").Echo = null,
+/// The last bytes the guest said, as many as the thing being watched for is long. Compared whole
+/// each time rather than carried as a position: a match that can begin again inside itself is
+/// easy to get wrong that way, and `aab` really is inside `aaab`.
+recent: [@import("../mirage-device.zig").max_watch]u8 = @splat(0),
+heard: usize = 0,
 /// Where to say an interrupt has happened, and which one. A port with nowhere to
 /// report is still usable by a driver that polls, which is what an early console
 /// does.
@@ -124,6 +137,26 @@ fn read(ctx: *anyopaque, offset: u64, size: Bus.Size) u64 {
     };
 }
 
+/// Take one byte of what the guest said and see whether it has now said the thing being watched
+/// for. The match runs over the stream rather than over a line, so the thing may be split across
+/// however many writes the guest made.
+fn hear(self: *@This(), byte: u8) void {
+    if (self.echo) |also| also.byte(also.ctx, byte);
+    if (self.watch.len == 0 or self.said) return;
+    if (self.watch.len > self.recent.len) return;
+
+    const wanted = self.watch.len;
+    if (self.heard < wanted) {
+        self.recent[self.heard] = byte;
+        self.heard += 1;
+    } else {
+        std.mem.copyForwards(u8, self.recent[0 .. wanted - 1], self.recent[1..wanted]);
+        self.recent[wanted - 1] = byte;
+    }
+
+    if (self.heard == wanted and std.mem.eql(u8, self.recent[0..wanted], self.watch)) self.said = true;
+}
+
 fn write(ctx: *anyopaque, offset: u64, size: Bus.Size, value: u64) void {
     _ = size;
     const self: *Pl011 = @ptrCast(@alignCast(ctx));
@@ -135,8 +168,11 @@ fn write(ctx: *anyopaque, offset: u64, size: Bus.Size, value: u64) void {
     }
 
     switch (offset) {
-        reg.dr => self.sink.writeByte(@truncate(value)) catch {
-            self.dropped += 1;
+        reg.dr => {
+            self.hear(@truncate(value));
+            self.sink.writeByte(@truncate(value)) catch {
+                self.dropped += 1;
+            };
         },
         reg.imsc => {
             self.imsc = @truncate(value);
@@ -317,4 +353,69 @@ test "a register the port keeps reads back as it was written" {
 
     bus.write(0x0900_002c, .word, 0x70);
     try testing.expectEqual(@as(u64, 0x70), bus.read(0x0900_002c, .word));
+}
+
+test "a guest that says the thing being watched for is heard saying it" {
+    var room: [64]u8 = undefined;
+    var sink = std.Io.Writer.fixed(&room);
+    var port: Pl011 = .{ .sink = &sink, .watch = "alive" };
+    var one = port.device(0x0900_0000);
+
+    for ("the guest is alive now") |byte| one.vtable.write(one.ctx, reg.dr, .byte, byte);
+
+    try testing.expectEqual(true, port.said);
+    try testing.expectEqualSlices(u8, "the guest is alive now", sink.buffered());
+}
+
+test "a false start does not stop the match from finding the real one" {
+    var room: [64]u8 = undefined;
+    var sink = std.Io.Writer.fixed(&room);
+    var port: Pl011 = .{ .sink = &sink, .watch = "aab" };
+    var one = port.device(0);
+
+    // The first two bytes begin a match that the third breaks. A matcher that gave up there would
+    // miss the one that follows.
+    for ("aaab") |byte| one.vtable.write(one.ctx, reg.dr, .byte, byte);
+    try testing.expectEqual(true, port.said);
+}
+
+test "a port with nothing to watch for never says it heard anything" {
+    var room: [64]u8 = undefined;
+    var sink = std.Io.Writer.fixed(&room);
+    var port: Pl011 = .{ .sink = &sink };
+    var one = port.device(0);
+
+    for ("whatever it likes") |byte| one.vtable.write(one.ctx, reg.dr, .byte, byte);
+    try testing.expectEqual(false, port.said);
+}
+
+test "what the guest says reaches whoever else is listening" {
+    var room: [64]u8 = undefined;
+    var sink = std.Io.Writer.fixed(&room);
+
+    const Heard = struct {
+        bytes: [32]u8 = @splat(0),
+        count: usize = 0,
+
+        fn echo(self: *@This()) @import("../mirage-device.zig").Echo {
+            return .{ .ctx = self, .byte = @This().took };
+        }
+
+        fn took(ctx: *anyopaque, said: u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.count == self.bytes.len) return;
+            self.bytes[self.count] = said;
+            self.count += 1;
+        }
+    };
+
+    var heard: Heard = .{};
+    var port: Pl011 = .{ .sink = &sink, .echo = heard.echo() };
+    var one = port.device(0);
+
+    for ("hello") |byte| one.vtable.write(one.ctx, reg.dr, .byte, byte);
+
+    // Both get every byte: the sink is where a person reads it and the echo is where a program does.
+    try testing.expectEqualSlices(u8, "hello", heard.bytes[0..heard.count]);
+    try testing.expectEqualSlices(u8, "hello", sink.buffered());
 }

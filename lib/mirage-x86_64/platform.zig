@@ -70,6 +70,10 @@ pub const pci: ?Bridge = .{
     .memory64 = .{ .at = 0x80_0000_0000, .len = 0x1_0000_0000 },
 };
 
+/// The firmware configuration device. None here: firmware is not started on this architecture, so
+/// there is nothing to read it, and a device no guest is told about is a window nobody reads.
+pub const fw_cfg: ?Device = null;
+
 const testing = @import("mirage-testing");
 const std = @import("std");
 

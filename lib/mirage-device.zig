@@ -58,13 +58,29 @@ pub const Service = struct {
     pub const Error = virtio.Queue.Error;
 };
 
+/// Another reader of what a guest says, beside wherever its serial port already writes. One byte
+/// at a time, as the guest writes it, because a guest that stops half way through a line still
+/// said the half. Here rather than on a port because a machine has one of several kinds of port
+/// and whoever is listening does not care which.
+pub const Echo = struct {
+    ctx: *anyopaque,
+    byte: *const fn (ctx: *anyopaque, said: u8) void,
+};
+
+/// The longest thing a serial port can be asked to watch the guest say. A caller asking for more
+/// is refused where the ask is made rather than left with a guest that never stops.
+pub const max_watch = 64;
+
 pub const AcpiShutdown = @import("mirage-device/AcpiShutdown.zig");
 pub const Gicv2 = @import("mirage-device/Gicv2.zig");
 pub const Pl011 = @import("mirage-device/Pl011.zig");
 pub const Uart16550 = @import("mirage-device/Uart16550.zig");
 pub const Tpm = @import("mirage-device/Tpm.zig");
 pub const PciHost = @import("mirage-device/PciHost.zig");
+pub const Settings = @import("mirage-device/Settings.zig");
 pub const Glacier = @import("mirage-device/Glacier.zig");
+pub const FwCfg = @import("mirage-device/FwCfg.zig");
+pub const NorFlash = @import("mirage-device/NorFlash.zig");
 pub const virtio = struct {
     pub const Queue = @import("mirage-device/virtio/Queue.zig");
     pub const Mmio = @import("mirage-device/virtio/Mmio.zig");
@@ -83,7 +99,11 @@ test {
     _ = Uart16550;
     _ = Tpm;
     _ = PciHost;
+    _ = Settings;
     _ = Glacier;
+    _ = Glacier.Core;
+    _ = FwCfg;
+    _ = NorFlash;
     _ = virtio.Queue;
     _ = virtio.Mmio;
     _ = virtio.Block;

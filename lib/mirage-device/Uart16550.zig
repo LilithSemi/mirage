@@ -52,6 +52,19 @@ const iir_thri: u8 = 0x02;
 const iir_none: u8 = 0x01;
 
 sink: *std.Io.Writer,
+/// Something to watch the guest say, and whether it has said it yet. A caller testing a guest
+/// runs it until it prints a thing it knows rather than until a clock runs out, which is the
+/// difference between a test that takes a second and one that takes a minute.
+watch: []const u8 = &.{},
+said: bool = false,
+/// Somewhere else the bytes go, beside the sink. What a guest says is part of the account of a
+/// run, and a caller writing that account down wants it in the same place as everything else.
+echo: ?@import("../mirage-device.zig").Echo = null,
+/// The last bytes the guest said, as many as the thing being watched for is long. Compared whole
+/// each time rather than carried as a position: a match that can begin again inside itself is
+/// easy to get wrong that way, and `aab` really is inside `aaab`.
+recent: [@import("../mirage-device.zig").max_watch]u8 = @splat(0),
+heard: usize = 0,
 /// Bytes the sink would not take. A byte lost in silence is a bug that hides itself.
 dropped: u64 = 0,
 /// What the guest asked to be interrupted for. The transmitter is never busy, so the
@@ -106,12 +119,35 @@ fn read(ctx: *anyopaque, offset: u64, size: Bus.Size) u64 {
     };
 }
 
+/// Take one byte of what the guest said and see whether it has now said the thing being watched
+/// for. The match runs over the stream rather than over a line, so the thing may be split across
+/// however many writes the guest made.
+fn hear(self: *@This(), byte: u8) void {
+    if (self.echo) |also| also.byte(also.ctx, byte);
+    if (self.watch.len == 0 or self.said) return;
+    if (self.watch.len > self.recent.len) return;
+
+    const wanted = self.watch.len;
+    if (self.heard < wanted) {
+        self.recent[self.heard] = byte;
+        self.heard += 1;
+    } else {
+        std.mem.copyForwards(u8, self.recent[0 .. wanted - 1], self.recent[1..wanted]);
+        self.recent[wanted - 1] = byte;
+    }
+
+    if (self.heard == wanted and std.mem.eql(u8, self.recent[0..wanted], self.watch)) self.said = true;
+}
+
 fn write(ctx: *anyopaque, offset: u64, size: Bus.Size, value: u64) void {
     _ = size;
     const self: *Uart16550 = @ptrCast(@alignCast(ctx));
     switch (offset) {
-        reg.thr => self.sink.writeByte(@truncate(value)) catch {
-            self.dropped += 1;
+        reg.thr => {
+            self.hear(@truncate(value));
+            self.sink.writeByte(@truncate(value)) catch {
+                self.dropped += 1;
+            };
         },
         reg.ier => self.ier = @truncate(value),
         reg.scr => self.scratch = @truncate(value),
