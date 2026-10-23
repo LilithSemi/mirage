@@ -11,6 +11,10 @@
             .url = "git+https://git.lilithsemi.com/LilithSemi/almanac.git#70e5ea998a320c441cfd7b68c71d94888d246551",
             .hash = "almanac-0.1.0-9SzmcJ8pBgC05r2UQazhuVhCuMRbSS_zhnYSEJmrcqG4",
         },
+        .vulcan = .{
+            .url = "git+https://git.lilithsemi.com/LilithSemi/vulcan.git#2946a612dbefa7838caaccbead2d930a405eeb00",
+            .hash = "vulcan-0.0.0-d6EfZJWjugDenSy3PEWtCJEwvT8JfBawLeQ9iYAkhXaY",
+        },
     },
     .paths = .{""},
     .fingerprint = 0xecd09ace8d31239,
