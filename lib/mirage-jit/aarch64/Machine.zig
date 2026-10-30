@@ -5,12 +5,12 @@ const arm64 = @import("mirage-arm64");
 /// the host's hypervisor would be.
 const Backend = @import("mirage-backend").For(arm64);
 const GuestMemory = @import("mirage-memory").GuestMemory;
-const Cpu = @import("Cpu.zig");
+const Cpu = @import("vulcan-target").aarch64_guest.Cpu;
 const Cache = @import("../aarch64.zig").Cache;
 const Translate = @import("Translate.zig");
 const Exception = @import("Exception.zig");
 
-const Identification = @import("Identification.zig");
+const Identification = @import("vulcan-target").aarch64_guest.identification;
 
 const Machine = @This();
 memory: *GuestMemory,

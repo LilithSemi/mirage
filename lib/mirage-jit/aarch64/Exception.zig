@@ -13,7 +13,7 @@
 //! to bank. A guest that expects the other levels' banks restored would need
 //! real banking, which is what running two levels at once would require.
 const std = @import("std");
-const Cpu = @import("Cpu.zig");
+const Cpu = @import("vulcan-target").aarch64_guest.Cpu;
 
 const Exception = @This();
 
