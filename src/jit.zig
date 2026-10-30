@@ -13,6 +13,7 @@ const arm64 = @import("mirage-arm64");
 const attest = @import("mirage-attest");
 const GuestMemory = @import("mirage-memory").GuestMemory;
 const Options = @import("Options.zig");
+const host = @import("host.zig");
 
 const ram_base = 0x4000_0000;
 const uart_base = 0x0900_0000;
@@ -61,7 +62,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, options: Opt
         try w.writeAll("the JIT runs one cpu\n");
         return;
     }
-    if (options.disk != null or options.vsock != null or options.nat or options.net != null or options.pci or
+    if (options.vsock != null or options.nat or options.net != null or options.pci or
         options.tpm != null or options.share_count > 0 or options.session != null or options.save != null or
         options.restore != null or options.firmware != null)
     {
@@ -77,6 +78,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, options: Opt
     defer gpa.free(kernel);
     const initrd: ?[]const u8 = if (options.initrd) |path| try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, limit) else null;
     defer if (initrd) |bytes| gpa.free(bytes);
+    const disk: ?[]u8 = if (options.disk) |path| try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, limit) else null;
+    defer if (disk) |bytes| gpa.free(bytes);
 
     const ram = try gpa.alloc(u8, ram_size);
     defer gpa.free(ram);
@@ -91,7 +94,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, options: Opt
         .cmdline = cmdline,
         .initrd = initrd,
         .controller = .{ .gic_v2 = .{ .cpu_base = arm64.fdt.gicv2_cpu_base } },
-        .block_device = false,
+        .block_device = disk != null,
         .ram_base = ram_base,
         .ram_size = ram_size,
         .cpus = 1,
@@ -104,8 +107,15 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, options: Opt
         .sink = console,
         .line = .{ .controller = gic.controller(), .intid = arm64.fdt.uart_intid },
     };
-    var devices = [_]device.Bus.Device{ serial.device(uart_base), gic_devices[0], gic_devices[1] };
-    var bus: device.Bus = .{ .devices = &devices };
+    var block: device.virtio.Block = undefined;
+    if (disk) |bytes| block.init(bytes);
+
+    var attached: host.Attached = .{};
+    attached.add(serial.device(uart_base));
+    attached.add(gic_devices[0]);
+    attached.add(gic_devices[1]);
+    if (disk != null) attached.addServed(block.device(arm64.fdt.virtio_base), block.service(arm64.fdt.virtio_intid));
+    var bus = attached.bus();
 
     var machine = jit.Machine.init(gpa, &memory);
     defer machine.deinit();
@@ -127,6 +137,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, options: Opt
         .bus = &bus,
         .memory = &memory,
         .controller = gic.controller(),
+        .services = attached.served(),
         .exits = std.math.maxInt(u64),
         .host = .{ .ctx = &deadline, .step = Deadline.step },
     });
