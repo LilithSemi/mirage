@@ -46,12 +46,16 @@ pub fn Cache(comptime Guest: type) type {
         pub fn init(allocator: std.mem.Allocator) Self {
             // Not an arena: it is used from one thread, and an arena pays an atomic
             // operation per allocation, of which a translation makes hundreds.
-            const memory: []u8 = std.heap.page_allocator.alloc(u8, scratch_bytes) catch &.{};
+            //
+            // The raw call and not `alloc`: in a debug build `alloc` fills what it returns with
+            // a pattern, which touches every page of the reservation and makes it a gigabyte of
+            // resident memory for each cache.
+            const memory: []u8 = if (std.heap.page_allocator.rawAlloc(scratch_bytes, .of(u8), @returnAddress())) |at| at[0..scratch_bytes] else &.{};
             return .{ .allocator = allocator, .scratch = .init(memory) };
         }
 
         pub fn deinit(self: *Self) void {
-            std.heap.page_allocator.free(self.scratch.buffer);
+            if (self.scratch.buffer.len != 0) std.heap.page_allocator.rawFree(self.scratch.buffer, .of(u8), @returnAddress());
             for (self.blocks.items) |*entry| {
                 entry.block.deinit();
                 self.allocator.free(entry.bytes);

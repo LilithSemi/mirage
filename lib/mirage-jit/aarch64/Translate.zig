@@ -112,7 +112,11 @@ fn regime(cpu: *const Cpu) Fault!Regime {
     // ASID and has nothing to do with the size: reading seven bits made a kernel
     // that sets it look like it had asked for a region of a negative size.
     const t1sz: u6 = @truncate(cpu.system.tcr_el1 >> fields.t1sz_shift);
-    if (t1sz == 0) return error.MalformedTables;
+    // A zero size is reserved for a region that is walked, but a kernel that has not set up its
+    // upper half yet turns that half off with `EPD1` and leaves the size alone. Nothing is walked
+    // there, so the size only has to put the split somewhere, and every address above it faults.
+    if (t1sz == 0 and (cpu.system.tcr_el1 & (@as(u64, 1) << fields.epd1_shift)) == 0) return error.MalformedTables;
+    if (t1sz == 0) return .{ .enabled = true, .split_bit = 48 };
     return .{
         .enabled = true,
         .split_bit = @intCast(@as(u8, 64) - t1sz),

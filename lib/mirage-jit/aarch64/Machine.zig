@@ -242,7 +242,7 @@ fn retireAccess(self: *Machine) Backend.Error!?Backend.Exit {
     self.cpu.exclusive = .none;
     self.faulted = false;
     const outcome = switch (exclusive) {
-        .none => try self.access(self.cpu.address, self.cpu.width, self.cpu.dest, self.cpu.value),
+        .none => try self.access(self.cpu.address, self.cpu.width, self.cpu.dest, self.cpu.value, self.cpu.value_hi),
         .load => try self.loadExclusive(),
         .store => try self.storeExclusive(),
     };
@@ -262,12 +262,13 @@ fn retireAccess(self: *Machine) Backend.Error!?Backend.Exit {
             .width = self.cpu.second_width,
             .dest = self.cpu.second_dest,
             .value = self.cpu.second_value,
+            .value_hi = self.cpu.second_value_hi,
             .signed = self.cpu.second_signed,
         };
         self.cpu.second_pending = false;
         self.cpu.load_signed = second.signed;
         self.cpu.second_signed = .none;
-        if (try self.access(second.address, second.width, second.dest, second.value)) |exit| return exit;
+        if (try self.access(second.address, second.width, second.dest, second.value, second.value_hi)) |exit| return exit;
         if (self.faulted) {
             self.cpu.writeback = false;
             return null;
@@ -317,7 +318,7 @@ fn zeroLine(self: *Machine, virtual: u64) Backend.Error!void {
 /// backend asked for when the host has to intervene. The direction is read from
 /// the caller's trap rather than from `dest`, so that a store to the discarded
 /// register 31 still performs its write.
-fn access(self: *Machine, address: u64, width: u8, dest: u8, value: u64) Backend.Error!?Backend.Exit {
+fn access(self: *Machine, address: u64, width: u8, dest: u8, value: u64, value_hi: u64) Backend.Error!?Backend.Exit {
     // The address a block formed is virtual. It becomes physical here, because
     // this is the one place where the translation regime can be consulted: a
     // block is cached by its instructions, and the instructions do not change
@@ -363,9 +364,12 @@ fn access(self: *Machine, address: u64, width: u8, dest: u8, value: u64) Backend
         2 => .half,
         4 => .word,
         8 => .double,
+        // A 128-bit access is plain memory or nothing: the bus has no access that wide, so a
+        // device is refused below, once it is known to be one.
+        16 => .double,
         else => return error.HypervisorFault,
     };
-    var bytes: [8]u8 = @splat(0);
+    var bytes: [16]u8 = @splat(0);
     if (self.cpu.trap == .load) {
         self.memory.read(physical, bytes[0..width]) catch |err| switch (err) {
             // An address in no region is how this backend says a device is
@@ -380,17 +384,32 @@ fn access(self: *Machine, address: u64, width: u8, dest: u8, value: u64) Backend
                 self.cpu.dest = dest;
                 self.pending_signed = signed;
                 self.pending_read = true;
-                return .{ .mmio_read = .{ .gpa = physical, .size = size, .dest = @intCast(dest) } };
+                if (width == 16) {
+                    self.stalled_at = self.cpu.pc;
+                    self.stalled = "128-bit access to a device";
+                    return error.HypervisorFault;
+                }
+                return .{ .mmio_read = .{ .gpa = physical, .size = size, .dest = @truncate(dest) } };
             },
             else => return error.HypervisorFault,
         };
-        self.finishRead(std.mem.readInt(u64, &bytes, .little), width, dest, signed);
+        if (dest >= 32) {
+            self.cpu.v[dest - 32] = .{ std.mem.readInt(u64, bytes[0..8], .little), std.mem.readInt(u64, bytes[8..16], .little) };
+            if (width < 16) self.cpu.v[dest - 32][0] &= lowMask(width);
+            return null;
+        }
+        self.finishRead(std.mem.readInt(u64, bytes[0..8], .little), width, dest, signed);
         return null;
     }
-    std.mem.writeInt(u64, &bytes, value, .little);
-    const truncated = std.mem.readVarInt(u64, bytes[0..width], .little);
+    std.mem.writeInt(u64, bytes[0..8], value, .little);
+    std.mem.writeInt(u64, bytes[8..16], value_hi, .little);
+    const truncated = std.mem.readVarInt(u64, bytes[0..@min(width, 8)], .little);
     self.memory.write(physical, bytes[0..width]) catch |err| switch (err) {
-        error.OutOfBounds => return .{ .mmio_write = .{ .gpa = physical, .size = size, .value = truncated } },
+        error.OutOfBounds => if (width == 16) {
+            self.stalled_at = self.cpu.pc;
+            self.stalled = "128-bit access to a device";
+            return error.HypervisorFault;
+        } else return .{ .mmio_write = .{ .gpa = physical, .size = size, .value = truncated } },
         else => return error.HypervisorFault,
     };
     self.cache.written(physical);
@@ -405,7 +424,7 @@ fn loadExclusive(self: *Machine) Backend.Error!?Backend.Exit {
     self.cpu.monitor_valid = true;
     self.cpu.monitor_address = self.cpu.address;
     self.cpu.monitor_width = self.cpu.width;
-    return self.access(self.cpu.address, self.cpu.width, self.cpu.dest, self.cpu.value);
+    return self.access(self.cpu.address, self.cpu.width, self.cpu.dest, self.cpu.value, self.cpu.value_hi);
 }
 
 /// A store-exclusive. It stores only if the claim a load-exclusive made is still held
@@ -422,7 +441,7 @@ fn storeExclusive(self: *Machine) Backend.Error!?Backend.Exit {
         return null;
     }
     self.faulted = false;
-    const outcome = try self.access(self.cpu.address, self.cpu.width, self.cpu.dest, self.cpu.value);
+    const outcome = try self.access(self.cpu.address, self.cpu.width, self.cpu.dest, self.cpu.value, self.cpu.value_hi);
     if (!self.faulted) self.report(0);
     return outcome;
 }
@@ -433,7 +452,18 @@ fn report(self: *Machine, status: u64) void {
     if (self.cpu.status_dest != 31) self.cpu.x[self.cpu.status_dest] = status;
 }
 
+/// The bits a read of `width` bytes (up to eight) fills.
+fn lowMask(width: u8) u64 {
+    return if (width >= 8) std.math.maxInt(u64) else (@as(u64, 1) << @as(u6, @intCast(width * 8))) - 1;
+}
+
 fn finishRead(self: *Machine, value: u64, width: u8, dest: u8, signed: Cpu.SignExtend) void {
+    // A device answers a vector register with at most eight bytes, and the rest of the register
+    // is zero, as it is for any scalar write.
+    if (dest >= 32) {
+        self.cpu.v[dest - 32] = .{ value & lowMask(width), 0 };
+        return;
+    }
     if (dest == 31) return;
     const bits: u7 = @intCast(width * 8);
     const kept = if (bits == 64) value else value & ((@as(u64, 1) << @as(u6, @intCast(bits))) - 1);

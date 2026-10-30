@@ -7346,8 +7346,8 @@ test "addressing modes decode as the assembler encodes them" {
     try std.testing.expectEqual(Instruction{ .pair = .{ .op = .load, .size = .double, .rn = 4, .rt = 27, .rt2 = 28, .addressing = .{ .post_index = 32 } } }, try decode(0xa8c2709b));
     try std.testing.expectEqual(Instruction{ .pair = .{ .op = .load, .size = .double, .rn = 5, .rt = 29, .rt2 = 30, .addressing = .{ .offset = 64 } } }, try decode(0xa94478bd));
     try std.testing.expectEqual(Instruction{ .pair = .{ .op = .load, .size = .word, .rn = 3, .rt = 1, .rt2 = 2, .addressing = .{ .offset = 8 } } }, try decode(0x29410861));
-    // A pair of 16-bit elements is the floating point class, which this does not model.
-    try std.testing.expectError(error.UnsupportedInstruction, decode(0x6d410861));
+    // `ldp d1, d2, [x3, #16]` is the same shape in the other register file.
+    try std.testing.expectEqual(Instruction{ .pair = .{ .op = .load, .size = .double, .rn = 3, .rt = 1, .rt2 = 2, .addressing = .{ .offset = 16 }, .vector = true } }, try decode(0x6d410861));
 }
 
 /// The eight bytes of guest memory at an offset within a block, read as a word.
@@ -8626,8 +8626,8 @@ const classes = struct {
         }
 
         test "the literal forms this does not perform are refused, not read as plain loads" {
-            // The sign-extending word load and the SIMD load.
-            for ([_]u32{ 0x98000000, 0x1c000000 }) |word| {
+            // The sign-extending word load, and the SIMD literal that names a size no register has.
+            for ([_]u32{ 0x98000000, 0xdc000000 }) |word| {
                 try testing.expectError(error.UnsupportedInstruction, Decode.decode(word));
             }
         }
@@ -10167,4 +10167,5 @@ const classes = struct {
 
 test {
     std.testing.refAllDecls(classes);
+    _ = @import("simd_tests.zig");
 }
