@@ -2,10 +2,10 @@
 const std = @import("std");
 const GuestMemory = @import("mirage-memory").GuestMemory;
 const lowering = @import("aarch64/Compile.zig");
-pub const Decode = @import("vulcan-target").aarch64_guest.decode;
-pub const Identification = @import("vulcan-target").aarch64_guest.identification;
+pub const Decode = @import("vulcan-target").aarch64.decode;
+pub const Identification = @import("vulcan-target").aarch64.identification;
 
-pub const Cpu = @import("vulcan-target").aarch64_guest.Cpu;
+pub const Cpu = @import("vulcan-target").aarch64.GuestCpu;
 pub const Translate = @import("aarch64/Translate.zig");
 pub const Tlb = Translate.Tlb;
 pub const Exception = @import("aarch64/Exception.zig");

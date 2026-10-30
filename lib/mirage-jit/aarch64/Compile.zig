@@ -8,8 +8,8 @@ const ir = @import("vulcan-ir");
 const vulcan = @import("vulcan-target");
 const native = vulcan.native;
 const opt = vulcan.opt;
-const lift = vulcan.aarch64_guest.lift;
-const Cpu = vulcan.aarch64_guest.Cpu;
+const lift = vulcan.aarch64.lift;
+const Cpu = vulcan.aarch64.GuestCpu;
 
 pub const Error = std.mem.Allocator.Error || native.Error || lift.Error;
 

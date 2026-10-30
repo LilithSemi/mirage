@@ -29,10 +29,18 @@ const Deadline = struct {
     exits: u64 = 0,
     /// Set when the guest's stack pointer left everything it could validly point at.
     lost_stack: bool = false,
+    /// A program counter to stop at, taken from `JIT_STOP_AT` in hex, to look at how the guest got
+    /// there. Zero is never a place to stop.
+    stop_at: u64 = 0,
+    reached: bool = false,
 
     fn step(ctx: *anyopaque) bool {
         const self: *Deadline = @ptrCast(@alignCast(ctx));
         self.exits += 1;
+        if (self.stop_at != 0 and self.machine.cpu.pc == self.stop_at) {
+            self.reached = true;
+            return false;
+        }
         // Reading the clock on every exit would cost more than the exit.
         if (self.exits % 4096 != 0) return true;
         return std.Io.Clock.awake.now(self.io).nanoseconds < self.until;
@@ -103,6 +111,7 @@ pub fn main(init: std.process.Init) !void {
     var trace: jit.Machine.Trace = .{};
     machine.trace = &trace;
     var deadline: Deadline = .{
+        .stop_at = if (std.c.getenv("JIT_STOP_AT")) |value| std.fmt.parseInt(u64, std.mem.span(value), 16) catch 0 else 0,
         .io = io,
         .machine = &machine,
         .until = std.Io.Clock.awake.now(io).nanoseconds + @as(i96, seconds) * std.time.ns_per_s,
@@ -122,10 +131,10 @@ pub fn main(init: std.process.Init) !void {
         try w.print("error {t}\n", .{err});
     }
     try report(&machine, &memory, w);
-    if (deadline.lost_stack) {
+    if (deadline.lost_stack or deadline.reached) {
         // Oldest first, ending at the block that ran last.
         try w.writeAll("the stack pointer left memory; the last blocks, oldest first:\n");
-        const shown: u64 = @min(trace.count, 24);
+        const shown: u64 = @min(trace.count, if (deadline.reached) @as(u64, 120) else @as(u64, 24));
         var index = trace.count - shown;
         while (index < trace.count) : (index += 1) {
             const slot = index % jit.Machine.Trace.capacity;

@@ -13,6 +13,8 @@ const testing = @import("mirage-testing");
 const guest = @import("mirage-jit").aarch64;
 const Cpu = guest.Cpu;
 const cases = @import("simd_cases.zig").cases;
+const memory_cases = @import("simd_cases.zig").memory_cases;
+const GuestMemory = @import("mirage-memory").GuestMemory;
 
 const native_host = builtin.cpu.arch == .aarch64;
 
@@ -23,8 +25,10 @@ const State = extern struct {
     nzcv: u64,
 };
 
-fn runNative(comptime word: u32, state: *State) void {
-    const body = std.fmt.comptimePrint("\n.inst 0x{x}\n", .{word});
+fn runNative(comptime words: []const u32, state: *State) void {
+    comptime var body: []const u8 = "";
+    inline for (words) |word| body = body ++ std.fmt.comptimePrint("\n.inst 0x{x}", .{word});
+    body = body ++ "\n";
     asm volatile (
         \\ ldr x9, [%[s], #192]
         \\ msr nzcv, x9
@@ -52,12 +56,12 @@ fn runNative(comptime word: u32, state: *State) void {
         : .{ .x0 = true, .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true, .x6 = true, .x7 = true, .x9 = true, .v0 = true, .v1 = true, .v2 = true, .v3 = true, .v4 = true, .v5 = true, .v6 = true, .v7 = true, .memory = true });
 }
 
-fn runLifted(word: u32, state: *State) !void {
-    var bytes: [4]u8 = undefined;
-    std.mem.writeInt(u32, &bytes, word, .little);
+fn runLifted(words: []const u32, state: *State) !void {
+    var bytes: [64]u8 = undefined;
+    for (words, 0..) |word, i| std.mem.writeInt(u32, bytes[i * 4 ..][0..4], word, .little);
     // Not the testing allocator: it remembers every allocation it has ever made, and this makes
     // tens of thousands of compilations.
-    var block = try guest.compile(std.heap.smp_allocator, 0x1000, &bytes);
+    var block = try guest.compile(std.heap.smp_allocator, 0x1000, bytes[0 .. words.len * 4]);
     defer block.deinit();
     var cpu: Cpu = .{};
     for (0..8) |i| {
@@ -147,9 +151,9 @@ test "SIMD and floating point instructions agree with the machine they run on" {
             var before: State = undefined;
             fill(random, &before);
             var native = before;
-            runNative(case.word, &native);
+            runNative(&.{case.word}, &native);
             var lifted = before;
-            runLifted(case.word, &lifted) catch |err| {
+            runLifted(&.{case.word}, &lifted) catch |err| {
                 std.debug.print("{s} ({x:0>8}): {t}\n", .{ case.text, case.word, err });
                 bad = 1000;
                 break;
@@ -178,3 +182,170 @@ test "SIMD and floating point instructions agree with the machine they run on" {
     try std.testing.expectEqual(@as(usize, 0), failed);
 }
 
+
+const Sequence = struct { len: usize, words: [4]u32 };
+
+/// Three hundred short sequences drawn from the cases, the same ones every time.
+const sequences = blk: {
+    @setEvalBranchQuota(10_000_000);
+    var generator = std.Random.DefaultPrng.init(0xc0ffee);
+    const picker = generator.random();
+    var list: [300]Sequence = undefined;
+    for (&list) |*sequence| {
+        sequence.len = 2 + picker.uintLessThan(usize, 3);
+        sequence.words = @splat(0);
+        for (sequence.words[0..sequence.len]) |*word| {
+            while (true) {
+                const case = cases[picker.uintLessThan(usize, cases.len)];
+                if (std.mem.startsWith(u8, case.text, "fmla v") or std.mem.startsWith(u8, case.text, "fmls v")) continue;
+                // A single precision multiply-add is rounded twice here and once by the machine, which
+                // differs in the last place for roughly one start in several hundred.
+                if (std.mem.startsWith(u8, case.text, "fmadd s") or std.mem.startsWith(u8, case.text, "fmsub s") or std.mem.startsWith(u8, case.text, "fnmadd s") or std.mem.startsWith(u8, case.text, "fnmsub s")) continue;
+                word.* = case.word;
+                break;
+            }
+        }
+    }
+    break :blk list;
+};
+
+// The same instructions in company. A pair of instructions in one block is where the optimizer
+// and the cache of registers a block keeps can go wrong without either instruction being wrong,
+// for instance a byte stored into a register and then read back as a word.
+test "short sequences of SIMD and floating point instructions agree with the machine they run on" {
+    if (!native_host) return error.SkipZigTest;
+    @setEvalBranchQuota(10_000_000);
+    var prng = std.Random.DefaultPrng.init(0x5e9);
+    const random = prng.random();
+    var failed: usize = 0;
+    inline for (sequences) |sequence| {
+        const words = comptime sequence.words[0..sequence.len];
+        var bad: usize = 0;
+        var first: ?struct { before: State, native: State, lifted: State } = null;
+        for (0..60) |_| {
+            var before: State = undefined;
+            fill(random, &before);
+            var native = before;
+            runNative(words, &native);
+            var lifted = before;
+            runLifted(words, &lifted) catch |err| {
+                std.debug.print("sequence {any}: {t}\n", .{ words, err });
+                bad = 1000;
+                break;
+            };
+            if (!same(native, lifted)) {
+                bad += 1;
+                if (first == null) first = .{ .before = before, .native = native, .lifted = lifted };
+            }
+        }
+        if (bad != 0) {
+            failed += 1;
+            std.debug.print("DIFFERS sequence", .{});
+            inline for (words) |word| std.debug.print(" {x:0>8}", .{word});
+            std.debug.print(": {} of 60 starts\n", .{bad});
+            if (first) |f| {
+                for (0..8) |i| {
+                    if (!std.mem.eql(u64, &f.native.v[i], &f.lifted.v[i]))
+                        std.debug.print("  v{}: before {x:0>16}_{x:0>16} native {x:0>16}_{x:0>16} lifted {x:0>16}_{x:0>16}\n", .{ i, f.before.v[i][1], f.before.v[i][0], f.native.v[i][1], f.native.v[i][0], f.lifted.v[i][1], f.lifted.v[i][0] });
+                    if (f.native.x[i] != f.lifted.x[i])
+                        std.debug.print("  x{}: before {x:0>16} native {x:0>16} lifted {x:0>16}\n", .{ i, f.before.x[i], f.native.x[i], f.lifted.x[i] });
+                }
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), failed);
+}
+
+/// A buffer the memory cases work in, with the registers they use.
+const Memory = extern struct {
+    state: State,
+    bytes: [512]u8 align(16),
+};
+
+fn runNativeMemory(comptime word: u32, m: *Memory) void {
+    m.state.x[0] = @intFromPtr(&m.bytes) + 256;
+    runNative(&.{word}, &m.state);
+}
+
+fn runLiftedMemory(word: u32, m: *Memory) !void {
+    var code: [4096]u8 align(16) = @splat(0);
+    std.mem.writeInt(u32, code[0..4], word, .little);
+    std.mem.writeInt(u32, code[4..8], 0xd503207f, .little); // wfi
+    const code_at: u64 = 0x4000_0000;
+    const data_at: u64 = @intFromPtr(&m.bytes);
+    const regions = [_]GuestMemory.Region{
+        .{ .gpa = code_at, .len = code.len, .backing = .{ .shared = &code } },
+        .{ .gpa = data_at, .len = m.bytes.len, .backing = .{ .shared = &m.bytes } },
+    };
+    var memory: GuestMemory = .{ .regions = &regions };
+    var machine = guest.Machine.init(std.heap.smp_allocator, &memory);
+    defer machine.deinit();
+    const hv = machine.backend();
+    const id = try hv.addVcpu();
+    try hv.setRegister(id, .pc, code_at);
+    for (0..8) |i| {
+        machine.cpu.v[i] = m.state.v[i];
+        machine.cpu.x[i] = m.state.x[i];
+    }
+    machine.cpu.x[0] = data_at + 256;
+    machine.cpu.flags = @intCast(m.state.nzcv & 0xf000_0000);
+    while (true) switch (try hv.run(id)) {
+        .wfi => break,
+        .interrupted => {},
+        else => return error.UnexpectedExit,
+    };
+    for (0..8) |i| {
+        m.state.v[i] = machine.cpu.v[i];
+        m.state.x[i] = machine.cpu.x[i];
+    }
+    m.state.nzcv = machine.cpu.flags;
+}
+
+test "vector loads and stores agree with the machine they run on" {
+    if (!native_host) return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(0x3e3);
+    const random = prng.random();
+    var failed: usize = 0;
+    inline for (memory_cases) |case| {
+        var bad: usize = 0;
+        var report: ?[]const u8 = null;
+        for (0..100) |_| {
+            var before: Memory = undefined;
+            fill(random, &before.state);
+            random.bytes(&before.bytes);
+            before.state.x[1] = random.uintLessThan(u64, 4);
+            before.state.x[2] = random.uintLessThan(u64, 4);
+            var native = before;
+            runNativeMemory(case.word, &native);
+            var lifted = before;
+            lifted.state.x[0] = @intFromPtr(&lifted.bytes) + 256;
+            runLiftedMemory(case.word, &lifted) catch |err| {
+                report = @errorName(err);
+                bad = 1000;
+                break;
+            };
+            // Where x0 ends up is only comparable as a distance from the buffer.
+            native.state.x[0] -%= @intFromPtr(&native.bytes);
+            lifted.state.x[0] -%= @intFromPtr(&lifted.bytes);
+            if (!std.mem.eql(u8, std.mem.asBytes(&native), std.mem.asBytes(&lifted))) {
+                bad += 1;
+                if (report == null) {
+                    var detail: [256]u8 = undefined;
+                    var offset: usize = 0;
+                    for (native.bytes, lifted.bytes, 0..) |a, b, at| {
+                        if (a != b) {
+                            offset = at;
+                            break;
+                        }
+                    }
+                    report = std.fmt.bufPrint(&detail, "x0 {x} vs {x}, v1 {x}_{x} vs {x}_{x}, first byte differing at {}", .{ native.state.x[0], lifted.state.x[0], native.state.v[1][1], native.state.v[1][0], lifted.state.v[1][1], lifted.state.v[1][0], offset }) catch "?";
+                }
+            }
+        }
+        if (bad != 0) {
+            failed += 1;
+            std.debug.print("DIFFERS {s} ({x:0>8}): {} of 100: {s}\n", .{ case.text, case.word, bad, report orelse "" });
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), failed);
+}

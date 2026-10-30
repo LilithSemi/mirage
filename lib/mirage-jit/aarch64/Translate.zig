@@ -12,7 +12,7 @@
 //! 52-bit form needs `LPA`, which does not exist at EL1, so it is not here.
 const std = @import("std");
 const GuestMemory = @import("mirage-memory").GuestMemory;
-const Cpu = @import("vulcan-target").aarch64_guest.Cpu;
+const Cpu = @import("vulcan-target").aarch64.GuestCpu;
 
 const Translate = @This();
 
