@@ -7,6 +7,7 @@ const std = @import("std");
 const ir = @import("vulcan-ir");
 const vulcan = @import("vulcan-target");
 const native = vulcan.native;
+const opt = vulcan.opt;
 const lift = vulcan.aarch64_guest.lift;
 const Cpu = vulcan.aarch64_guest.Cpu;
 
@@ -44,6 +45,9 @@ pub fn compileIn(scratch: std.mem.Allocator, allocator: std.mem.Allocator, guest
     var func = ir.function.Function.init(scratch);
     defer func.deinit();
     try lift.region(&func, guest_pc, bytes);
+    // Tuning is only an improvement: a pass that gives up leaves the function it was handed
+    // correct, so a failure here costs speed and not the block.
+    _ = opt.optimize(scratch, &func) catch false;
 
     const funcs = [_]native.ModuleFunction{.{ .name = "block", .func = &func }};
     var image = try native.jitModule(scratch, &funcs);
