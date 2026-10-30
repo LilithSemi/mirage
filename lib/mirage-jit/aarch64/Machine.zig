@@ -225,68 +225,69 @@ fn run(ctx: *anyopaque, vcpu: Backend.VcpuId) Backend.Error!Backend.Exit {
                 .function = @truncate(self.cpu.x[0]),
                 .args = .{ self.cpu.x[1], self.cpu.x[2], self.cpu.x[3] },
             } },
-            .load, .store => {
-                // An exclusive access arms or checks the monitor around the access, and
-                // is otherwise the same access. The kind is read and cleared first so
-                // that it cannot leak onto the next block's plain load.
-                const exclusive = self.cpu.exclusive;
-                self.cpu.exclusive = .none;
-                self.faulted = false;
-                const outcome = switch (exclusive) {
-                    .none => try self.access(self.cpu.address, self.cpu.width, self.cpu.dest, self.cpu.value),
-                    .load => try self.loadExclusive(),
-                    .store => try self.storeExclusive(),
-                };
-                if (self.faulted) {
-                    self.cpu.writeback = false;
-                    self.cpu.second_pending = false;
-                    self.cpu.second_signed = .none;
-                    continue;
-                }
-                if (self.cpu.second_pending) {
-                    // The second half waits for the first to retire, so if the
-                    // host has to service this one, the other is still owed and
-                    // must be performed when the run resumes.
-                    if (outcome != null) return outcome.?;
-                    const second = .{
-                        .address = self.cpu.second_address,
-                        .width = self.cpu.second_width,
-                        .dest = self.cpu.second_dest,
-                        .value = self.cpu.second_value,
-                        .signed = self.cpu.second_signed,
-                    };
-                    self.cpu.second_pending = false;
-                    self.cpu.load_signed = second.signed;
-                    self.cpu.second_signed = .none;
-                    if (try self.access(second.address, second.width, second.dest, second.value)) |exit| return exit;
-                    if (self.faulted) {
-                        self.cpu.writeback = false;
-                        continue;
-                    }
-                } else if (outcome) |exit| return exit;
-                // A post-index access updates its base register only now that the
-                // access it described has retired without faulting.
-                if (self.cpu.writeback) {
-                    // Register 31 is the stack pointer for an access, as it is
-                    // for the base the translated block read.
-                    if (self.cpu.writeback_dest == 31) {
-                        self.cpu.sp = self.cpu.writeback_value;
-                    } else {
-                        self.cpu.x[self.cpu.writeback_dest] = self.cpu.writeback_value;
-                    }
-                    self.cpu.writeback = false;
-                }
-            },
+            .load, .store => if (try self.retireAccess()) |exit| return exit,
         }
     }
     return .interrupted;
 }
 
-/// One access, of `width` bytes. `value` is the datum to store and is ignored by
-/// a load. Returns null once the access has been carried out, or the exit the
-/// backend asked for when the host has to intervene. The direction is read from
-/// the caller's trap rather than from `dest`, so that a store to the discarded
-/// register 31 still performs its write.
+/// Perform the access the block that just ran left in the cpu, and everything that rides on it: the
+/// second half of a pair, and a post-index write-back. Returns the exit the host owes a service,
+/// or null once the access retired, whether by completing or by taking an exception.
+fn retireAccess(self: *Machine) Backend.Error!?Backend.Exit {
+    // An exclusive access arms or checks the monitor around the access, and
+    // is otherwise the same access. The kind is read and cleared first so
+    // that it cannot leak onto the next block's plain load.
+    const exclusive = self.cpu.exclusive;
+    self.cpu.exclusive = .none;
+    self.faulted = false;
+    const outcome = switch (exclusive) {
+        .none => try self.access(self.cpu.address, self.cpu.width, self.cpu.dest, self.cpu.value),
+        .load => try self.loadExclusive(),
+        .store => try self.storeExclusive(),
+    };
+    if (self.faulted) {
+        self.cpu.writeback = false;
+        self.cpu.second_pending = false;
+        self.cpu.second_signed = .none;
+        return null;
+    }
+    if (self.cpu.second_pending) {
+        // The second half waits for the first to retire, so if the
+        // host has to service this one, the other is still owed and
+        // must be performed when the run resumes.
+        if (outcome != null) return outcome;
+        const second = .{
+            .address = self.cpu.second_address,
+            .width = self.cpu.second_width,
+            .dest = self.cpu.second_dest,
+            .value = self.cpu.second_value,
+            .signed = self.cpu.second_signed,
+        };
+        self.cpu.second_pending = false;
+        self.cpu.load_signed = second.signed;
+        self.cpu.second_signed = .none;
+        if (try self.access(second.address, second.width, second.dest, second.value)) |exit| return exit;
+        if (self.faulted) {
+            self.cpu.writeback = false;
+            return null;
+        }
+    } else if (outcome) |exit| return exit;
+    // A post-index access updates its base register only now that the
+    // access it described has retired without faulting.
+    if (self.cpu.writeback) {
+        // Register 31 is the stack pointer for an access, as it is
+        // for the base the translated block read.
+        if (self.cpu.writeback_dest == 31) {
+            self.cpu.sp = self.cpu.writeback_value;
+        } else {
+            self.cpu.x[self.cpu.writeback_dest] = self.cpu.writeback_value;
+        }
+        self.cpu.writeback = false;
+    }
+    return null;
+}
+
 /// Zero the cache line holding `virtual`, which is sixty-four bytes. The line
 /// boundary is the address with its low six bits clear, and a machine whose
 /// memory is coherent with its cache has nothing to do beyond the zeroing.
@@ -311,6 +312,11 @@ fn zeroLine(self: *Machine, virtual: u64) Backend.Error!void {
     self.cache.written(physical);
 }
 
+/// One access, of `width` bytes. `value` is the datum to store and is ignored by
+/// a load. Returns null once the access has been carried out, or the exit the
+/// backend asked for when the host has to intervene. The direction is read from
+/// the caller's trap rather than from `dest`, so that a store to the discarded
+/// register 31 still performs its write.
 fn access(self: *Machine, address: u64, width: u8, dest: u8, value: u64) Backend.Error!?Backend.Exit {
     // The address a block formed is virtual. It becomes physical here, because
     // this is the one place where the translation regime can be consulted: a
