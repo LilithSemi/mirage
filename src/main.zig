@@ -9,6 +9,7 @@ const image = @import("mirage-image");
 const netmod = @import("mirage-net");
 const sessionmod = @import("mirage-session");
 const Options = @import("Options.zig");
+const jitrun = @import("jit.zig");
 const GuestMemory = @import("mirage-memory").GuestMemory;
 const attest = @import("mirage-attest");
 const Manifest = attest.Manifest;
@@ -40,7 +41,12 @@ pub fn main(init: std.process.Init) !void {
 
     const command = args[1];
     if (std.mem.eql(u8, command, "probe")) return runner.probe(&out.interface);
-    if (std.mem.eql(u8, command, "run")) return runner.run(gpa, io, &out.interface, args[2..]);
+    if (std.mem.eql(u8, command, "run")) {
+        if (Options.parse(args[2..])) |options| {
+            if (options.jit) return jitrun.run(gpa, io, &out.interface, options);
+        } else |_| {}
+        return runner.run(gpa, io, &out.interface, args[2..]);
+    }
     if (std.mem.eql(u8, command, "pack")) return pack(gpa, io, &out.interface, args[2..]);
     if (std.mem.eql(u8, command, "seal")) return seal(gpa, io, &out.interface, args[2..]);
 

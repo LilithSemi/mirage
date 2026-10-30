@@ -1,9 +1,8 @@
-//! Boots a raw arm64 Linux `Image` (and an optional initramfs) on the AArch64 JIT with a serial port and an
-//! interrupt controller, and says exactly where and why it stopped.
+//! `mirage run --jit yes`: boots a raw arm64 kernel (and an optional initramfs) on the AArch64 JIT with a
+//! serial port and an interrupt controller, and says exactly where and why it stopped.
 //!
-//! This is a driver for working towards a boot, not a gate: a kernel that has
-//! not booted yet ends here with the instruction, the address and the registers
-//! of whatever the JIT could not yet do.
+//! It needs no hypervisor, so it runs on any host. A kernel that does not boot ends with the
+//! instruction, the address and the registers of whatever the JIT could not yet do.
 const std = @import("std");
 const jit = @import("mirage-jit").aarch64;
 const core = @import("mirage-core");
@@ -13,9 +12,9 @@ const device = @import("mirage-device");
 const arm64 = @import("mirage-arm64");
 const attest = @import("mirage-attest");
 const GuestMemory = @import("mirage-memory").GuestMemory;
+const Options = @import("Options.zig");
 
 const ram_base = 0x4000_0000;
-const ram_size = 128 << 20;
 const uart_base = 0x0900_0000;
 
 const default_cmdline = "console=ttyAMA0 earlycon=pl011,0x9000000 nokaslr loglevel=8";
@@ -29,7 +28,7 @@ const Deadline = struct {
     exits: u64 = 0,
     /// Set when the guest's stack pointer left everything it could validly point at.
     lost_stack: bool = false,
-    /// A program counter to stop at, taken from `JIT_STOP_AT` in hex, to look at how the guest got
+    /// A program counter to stop at, from `--stop-at`, to look at how the guest got
     /// there. Zero is never a place to stop.
     stop_at: u64 = 0,
     reached: bool = false,
@@ -47,28 +46,36 @@ const Deadline = struct {
     }
 };
 
-pub fn main(init: std.process.Init) !void {
-    const gpa = init.gpa;
-    const io = init.io;
-
-    var out_buffer: [4096]u8 = undefined;
-    var out = std.Io.File.stdout().writer(io, &out_buffer);
-    const w = &out.interface;
-    defer w.flush() catch {};
-
-    // The serial console writes through unbuffered, so guest output appears as the
-    // guest produces it instead of when the 4 KiB buffer above fills or the run ends.
+pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, options: Options) !void {
+    const w = out;
+    // The serial console writes through unbuffered, so guest output appears as the guest produces it.
     var console_out = std.Io.File.stdout().writer(io, &.{});
     const console = &console_out.interface;
+    try w.flush();
 
-    const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len < 2) return error.ExpectedKernelPath;
-    const seconds: u32 = if (args.len > 2) try std.fmt.parseInt(u32, args[2], 10) else 20;
-    const cmdline: []const u8 = if (args.len > 3) args[3] else default_cmdline;
+    if (options.kernel.len == 0) {
+        try w.writeAll("a kernel is required\n");
+        return;
+    }
+    if (options.cpus != 1) {
+        try w.writeAll("the JIT runs one cpu\n");
+        return;
+    }
+    if (options.disk != null or options.vsock != null or options.nat or options.net != null or options.pci or
+        options.tpm != null or options.share_count > 0 or options.session != null or options.save != null or
+        options.restore != null or options.firmware != null)
+    {
+        try w.writeAll("the JIT has a serial port and an interrupt controller so far, and no other device\n");
+        return;
+    }
+    const seconds: u64 = options.seconds orelse 20;
+    const cmdline: []const u8 = options.cmdline;
+    const ram_size: u64 = options.memory << 20;
+    const limit: std.Io.Limit = .limited(1 << 30);
 
-    const kernel = try std.Io.Dir.cwd().readFileAlloc(io, args[1], gpa, .limited(256 << 20));
+    const kernel = try std.Io.Dir.cwd().readFileAlloc(io, options.kernel, gpa, limit);
     defer gpa.free(kernel);
-    const initrd: ?[]const u8 = if (args.len > 4) try std.Io.Dir.cwd().readFileAlloc(io, args[4], gpa, .limited(256 << 20)) else null;
+    const initrd: ?[]const u8 = if (options.initrd) |path| try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, limit) else null;
     defer if (initrd) |bytes| gpa.free(bytes);
 
     const ram = try gpa.alloc(u8, ram_size);
@@ -111,7 +118,7 @@ pub fn main(init: std.process.Init) !void {
     var trace: jit.Machine.Trace = .{};
     machine.trace = &trace;
     var deadline: Deadline = .{
-        .stop_at = if (std.c.getenv("JIT_STOP_AT")) |value| std.fmt.parseInt(u64, std.mem.span(value), 16) catch 0 else 0,
+        .stop_at = options.stop_at,
         .io = io,
         .machine = &machine,
         .until = std.Io.Clock.awake.now(io).nanoseconds + @as(i96, seconds) * std.time.ns_per_s,
