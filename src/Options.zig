@@ -57,6 +57,8 @@ pub const usage =
     \\  --share <name>=<dir>  offer that directory under that name, read only
     \\  --share <n>=<dir>:write  offer it and let the guest change what is in it
     \\  --session <path>      hold the guest up for whoever connects here
+    \\  --jit yes             run an AArch64 guest on the JIT instead of a hypervisor
+    \\  --stop-at <hex pc>    with --jit, stop where the guest reaches this address
     \\  --sev yes             launch the guest under AMD SEV
     \\  --sev-es yes          launch under SEV-ES (implies --sev yes)
     \\  --sev-policy <n>      SEV launch policy, 0 by default
@@ -66,6 +68,10 @@ pub const usage =
 const Options = @This();
 
 kernel: []const u8 = &.{},
+/// Run on the JIT, which needs no hypervisor and runs on any host.
+jit: bool = false,
+/// With the JIT, the address at which to stop and show how the guest got there.
+stop_at: u64 = 0,
 initrd: ?[]const u8 = null,
 disk: ?[]const u8 = null,
 cmdline: []const u8 = "console=ttyAMA0 earlycon=pl011,0x9000000",
@@ -234,6 +240,10 @@ pub fn parse(args: []const [:0]const u8) !Options {
 
         if (std.mem.eql(u8, name, "--kernel")) {
             options.kernel = value;
+        } else if (std.mem.eql(u8, name, "--jit")) {
+            options.jit = std.mem.eql(u8, value, "yes");
+        } else if (std.mem.eql(u8, name, "--stop-at")) {
+            options.stop_at = try std.fmt.parseInt(u64, value, 16);
         } else if (std.mem.eql(u8, name, "--initrd")) {
             options.initrd = value;
         } else if (std.mem.eql(u8, name, "--disk")) {

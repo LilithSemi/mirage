@@ -6,7 +6,18 @@
 
 const builtin = @import("builtin");
 
-pub const Backend = @import("mirage-backend/Backend.zig");
+const generic = @import("mirage-backend/Backend.zig");
+
+/// The backend interface for a guest of the architecture `Guest`, a module such as `mirage-arm64`.
+/// What a backend runs is a guest, and a translator runs one the host is not.
+pub const For = generic.For;
+
+/// The parts of a backend's vocabulary that are the same for every guest.
+pub const shared = generic.shared;
+
+/// The backend for the guest this build's hypervisor runs: a hardware hypervisor can only run a
+/// guest of its own architecture.
+pub const Backend = For(@import("mirage-arch"));
 pub const Exit = Backend.Exit;
 
 pub const hvf = switch (builtin.os.tag) {
@@ -40,7 +51,7 @@ pub const kvm = switch (builtin.os.tag) {
 };
 
 test {
-    _ = Backend;
+    _ = generic;
     if (builtin.os.tag == .macos) {
         _ = hvf.binding;
         _ = hvf.Machine;

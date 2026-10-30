@@ -11,7 +11,7 @@
 
 const std = @import("std");
 const testing = @import("mirage-testing");
-const Backend = @import("../../../Backend.zig");
+const Backend = @import("../../../Backend.zig").For(@import("mirage-arch"));
 const Vm = @import("../Vm.zig");
 const device = @import("mirage-device");
 const ioctl = @import("../ioctl.zig");

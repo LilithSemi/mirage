@@ -454,7 +454,7 @@ test "a guest still reaches the serial port with an interrupt controller present
 
     const ram = 0x4000_0000;
     const region = try machine.vm.addMemory(ram, 4 * std.heap.pageSize(), .shared);
-    var memory: @import("../../Backend.zig").GuestMemory = .{ .regions = &.{region} };
+    var memory: @import("mirage-memory").GuestMemory = .{ .regions = &.{region} };
 
     const code = [_]u32{
         0xd2a12001, // movz x1, #0x0900, lsl #16
