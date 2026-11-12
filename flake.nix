@@ -27,6 +27,12 @@
         "aarch64-darwin"
       ];
 
+      manifestVersion =
+        let
+          matched = builtins.match ".*\n[ ]*\\.version = \"([^\"]+)\",.*" (builtins.readFile ./build.zig.zon);
+        in
+        if matched == null then throw "build.zig.zon has no .version to read" else builtins.head matched;
+
       flakeverConfig = flakever.lib.mkFlakever {
         inherit inputs;
 
@@ -43,24 +49,35 @@
           system:
           f {
             inherit system;
-            pkgs = import nixpkgs { inherit system; };
+            pkgs = import nixpkgs {
+              inherit system;
+              overlays = [
+                self.overlays.default
+              ];
+            };
           }
         );
 
       treefmtEval = forAllSystems ({ pkgs, ... }: treefmt-nix.lib.evalModule pkgs (import ./treefmt.nix));
     in
     {
-      versionTemplate = "1.1pre-<lastModifiedDate>-<rev>";
+      versionTemplate =
+        if lib.hasSuffix "-unstable" manifestVersion then
+          "${manifestVersion}-<lastModifiedDate>-<rev>"
+        else
+          manifestVersion;
+
+      overlays.default = final: prev: {
+        mirage = final.callPackage ./pkgs/mirage {
+          flakever = flakeverConfig;
+          zig = final.zig_0_17;
+        };
+      };
 
       devShells = forAllSystems (
         { pkgs, ... }:
         {
-          default = pkgs.mkShell {
-            name = "mirage-dev-shell";
-            packages = with pkgs; [
-              zig_0_17
-            ];
-          };
+          default = pkgs.mirage.shell;
         }
       );
 
@@ -69,27 +86,7 @@
       checks = forAllSystems (
         { system, pkgs, ... }:
         {
-          default = pkgs.stdenv.mkDerivation (finalAttrs: {
-            pname = "mirage";
-            inherit (flakeverConfig) version;
-
-            src = lib.cleanSource ./.;
-
-            zigDeps = pkgs.zig_0_17.fetchDeps {
-              inherit (finalAttrs) src pname version;
-              hash = "sha256-5fq0AbGxyc5OEQdSIPzPSqHnruP9sShKNWy7UVtrmrc=";
-            };
-
-            nativeBuildInputs = with pkgs; [
-              zig_0_17
-            ];
-
-            postConfigure = ''
-              ln -s ${finalAttrs.zigDeps} "$ZIG_GLOBAL_CACHE_DIR/p"
-            '';
-
-            doCheck = true;
-          });
+          default = pkgs.mirage;
 
           formatting = treefmtEval.${system}.config.build.check self;
         }
