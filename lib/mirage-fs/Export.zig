@@ -6,9 +6,9 @@
 //! directory rather than a device of its own. Whoever holds the guest adds and withdraws them, and a
 //! guest puts them where it wants them with mounts of its own.
 //!
-//! This is what a guest mounts. It answers the kernel's filesystem messages from real files here,
-//! and it answers every request that would change something with a refusal, so a guest cannot write
-//! through it however it asks.
+//! This is what a guest mounts. It answers the kernel's filesystem messages from real files here.
+//! Whether a guest may change what it sees is the offer's to say: an offer nobody made writable
+//! answers every request that would change something with a refusal, however the guest asks.
 //!
 //! What a guest may reach is bounded by name rather than by trust. A name with a separator in it, or
 //! one that walks upwards, is refused before anything is opened: the kernel never sends those, so a
@@ -166,6 +166,8 @@ written_bytes: u64 = 0,
 made: u64 = 0,
 taken_away: u64 = 0,
 moved: u64 = 0,
+/// Times the guest asked for what it wrote to be on the disk and it was put there.
+pushed: u64 = 0,
 
 /// The number the guest holds for a file: which slot in the table, and which use of that slot. A guest
 /// that keeps one past the file being forgotten gets nothing back rather than somebody else's file.
@@ -350,9 +352,8 @@ pub fn answer(self: *Export, request: []const u8, into: []u8) usize {
         .rename, .rename2 => self.rename(into, head, body, head.op == .rename2),
         .symlink => self.makeLink(into, head, body),
         .link => self.makeHardLink(into, head, body),
-        // Nothing here holds anything back, so there is nothing to push out. Saying so is better
-        // than refusing: a program that asks and is refused takes it for a failure to save.
-        .fsync, .fsyncdir => wire.Answer.write(into, head.unique, 0, 0),
+        .fsync => self.push(into, head, body),
+        .fsyncdir => self.pushDirectory(into, head, body),
         .destroy => wire.Answer.write(into, head.unique, 0, 0),
         else => self.refuse(into, head, wire.err.nosys),
     };
@@ -1153,6 +1154,44 @@ fn makeHardLink(self: *Export, into: []u8, head: wire.Header, body: []const u8) 
     return wire.Answer.write(into, head.unique, 0, wire.Entry.write(into[wire.Answer.size..], nodeid, attr));
 }
 
+/// Put what the guest wrote on the disk under it.
+///
+/// A guest that asks for this and is told yes without anything being put there believes its work is
+/// safe when it is not, and a mail store or a database asks for exactly this before it says the same
+/// to whoever asked it. So the answer is yes only once the disk has it.
+///
+/// A share nobody made writable holds nothing of the guest's, so there is nothing to put anywhere
+/// and yes is the whole truth. The handle is still checked, because a yes to a handle nobody holds
+/// says the file is safe when there is no file.
+fn push(self: *Export, into: []u8, head: wire.Header, body: []const u8) usize {
+    const asked = wire.Fsync.parse(body) orelse return self.refuse(into, head, wire.err.invalid);
+    const held = self.heldAt(asked.handle) orelse return self.refuse(into, head, wire.err.badf);
+    const file = held.open orelse return self.refuse(into, head, wire.err.badf);
+    if (!self.mayWrite(head.nodeid)) return wire.Answer.write(into, head.unique, 0, 0);
+
+    file.sync(self.io) catch |failure| return self.refuse(into, head, wire.errnoFor(failure));
+    self.pushed += 1;
+    return wire.Answer.write(into, head.unique, 0, 0);
+}
+
+/// The same for a directory, which is what a program asks for after it moves a name into place. A
+/// file on the disk under a name that is not there yet is a file nothing finds.
+///
+/// The guest asks for this on the handle it reads names by, which is a directory this end opened and
+/// holds, so what is pushed out is that one and not a path looked up again.
+fn pushDirectory(self: *Export, into: []u8, head: wire.Header, body: []const u8) usize {
+    const asked = wire.Fsync.parse(body) orelse return self.refuse(into, head, wire.err.invalid);
+    const held = self.heldAt(asked.handle) orelse return self.refuse(into, head, wire.err.badf);
+    const opened = held.walking orelse return self.refuse(into, head, wire.err.badf);
+    if (!self.mayWrite(head.nodeid)) return wire.Answer.write(into, head.unique, 0, 0);
+
+    // A directory is pushed out the way a file is, through the same call on what it was opened as.
+    const as_file: std.Io.File = .{ .handle = opened.handle, .flags = .{ .nonblocking = false } };
+    as_file.sync(self.io) catch |failure| return self.refuse(into, head, wire.errnoFor(failure));
+    self.pushed += 1;
+    return wire.Answer.write(into, head.unique, 0, 0);
+}
+
 fn release(self: *Export, into: []u8, head: wire.Header, body: []const u8) usize {
     const handle = wire.Release.parse(body) orelse return self.refuse(into, head, wire.err.invalid);
     if (self.heldAt(handle)) |held| {
@@ -1729,6 +1768,97 @@ test "a guest writes into a share that allows it" {
     defer gpa.free(on_disk);
     try std.testing.expectEqualSlices(u8, said, on_disk);
     try std.testing.expectEqual(@as(u64, said.len), offered.written_bytes);
+}
+
+test "what the guest asked to be on the disk is on the disk before it is told so" {
+    const gpa = std.testing.allocator;
+    var bench = try Bench.open(gpa);
+    defer bench.close();
+
+    var offered = try Export.init(gpa, bench.io);
+    defer offered.deinit();
+    try offered.offer("work", bench.at, true);
+
+    var request: [1024]u8 = undefined;
+    var answered: [4096]u8 = undefined;
+    const work = try nodeOf(&offered, "work", &request, &answered);
+
+    var create_in: [wire.Create.in_size + 8]u8 = @splat(0);
+    std.mem.writeInt(u32, create_in[0..4], 0o101, .little);
+    std.mem.writeInt(u32, create_in[4..8], 0o100644, .little);
+    @memcpy(create_in[wire.Create.in_size..][0..6], "mail\x00\x00");
+    var wrote = offered.answer(ask(&request, .create, work, &create_in), &answered);
+    const nodeid = std.mem.readInt(u64, answered[wire.Answer.size..][0..8], .little);
+    const handle = std.mem.readInt(u64, answered[wire.Answer.size + wire.Entry.size ..][0..8], .little);
+
+    const said = "a message nobody may lose\n";
+    var write_in: [wire.Write.in_size + said.len]u8 = @splat(0);
+    std.mem.writeInt(u64, write_in[0..8], handle, .little);
+    std.mem.writeInt(u32, write_in[16..20], said.len, .little);
+    @memcpy(write_in[wire.Write.in_size..], said);
+    wrote = offered.answer(ask(&request, .write, nodeid, &write_in), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+
+    // The file, then the directory its name is in. A program that keeps mail does both, because a
+    // file on the disk under a name that is not there is a file nothing finds.
+    var sync_in: [wire.Fsync.in_size]u8 = @splat(0);
+    std.mem.writeInt(u64, sync_in[0..8], handle, .little);
+    wrote = offered.answer(ask(&request, .fsync, nodeid, &sync_in), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+    try std.testing.expectEqual(@as(u64, 1), offered.pushed);
+
+    var open_in: [8]u8 = @splat(0);
+    wrote = offered.answer(ask(&request, .opendir, work, &open_in), &answered);
+    const walking = std.mem.readInt(u64, answered[wire.Answer.size..][0..8], .little);
+    std.mem.writeInt(u64, sync_in[0..8], walking, .little);
+    wrote = offered.answer(ask(&request, .fsyncdir, work, &sync_in), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+    try std.testing.expectEqual(@as(u64, 2), offered.pushed);
+
+    // A yes to a handle nobody holds would say a file is safe when there is no file, so the handle
+    // is looked at rather than taken. This is what tells a push that happened from one that did not.
+    std.mem.writeInt(u64, sync_in[0..8], 61, .little);
+    wrote = offered.answer(ask(&request, .fsync, nodeid, &sync_in), &answered);
+    try std.testing.expectEqual(@as(?i32, wire.err.badf), refusalIn(answered[0..wrote]));
+    wrote = offered.answer(ask(&request, .fsyncdir, work, &sync_in), &answered);
+    try std.testing.expectEqual(@as(?i32, wire.err.badf), refusalIn(answered[0..wrote]));
+    try std.testing.expectEqual(@as(u64, 2), offered.pushed);
+}
+
+test "a share nobody made writable answers a push without one" {
+    const gpa = std.testing.allocator;
+    var bench = try Bench.open(gpa);
+    defer bench.close();
+
+    var offered = try Export.init(gpa, bench.io);
+    defer offered.deinit();
+    try offered.offer("store", bench.at, false);
+
+    var request: [1024]u8 = undefined;
+    var answered: [4096]u8 = undefined;
+    const store = try nodeOf(&offered, "store", &request, &answered);
+    var asking: [8]u8 = @splat(0);
+    @memcpy(asking[0..6], "hello\x00");
+    var wrote = offered.answer(ask(&request, .lookup, store, &asking), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+    const hello = std.mem.readInt(u64, answered[wire.Answer.size..][0..8], .little);
+
+    // Nothing of the guest's is held here, so there is nothing to put on the disk. A refusal would
+    // be read as a failure to save by a program that only ever read.
+    var open_in: [8]u8 = @splat(0);
+    wrote = offered.answer(ask(&request, .open, hello, &open_in), &answered);
+    const handle = std.mem.readInt(u64, answered[wire.Answer.size..][0..8], .little);
+    var sync_in: [wire.Fsync.in_size]u8 = @splat(0);
+    std.mem.writeInt(u64, sync_in[0..8], handle, .little);
+    wrote = offered.answer(ask(&request, .fsync, hello, &sync_in), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+
+    wrote = offered.answer(ask(&request, .opendir, store, &open_in), &answered);
+    const walking = std.mem.readInt(u64, answered[wire.Answer.size..][0..8], .little);
+    std.mem.writeInt(u64, sync_in[0..8], walking, .little);
+    wrote = offered.answer(ask(&request, .fsyncdir, store, &sync_in), &answered);
+    try std.testing.expectEqual(@as(?i32, null), refusalIn(answered[0..wrote]));
+    try std.testing.expectEqual(@as(u64, 0), offered.pushed);
 }
 
 test "a guest makes and unmakes directories and moves names about" {

@@ -317,6 +317,20 @@ pub const Read = struct {
     }
 };
 
+pub const Fsync = struct {
+    pub const in_size = 16;
+
+    handle: u64,
+
+    /// The flags say whether the guest wants only the contents out. They are not read, because the
+    /// one call this end has pushes the contents and what describes them together: more than a
+    /// contents only sync asks for, and never less.
+    pub fn parse(body: []const u8) ?Fsync {
+        if (body.len < in_size) return null;
+        return .{ .handle = std.mem.readInt(u64, body[0..8], .little) };
+    }
+};
+
 pub const Release = struct {
     pub fn parse(body: []const u8) ?u64 {
         if (body.len < 8) return null;

@@ -1104,6 +1104,15 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         }
         // What the guest finished with. A guest held up for a session makes and forgets files for hours,
         // and a number here that stays at zero while it works means this side is holding all of them.
+        // What the guest changed, and how often it asked for that to be on the disk. A guest keeping
+        // mail or a database asks, and a number that stays at zero while it writes is a guest whose
+        // work is only in the page cache.
+        if (one.written_bytes != 0) {
+            try say.print("share: {d}KB written, put on the disk {d} times\n", .{
+                one.written_bytes / 1024,
+                one.pushed,
+            });
+        }
         if (one.let_go_nodes != 0) {
             try say.print("share: {d} files the guest finished with\n", .{one.let_go_nodes});
         }
