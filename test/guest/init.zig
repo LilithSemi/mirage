@@ -731,6 +731,64 @@ fn network() void {
     say("network: no answer came back\n");
 }
 
+/// What an echo asks with and what an answer carries: the kind, then the two numbers that come back.
+const echo_request = 8;
+const echo_reply = 0;
+
+/// The sum the internet protocols check a header by: every pair of bytes added up, carried round, and
+/// turned over.
+fn onesComplement(bytes: []const u8) u16 {
+    var sum: u32 = 0;
+    var at: usize = 0;
+    while (at + 1 < bytes.len) : (at += 2) sum += std.mem.readInt(u16, bytes[at..][0..2], .big);
+    if (at < bytes.len) sum += @as(u16, bytes[at]) << 8;
+    while (sum >> 16 != 0) sum = (sum & 0xffff) + (sum >> 16);
+    return ~@as(u16, @truncate(sum));
+}
+
+/// Ask the gateway for an echo.
+///
+/// This is the shortest thing that proves a frame left the guest, that whatever is on the other side
+/// read it and built an answer, and that the answer came back. What answers differs by how the guest
+/// was given its network, and the line this prints is the same either way.
+fn ping() void {
+    const raw = linux.socket(linux.AF.INET, linux.SOCK.RAW, 1);
+    if (std.posix.errno(raw) != .SUCCESS) {
+        say("network: no raw socket\n");
+        return;
+    }
+    const sock: i32 = @intCast(raw);
+    defer _ = linux.close(sock);
+
+    var request = [8]u8{ echo_request, 0, 0, 0, 0x12, 0x34, 0, 1 };
+    std.mem.writeInt(u16, request[2..4], onesComplement(&request), .big);
+
+    var gateway = inetAddress(10, 0, 2, 2);
+    const sent = linux.sendto(sock, &request, request.len, 0, @ptrCast(&gateway), @sizeOf(linux.sockaddr.in));
+    if (std.posix.errno(sent) != .SUCCESS) {
+        say("network: the echo would not go\n");
+        return;
+    }
+
+    // The header the kernel leaves in front of the answer is as long as it says it is, so where the
+    // echo starts is read rather than assumed.
+    var answer: [256]u8 = undefined;
+    var tries: usize = 0;
+    while (tries < 40) : (tries += 1) {
+        const got = linux.recvfrom(sock, &answer, answer.len, 0x40, null, null);
+        if (std.posix.errno(got) == .SUCCESS and got >= 20) {
+            const header = @as(usize, answer[0] & 0x0f) * 4;
+            if (got > header and answer[header] == echo_reply) {
+                say("network: the gateway answered\n");
+                return;
+            }
+        }
+        var pause: linux.timespec = .{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+        while (linux.nanosleep(&pause, &pause) == @as(usize, @bitCast(@as(isize, -4)))) {}
+    }
+    say("network: the gateway said nothing\n");
+}
+
 /// The character device the chip driver offers. Its numbers are fixed, so the node is made here
 /// rather than waiting for something to populate `/dev`.
 const tpm_major = 10;
@@ -929,6 +987,11 @@ fn stream() void {
     const fd: i32 = @intCast(opened);
     defer _ = linux.close(fd);
 
+    // One retry rather than the kernel's own handful, which take minutes between them. A far end
+    // that never answers is a thing to be told about, not a thing to wait out.
+    var once: u32 = 1;
+    _ = linux.setsockopt(fd, 6, 7, @ptrCast(&once), @sizeOf(u32));
+
     var address = inetAddress(10, 0, 2, 2);
     address.port = std.mem.nativeToBig(u16, stream_port);
     const joined = linux.connect(fd, @ptrCast(&address), @sizeOf(linux.sockaddr.in));
@@ -972,6 +1035,7 @@ pub fn main() void {
     share();
     channel();
     network();
+    ping();
     stream();
 
     // Give the devices that work in the background time to do so. The balloon driver hands

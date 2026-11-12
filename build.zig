@@ -355,6 +355,10 @@ pub fn build(b: *std.Build) void {
         // is what makes it a gate that can always run, unlike the one that needs passt.
         const nat_on = b.option(bool, "nat", "Give the guest a network of this vmm's own") orelse false;
         boot_options.addOption(bool, "nat", nat_on);
+        // A kernel interface the frames really go out of. It has to exist already and belong to
+        // whoever runs this, because attaching to one is all an unprivileged process may do.
+        const tap_name = b.option([]const u8, "tap", "Name of a tap interface owned by this user") orelse "";
+        boot_options.addOption([]const u8, "tap_name", tap_name);
         // A pci host bridge with nothing behind it. The guest enumerates an empty bus, which is what
         // says the config window, the two memory windows and the tree all agree. Needs a kernel with
         // the generic host bridge driver built in, which the small kernel here does not have.

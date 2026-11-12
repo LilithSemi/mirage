@@ -53,6 +53,17 @@ const net_on = net_socket.len > 0;
 /// beside this test, which is what lets it be a gate that always runs.
 const nat_on = options.nat;
 
+/// The kernel interface the guest's frames go out of, or nothing. The interface has to exist and to
+/// be this user's, so this is a gate of its own rather than one that always runs.
+const tap_name = options.tap_name;
+const tap_on = tap_name.len > 0;
+
+/// Where this machine answers on that interface, which is the address the guest has as its gateway.
+const tap_host: u32 = 0x0202_000a;
+
+/// Where this machine answers for a guest behind a translator, which reaches it on the loopback.
+const loopback: u32 = 0x0100_007f;
+
 /// Whether the guest is given a pci host bridge. Needs a kernel with the generic host bridge
 /// driver built in, so it is a gate of its own.
 const pci_on = options.pci or options.glacier;
@@ -215,7 +226,7 @@ const Listener = struct {
     heard: usize = 0,
     answered: bool = false,
 
-    fn open() ?Listener {
+    fn open(at: u32) ?Listener {
         const raw = linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0);
         if (std.posix.errno(raw) != .SUCCESS) return null;
         const handle: std.posix.fd_t = @intCast(raw);
@@ -228,7 +239,7 @@ const Listener = struct {
         var address: linux.sockaddr.in = .{
             .family = linux.AF.INET,
             .port = std.mem.nativeToBig(u16, stream_port),
-            .addr = 0x0100007f,
+            .addr = at,
             .zero = @splat(0),
         };
         if (std.posix.errno(linux.bind(handle, @ptrCast(&address), @sizeOf(linux.sockaddr.in))) != .SUCCESS) {
@@ -426,7 +437,7 @@ test "a real linux kernel boots far enough to speak" {
         .uart_base = uart_base,
         .vsock = channel_on,
         .balloon = balloon_on,
-        .net = net_on or nat_on,
+        .net = net_on or nat_on or tap_on,
         .tpm = chip_on,
         .pci = pci_on,
         .share = share_on,
@@ -485,10 +496,28 @@ test "a real linux kernel boots far enough to speak" {
     defer nat.deinit();
     if (nat_on) card.init(guest_mac);
 
-    // Something for the guest to reach through the gateway, on this machine's own loopback.
-    var listener: ?Listener = if (nat_on) Listener.open() else null;
+    // The interface itself. Whoever set this machine up made it and owns it, so attaching asks the
+    // kernel for nothing privileged; an interface that is not there is a gate that cannot run.
+    var tap: ?netmod.Tap = null;
+    if (tap_on) {
+        card.init(guest_mac);
+        tap = netmod.Tap.open(tap_name) catch |err| {
+            std.debug.print("\ncannot attach to {s}: {t}\n", .{ tap_name, err });
+            return error.SkipZigTest;
+        };
+    }
+    defer if (tap) |*open| open.close();
+
+    // Something for the guest to reach: on the loopback for a guest behind a translator, and on the
+    // interface itself for a guest whose frames leave this process.
+    var listener: ?Listener = if (nat_on)
+        Listener.open(loopback)
+    else if (tap_on)
+        Listener.open(tap_host)
+    else
+        null;
     defer if (listener) |*each| each.deinit();
-    if (nat_on and listener == null) std.debug.print("\ncannot listen on port {d}, so the stream is not checked\n", .{stream_port});
+    if ((nat_on or tap_on) and listener == null) std.debug.print("\ncannot listen on port {d}, so the stream is not checked\n", .{stream_port});
 
     // The chip needs something that understands its commands. `swtpm` is the usual one, and a gate
     // with a path but nothing listening is a gate that would pass without proving anything.
@@ -597,7 +626,7 @@ test "a real linux kernel boots far enough to speak" {
         on_bus += 1;
         serviced += 1;
     }
-    if (net_on or nat_on) {
+    if (net_on or nat_on or tap_on) {
         devices[on_bus] = card.device(arm64.fdt.net_base);
         services[serviced] = card.service(arm64.fdt.net_intid);
         on_bus += 1;
@@ -676,7 +705,10 @@ test "a real linux kernel boots far enough to speak" {
 
     // A guest that is waiting on a timer nobody built will sit in `KVM_RUN` forever,
     // so the loop is bounded by the clock as well as by the exit count.
-    const deadline = nowMs() + 5_000;
+    // A guest whose resolver answers is done well inside this. One asking a resolver that is not
+    // there waits out its own patience first, and that wait is longer than everything else the
+    // guest does, so the gate that has no resolver gets more clock rather than a shorter guest.
+    const deadline = nowMs() + if (tap_on) @as(i64, 10_000) else 5_000;
     armTicks(10);
 
     var exits: usize = 0;
@@ -801,12 +833,29 @@ test "a real linux kernel boots far enough to speak" {
             }
         }
 
+        // One read off a kernel interface is one whole frame, so there is nothing to put together
+        // here and no helper to be out of step with.
+        if (tap_on) {
+            if (listener) |*each| each.turn();
+            const interface = &tap.?;
+
+            var frame: [device.virtio.Net.max_frame]u8 = undefined;
+            while (true) {
+                const got = interface.read(&frame) catch break;
+                if (got == 0) break;
+                if (card.send(&memory, frame[0..got]) catch false) frames_in += 1;
+            }
+            while (card.receive(&memory, &frame) catch null) |length| {
+                if (interface.write(frame[0..length]) catch false) frames_out += 1;
+            }
+        }
+
         if (sink.buffered().len + 512 > output.len) break;
     }
 
     std.debug.print(
-        "\n=== exits {d}, stopped {?}, unmapped {d}, dropped {d} ===\n{s}\n=== end ===\n",
-        .{ exits, stopped, bus.unmapped, serial.dropped, sink.buffered() },
+        "\n=== exits {d}, stopped {?}, unmapped {d}, dropped {d}, frames {d} out {d} in ===\n{s}\n=== end ===\n",
+        .{ exits, stopped, bus.unmapped, serial.dropped, frames_out, frames_in, sink.buffered() },
     );
 
     const log = sink.buffered();
@@ -977,6 +1026,30 @@ test "a real linux kernel boots far enough to speak" {
         try std.testing.expectEqual(@as(u64, 0), relay.refused);
     }
 
+    if (tap_on) {
+        // The driver probed, and frames crossed a real kernel interface both ways.
+        try std.testing.expect(card.ready());
+        try std.testing.expect(frames_out > 0);
+        try std.testing.expect(frames_in > 0);
+        try std.testing.expect(std.mem.indexOf(u8, log, "network: eth0 is up") != null);
+
+        // The whole way there and back, through a stack that is not this process: the guest's frame
+        // left here, this machine's own kernel read it, answered it, and the answer arrived in the
+        // guest. Nothing in this process translated anything, which is the difference between this
+        // gate and the one beside it.
+        try std.testing.expect(std.mem.indexOf(u8, log, "network: the gateway answered") != null);
+
+        try std.testing.expectEqual(@as(u64, 0), card.dropped);
+
+        // A connection as well, when this machine lets one in. A host that filters what arrives on
+        // the interface drops it before anything is listening, and that is this machine's to allow
+        // rather than the guest's to get right, so it is said here and not asserted.
+        const at_far_end = if (listener) |each| each.heard else 0;
+        if (at_far_end == 0) {
+            std.debug.print("\nnothing reached {d} over the interface, so no stream was carried\n", .{stream_port});
+        }
+    }
+
     if (nat_on) {
         // A connection, not only a datagram. The guest opened one to the gateway, which reaches this
         // machine itself, said something, and read the answer. That is what a coding session rests on:
@@ -998,6 +1071,11 @@ test "a real linux kernel boots far enough to speak" {
         // the card, the translation, a socket of this process's own, and back again.
         try std.testing.expect(std.mem.indexOf(u8, log, "network: eth0 is up") != null);
         try std.testing.expect(std.mem.indexOf(u8, log, "network: the name was answered") != null);
+
+        // The gateway answered an echo as well, which here is this process answering as the network
+        // the guest believes it is on. The gate beside this one has the same line answered by a real
+        // kernel, so one line says a different thing in each.
+        try std.testing.expect(std.mem.indexOf(u8, log, "network: the gateway answered") != null);
 
         try std.testing.expect(frames_out > 0);
         try std.testing.expect(frames_in > 0);
