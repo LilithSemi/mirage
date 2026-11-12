@@ -24,6 +24,13 @@ pub const Socket = switch (builtin.os.tag) {
     else => @import("mirage-net/Socket.zig"),
 };
 
+/// A kernel interface the frames really go out of, for a guest that whoever runs it has to reach by
+/// address. Linux only: nothing answers to this on a Mac without a kernel extension.
+pub const Tap = switch (builtin.os.tag) {
+    .linux => @import("mirage-net/Tap.zig"),
+    else => void,
+};
+
 /// A network of this VMM's own, for a guest with no helper to give it one. Guarded like the socket,
 /// because it opens sockets of its own and a target with no operating system has none.
 pub const Nat = switch (builtin.os.tag) {
@@ -952,4 +959,5 @@ test "a frame is refused when the queue for the helper is full" {
 test {
     if (Socket != void) _ = Socket;
     if (Nat != void) _ = Nat;
+    if (Tap != void) _ = Tap;
 }

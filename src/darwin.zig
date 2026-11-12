@@ -205,6 +205,14 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     const disk = if (options.disk) |path| try cwd.readFileAlloc(io, path, gpa, file_limit) else null;
     defer if (disk) |bytes| gpa.free(bytes);
 
+    // Said here rather than ignored: a guest started with a network it does not have reads as a
+    // guest whose network is broken. Nothing answers to a tap on this system without a kernel
+    // extension, so a guest here reaches the network through one of this VMM's own.
+    if (options.tap != null) {
+        try say.writeAll("this system has no tap interface, so use --nat for a network\n");
+        return;
+    }
+
     var machine = backend.hvf.Machine.create(gpa, options.cpus) catch |err| {
         // Either the framework is not there, or this process was not signed to be allowed a guest.
         try say.print("no hypervisor: {t}\n", .{err});

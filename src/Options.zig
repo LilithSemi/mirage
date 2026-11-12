@@ -29,6 +29,8 @@ pub const usage =
     \\  --nat yes             give the guest a network of this vmm's own, with no helper
     \\  --net <path>          reach the network through a helper listening here
     \\  --net-fd <number>     reach it through a descriptor already connected to one
+    \\  --tap <name>          reach the network through this kernel interface
+    \\  --tap-fd <number>     reach it through a descriptor already attached to one
     \\  --save <path>         write everything the guest holds when the run ends
     \\  --restore <path>      start from that instead of from a kernel
     \\  --manifest yes        list what was measured, in the order it was measured
@@ -95,6 +97,9 @@ nat: bool = false,
 /// helper, so a descriptor that is already connected is the usual way in, and a path is for
 /// a person at a shell.
 net: ?Helper = null,
+/// The kernel interface the guest's frames go out of. A guest whoever runs it has to reach at an
+/// address needs this: a translator lets a guest open a connection and takes none.
+tap: ?Interface = null,
 /// Where to write everything the guest holds when the run ends.
 save: ?[]const u8 = null,
 /// Where to read it back from, instead of loading a kernel. The devices given have to be the
@@ -223,6 +228,9 @@ pub const Limit = union(enum) { megabytes: usize, machine };
 
 pub const Helper = union(enum) { path: []const u8, fd: std.posix.fd_t };
 
+/// A kernel interface, by the name it has or by a descriptor somebody already attached to it.
+pub const Interface = union(enum) { name: []const u8, fd: std.posix.fd_t };
+
 pub fn parse(args: []const [:0]const u8) !Options {
     var options: Options = .{};
     var gave_exits = false;
@@ -272,6 +280,10 @@ pub fn parse(args: []const [:0]const u8) !Options {
             options.seconds = try std.fmt.parseInt(u64, value, 10);
         } else if (std.mem.eql(u8, name, "--tick")) {
             options.tick_ms = try std.fmt.parseInt(u64, value, 10);
+        } else if (std.mem.eql(u8, name, "--tap")) {
+            options.tap = .{ .name = value };
+        } else if (std.mem.eql(u8, name, "--tap-fd")) {
+            options.tap = .{ .fd = try std.fmt.parseInt(std.posix.fd_t, value, 10) };
         } else if (std.mem.eql(u8, name, "--nat")) {
             options.nat = std.mem.eql(u8, value, "yes");
         } else if (std.mem.eql(u8, name, "--cpus")) {
@@ -357,8 +369,14 @@ pub fn complain(self: Options, out: *std.Io.Writer, cpu_room: u64) !bool {
     // A session reaches by name: the guest asks for one, whoever holds the session decides and hands
     // back a connection already made. A network of the guest's own is a second way out that answers
     // to nobody, and a guest with both has a door that is watched and a door that is not.
-    if (self.session != null and (self.nat or self.net != null)) {
+    if (self.session != null and (self.nat or self.net != null or self.tap != null)) {
         try out.writeAll("a guest held up for somebody else reaches by name, so it gets no network of its own\n");
+        return true;
+    }
+    // One device, so one way out. Two of these given together is a caller who means one of them and
+    // would otherwise find out which by watching where the traffic went.
+    if (@as(u8, @intFromBool(self.nat)) + @intFromBool(self.net != null) + @intFromBool(self.tap != null) > 1) {
+        try out.writeAll("a guest has one network: a helper, a tap, or one of this vmm's own\n");
         return true;
     }
     // Each CPU gets a piece of the interrupt controller of its own, and they have to fit below the

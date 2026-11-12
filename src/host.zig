@@ -149,6 +149,15 @@ pub const Host = struct {
     relay: *netmod.Relay = undefined,
     /// A network of this VMM's own, given instead of a helper when the caller asked for one.
     nat: ?*netmod.Nat = null,
+    /// A kernel interface, given instead of either when the guest is one to be reached at an address.
+    tap: ?*netmod.Tap = null,
+    /// A frame off the interface the guest had no buffer for. The kernel has already taken it off
+    /// the wire, so letting it go loses a packet nothing will send again; it waits here and goes in
+    /// before anything else next turn.
+    waiting: [device.virtio.Net.max_frame]u8 = undefined,
+    waiting_len: usize = 0,
+    /// Frames the kernel would not take, which is a guest sending faster than the interface drains.
+    refused_out: u64 = 0,
     /// Set when the run is over and every CPU should leave its loop. A CPU that kept going would be one
     /// whose registers cannot be read, because it holds its own lock while it is inside the hypervisor.
     stopping: std.atomic.Value(bool) = .init(false),
@@ -269,6 +278,55 @@ pub const Host = struct {
         }
     }
 
+    /// Carry frames between the card and a kernel interface.
+    ///
+    /// One read is one frame and one write takes one, so there is nothing to put back together here.
+    /// What there is instead is a frame the guest had no room for, which is held rather than let go:
+    /// the kernel has already taken it off the wire and nothing will send it again.
+    fn pumpTap(self: *Host, memory: *GuestMemory) void {
+        // A system with no tap device has no type for one either, and the body below is about that
+        // type. Asked this way the whole of it is left out of such a build rather than refused.
+        if (comptime netmod.Tap == void) return;
+        const card = self.card orelse return;
+        const tap = self.tap orelse return;
+        if (self.helper_gone) return;
+
+        if (self.waiting_len > 0) {
+            const went = card.send(memory, self.waiting[0..self.waiting_len]) catch return;
+            if (!went) return;
+            self.waiting_len = 0;
+            self.frames_in += 1;
+        }
+
+        var frame: [device.virtio.Net.max_frame]u8 = undefined;
+        while (true) {
+            const got = tap.read(&frame) catch {
+                self.helper_gone = true;
+                return;
+            };
+            if (got == 0) break;
+            const went = card.send(memory, frame[0..got]) catch break;
+            if (!went) {
+                @memcpy(self.waiting[0..got], frame[0..got]);
+                self.waiting_len = got;
+                break;
+            }
+            self.frames_in += 1;
+        }
+
+        while (card.receive(memory, &frame) catch null) |length| {
+            const went = tap.write(frame[0..length]) catch {
+                self.helper_gone = true;
+                return;
+            };
+            if (!went) {
+                self.refused_out += 1;
+                continue;
+            }
+            self.frames_out += 1;
+        }
+    }
+
     fn pump(self: *Host, memory: *GuestMemory) void {
         const card = self.card orelse return;
         const socket = self.socket orelse return;
@@ -363,6 +421,7 @@ pub const Host = struct {
         if (self.memory) |memory| {
             self.pump(memory);
             self.pumpNat(memory);
+            self.pumpTap(memory);
         }
 
         const channel = self.vsock orelse return true;

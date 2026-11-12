@@ -490,7 +490,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         .block_device = disk != null,
         .vsock = options.vsock != null,
         .balloon = options.limit != null,
-        .net = options.net != null or options.nat,
+        .net = options.net != null or options.nat or options.tap != null,
         .tpm = options.tpm != null,
         .pci = options.pci,
         .share = options.share_count > 0,
@@ -606,6 +606,24 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
             },
         };
     }
+
+    // A kernel interface, when the caller named one. Whoever set this machine up made it and owns it,
+    // so attaching needs no privilege here; a descriptor already attached is taken as it is.
+    var tap: ?netmod.Tap = null;
+    if (options.tap) |which| {
+        card.init(guest_mac);
+        tap = switch (which) {
+            .name => |name| netmod.Tap.open(name) catch |err| {
+                try say.print("cannot use the interface {s}: {t}\n", .{ name, err });
+                return;
+            },
+            .fd => |number| netmod.Tap.adopt(number) catch |err| {
+                try say.print("cannot use descriptor {d} as an interface: {t}\n", .{ number, err });
+                return;
+            },
+        };
+    }
+    defer if (tap) |*open| open.close();
 
     // A network of this VMM's own, when the caller asked for one instead of a helper. The guest is told
     // it holds one address and that a gateway sits beside it, and this translates between the two.
@@ -817,7 +835,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     if (options.limit != null) {
         attached.addServed(balloon.device(platform.balloon.addr), balloon.service(platform.balloon.intid));
     }
-    if (options.net != null or options.nat) {
+    if (options.net != null or options.nat or options.tap != null) {
         attached.addServed(card.device(platform.net.addr), card.service(platform.net.intid));
     }
     var bus = attached.bus();
@@ -949,8 +967,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         .session = held,
         .balloon = if (options.limit != null) &balloon else null,
         .memory = &memory,
-        .card = if (options.net != null or options.nat) &card else null,
+        .card = if (options.net != null or options.nat or options.tap != null) &card else null,
         .nat = if (options.nat) &nat else null,
+        .tap = if (tap) |*each| each else null,
         .socket = socket,
         .relay = &relay,
         .chip = if (options.tpm != null) &chip else null,
@@ -1119,7 +1138,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
     }
     if (gic.dropped != 0) try say.print("{d} interrupts were dropped\n", .{gic.dropped});
     if (bus.unmapped != 0) try say.print("{d} guest accesses matched no device\n", .{bus.unmapped});
-    if (options.net != null or options.nat) {
+    if (options.net != null or options.nat or options.tap != null) {
         // Whether the driver set the queues up says whether it probed at all, which a log line
         // does not: a network driver says nothing when it finds a device it is happy with.
         try say.print("network: driver ready {}, {d} frames from the guest, {d} to it\n", .{
@@ -1130,6 +1149,12 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         if (end.helper_gone) try say.writeAll("the network helper went away\n");
         if (card.dropped != 0) try say.print("{d} frames were dropped\n", .{card.dropped});
         if (relay.refused != 0) try say.print("{d} times the helper sent something unreadable\n", .{relay.refused});
+    }
+    if (options.tap != null) {
+        // A frame the kernel would not take is a guest sending faster than the interface drains, and
+        // one held is a guest that left no buffer. Both are the guest's doing and neither is a fault.
+        if (end.refused_out != 0) try say.print("{d} frames the interface would not take\n", .{end.refused_out});
+        if (end.waiting_len != 0) try say.writeAll("a frame was still waiting for the guest\n");
     }
     if (options.nat) {
         // What the built in network carried, and what it could not. A guest whose traffic vanishes in
