@@ -74,6 +74,13 @@
         };
       };
 
+      packages = forAllSystems (
+        { pkgs, ... }:
+        {
+          default = pkgs.mirage;
+        }
+      );
+
       devShells = forAllSystems (
         { pkgs, ... }:
         {

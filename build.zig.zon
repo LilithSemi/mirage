@@ -12,8 +12,8 @@
             .hash = "almanac-0.1.0-9SzmcJ8pBgC05r2UQazhuVhCuMRbSS_zhnYSEJmrcqG4",
         },
         .vulcan = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/vulcan#b3d2e1c3cd0d2f509ae52ab25c322900afd5c665",
-            .hash = "vulcan-0.0.0-d6EfZGCxugDp_D1KyWt0RaOmimET9LUPz5XXlUZ9SjvT",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/vulcan#4f3be4ab07182d4c7a6587138b6c7ee2d492b5f8",
+            .hash = "vulcan-0.0.0-d6EfZBZF0ACjq9cNvzqtmHv1rgvN-lngnI3_wu3RqfTt",
         },
     },
     .paths = .{""},
