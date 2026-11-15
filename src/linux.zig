@@ -959,6 +959,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         .io = io,
         .heard = if (options.stop_on != null) &serial.said else null,
         .screens = if (screens != null) &screens.? else null,
+        .gpu = if (wanted != null) &gpu else null,
         .deadline = if (options.seconds) |limit|
             std.Io.Clock.awake.now(io).nanoseconds + @as(i96, limit) * std.time.ns_per_s
         else

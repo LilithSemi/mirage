@@ -514,6 +514,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, args: []cons
         .session = held,
         .memory = &memory,
         .card = if (options.nat) &card else null,
+        .gpu = if (wanted != null) &gpu else null,
         .nat = if (options.nat) &nat else null,
         .relay = &relay,
         .chip = if (options.tpm != null) &chip else null,

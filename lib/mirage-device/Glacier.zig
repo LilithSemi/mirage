@@ -712,6 +712,13 @@ table_found: u64 = 0,
 /// asked to use it writes this, so it separates a driver that refused from one that was never
 /// called.
 mode_selects: u64 = 0,
+/// Frames the display has begun, which is what its counter answers.
+///
+/// Nothing here scans out, so the card cannot know when a frame starts: whoever runs the machine
+/// says so with `frame`, the way a core takes its words from an engine the caller gives it. A
+/// guest that waits for this to move is answered by a machine that is running, and by nothing at
+/// all where the card is held by a test that only reads registers.
+frames: u64 = 0,
 /// Bytes written into the frame buffer by the card's own engine: the driver painting for itself.
 painted: u64 = 0,
 /// Bytes written into the frame buffer straight through the window, which is firmware or an
@@ -899,8 +906,7 @@ fn displayWord(self: *const Glacier, at: u64) ?u32 {
         0x24 => shown.ddc,
         0x28 => shown.format,
         0x2c => shown.pitch,
-        // The frame counter counts started frames. Nothing here scans out, so no frame has begun.
-        0x30 => 0,
+        0x30 => @truncate(self.frames),
         else => 0,
     };
 }
@@ -1563,6 +1569,22 @@ test "a driver finds the display through the engine, a word at a time" {
     try testing.expectEqual(@as(u32, 0), through(&one, &fixture, display + 0x30));
 }
 
+test "the frame counter answers the frames the machine said began" {
+    var fixture: Fixture = .{};
+    var one = fixture.card();
+    const block = Fixture.fabric_at + 0x20;
+    one.aperture = .{ .at = Fixture.fabric_at, .len = 0x20 };
+    one.display = prototype_display;
+    one.display_at = block;
+    const display = block + displays_at;
+
+    // A card nobody is running answers zero, however long a guest waits on it.
+    try testing.expectEqual(@as(u32, 0), through(&one, &fixture, display + 0x30));
+    one.frame();
+    one.frame();
+    try testing.expectEqual(@as(u32, 2), through(&one, &fixture, display + 0x30));
+}
+
 test "the display registers are not memory, so nothing writes over the geometry" {
     var fixture: Fixture = .{};
     var one = fixture.card();
@@ -1804,6 +1826,14 @@ test "a card nobody is watching tells nothing and works the same" {
     try testing.expectEqual(@as(?Watcher, null), one.watching);
     _ = through(&one, &fixture, Fixture.fabric_at);
     try testing.expectEqual(@as(u64, 1), one.transfers);
+}
+
+/// Say that a frame has begun, which is what the display's counter counts.
+///
+/// A card with no display takes this and keeps nothing, because a counter nobody can read is not
+/// worth a case of its own at the call site.
+pub fn frame(self: *Glacier) void {
+    self.frames += 1;
 }
 
 /// The bytes of the frame buffer as the card holds them, or nothing where this card has no

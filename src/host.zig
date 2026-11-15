@@ -203,6 +203,10 @@ pub const Host = struct {
     said_it: bool = false,
     /// Whoever is taking pictures of the screen, where a caller asked for them.
     screens: ?*@import("Screendump.zig") = null,
+    /// The card whose display counts frames, and when this loop last said one began. The card does
+    /// not scan out, so a guest reading that counter reads what is written here.
+    gpu: ?*device.Glacier = null,
+    frame_at: i96 = 0,
     /// Counts the turns, so the serial output can be pushed out now and then. A guest that
     /// is killed before it stops would otherwise lose whatever is still buffered, which is
     /// exactly the output someone debugging needs.
@@ -210,6 +214,19 @@ pub const Host = struct {
 
     pub fn launchHost(self: *Host) core.Launch.Host {
         return .{ .ctx = self, .step = Host.step };
+    }
+
+    /// Tell the card a frame has begun, about sixty times a second.
+    ///
+    /// The rate is this loop's and not the mode's, because a model with no blanking has no frame
+    /// period of its own. A guest that waits for the counter to move is answered inside a frame of
+    /// a real display, which is what the wait is for.
+    fn beginFrame(self: *Host) void {
+        const gpu = self.gpu orelse return;
+        const now = std.Io.Clock.awake.now(self.io).nanoseconds;
+        if (now - self.frame_at < std.time.ns_per_s / 60) return;
+        self.frame_at = now;
+        gpu.frame();
     }
 
     /// Take the pages the guest gave up and hand them back to this machine. A page the guest
@@ -415,6 +432,7 @@ pub const Host = struct {
         }
 
         if (self.screens) |each| each.maybe();
+        self.beginFrame();
 
         self.drainBalloon();
         self.carryChip();
