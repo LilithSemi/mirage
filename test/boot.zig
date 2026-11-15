@@ -15,6 +15,7 @@ const Manifest = attest.Manifest;
 const image = @import("mirage-image");
 const netmod = @import("mirage-net");
 const fsmod = @import("mirage-fs");
+const jit = @import("mirage-jit");
 const linux = std.os.linux;
 
 /// The guest userspace, built for aarch64 by the same `zig build` as the VMM.
@@ -571,21 +572,29 @@ test "a real linux kernel boots far enough to speak" {
     // A bridge is three devices on the bus for one bridge: config space, the window below four
     // gigabytes and the window above it. All three or none, because config space says where a
     // region is and the windows are where it answers.
-    // The card this gate drives. Nothing asked for is the display alone, which is what this gate
-    // has always driven. A caller may give the settings of any board instead, in the same words
-    // `--device glacier-pci` takes, so a driver can be held to a card nobody has built here yet.
+    // The card this gate drives. Nothing asked for is the prototype board: a window, the mode it
+    // reports, the memory it hands out and a core to launch. A caller may give the settings of any
+    // board instead, in the same words `--device glacier-pci` takes, so a driver can be held to a
+    // card nobody has built here yet.
     const shape: device.Glacier.Build = if (glacier_card.len == 0)
-        .{ .display = device.Glacier.prototype_display }
+        device.Glacier.Build.prototype
     else
         try device.Glacier.Build.parse(glacier_card);
 
     // The card's own memory: the window the guest reaches directly, the two blocks past it, and
-    // the aperture and scratch of a core where the shape asks for one.
-    const fabric = if (glacier_on) try gpa.alloc(u8, @intCast(shape.fabricSize())) else @as([]u8, &.{});
+    // the aperture and scratch of a core where the shape asks for one. Both are aligned to a word,
+    // because an atomic a kernel does against either reads and writes a whole word at once.
+    const fabric = if (glacier_on)
+        try gpa.alignedAlloc(u8, .fromByteUnits(4), @intCast(shape.fabricSize()))
+    else
+        @as([]u8, &.{});
     defer if (glacier_on) gpa.free(fabric);
     const program = if (glacier_on) try gpa.alloc(u32, shape.programWords()) else @as([]u32, &.{});
     defer if (glacier_on) gpa.free(program);
-    const scratch = if (glacier_on) try gpa.alloc(u8, shape.scratchBytes()) else @as([]u8, &.{});
+    const scratch = if (glacier_on)
+        try gpa.alignedAlloc(u8, .fromByteUnits(4), shape.scratchBytes())
+    else
+        @as([]u8, &.{});
     defer if (glacier_on) gpa.free(scratch);
     if (glacier_on) {
         @memset(fabric, 0);
@@ -593,11 +602,25 @@ test "a real linux kernel boots far enough to speak" {
         @memset(scratch, 0);
     }
 
+    // Whoever runs the words a guest launches. The runner carries one, and a gate that left it out
+    // would answer every launch as a kernel that retired without running, which is a guest driving
+    // a card with nothing behind it.
+    var runner: ?jit.Glacier = if (glacier_on and shape.core != null) try .init(gpa, .{
+        .fabric = fabric,
+        .fabric_at = shape.window.at,
+        .scratch = scratch,
+        .scratch_at = shape.scratchAt(),
+        .warps = shape.core.?.warps,
+    }) else null;
+    defer if (runner) |*each| each.deinit();
+
     var gpu: device.Glacier = shape.card(.{
         .memory = &memory,
         .fabric = fabric,
         .program = program,
         .scratch = scratch,
+        .engine = if (runner) |*each| each.engine(io) else null,
+        .room = if (runner) |each| each.room else &.{},
     });
     // A core runs its warps on threads of their own, so the card stops before the memory they
     // write into goes away.
@@ -728,11 +751,19 @@ test "a real linux kernel boots far enough to speak" {
     // Frames each way, which is what says the network really carried something.
     var frames_out: u64 = 0;
     var frames_in: u64 = 0;
+    // When the card is next told a frame has begun. The card does not scan out, so this loop says
+    // it, the way the runner's own loop does.
+    var frame_at: i64 = 0;
     while (exits < max_exits) : (exits += 1) {
         if (exits % 4096 == 0) {
-            if (nowMs() > deadline) {
+            const clock = nowMs();
+            if (clock > deadline) {
                 std.debug.print("\n=== deadline after {d} exits ===\n", .{exits});
                 break;
+            }
+            if (glacier_on and clock - frame_at >= 16) {
+                frame_at = clock;
+                gpu.frame();
             }
             const have = sink.buffered();
             if (have.len > reported) {
@@ -1174,6 +1205,40 @@ test "a real linux kernel boots far enough to speak" {
         try std.testing.expect(registers + device.Glacier.registers_size <=
             arm64.fdt.pci_memory_base + arm64.fdt.pci_memory_size);
         try std.testing.expect(bridge.baseOf(0, device.Glacier.window_region) != null);
+
+        // The guest drove the card from userspace, and every address it used came off the card:
+        // the table said where the blocks sit, the display block said the mode, and the core said
+        // its own shape. These are the numbers of the card the gate builds, so a caller who asked
+        // for another board is held to the lines above and not to these.
+        if (glacier_card.len == 0) {
+            try std.testing.expect(std.mem.indexOf(u8, log, "card: blocks in the table 4") != null);
+            try std.testing.expect(std.mem.indexOf(u8, log, "card: 640x480 pitch 2560 at 0x80000000") != null);
+            try std.testing.expect(std.mem.indexOf(u8, log, "card: the core holds 8 warps of 4 lanes") != null);
+
+            // A kernel the guest wrote itself ran on every warp, and each warp's own word came
+            // back through the window. Nothing on this side put those words there.
+            try std.testing.expect(std.mem.indexOf(u8, log, "card: every warp wrote its own word") != null);
+
+            // And the counter the display keeps moved while the guest watched it, which is what a
+            // guest waiting for a frame waits for.
+            try std.testing.expect(std.mem.indexOf(u8, log, "card: the frame counter moved") != null);
+        }
+
+        // What the card saw of all that: the engine carried words, the table was read as a table,
+        // the window served reads, and nothing was aimed at fabric the card does not have.
+        try std.testing.expect(gpu.transfers > 0);
+        try std.testing.expect(gpu.table_found > 0);
+        try std.testing.expect(gpu.read_through_window > 0);
+        try std.testing.expectEqual(@as(u64, 0), gpu.strayed);
+
+        if (gpu.core) |*each| {
+            // One launch for each warp, and no kernel reached an address nothing claims. A core
+            // that answered a launch without running would leave the guest's words unwritten,
+            // which the line above is what catches.
+            try std.testing.expectEqual(@as(u64, shape.core.?.warps), each.launches);
+            const status = each.read(device.Glacier.Core.reg.status);
+            try std.testing.expectEqual(@as(u32, 0), status & device.Glacier.Core.status_bus_error);
+        }
     }
 
     try std.testing.expectEqual(@as(u64, 0), bus.unmapped);

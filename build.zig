@@ -226,23 +226,26 @@ pub fn build(b: *std.Build) void {
 
     // The runner itself, for whichever hypervisor this system has. Which one that is, is decided
     // inside `src/main.zig` and nowhere else.
-    if (has_os) {
-        // Whoever runs the words of a kernel. Compiling them for this cpu is a compiler's work, so
-        // Vulcan does it, and this edge is why the models carry a seam instead of a decoder. Only a
-        // hosted build takes it: a build with no operating system under it has no threads to run a
-        // warp on and nowhere to map code it compiled.
+    // Whoever runs the words of a kernel. Compiling them for this cpu is a compiler's work, so
+    // Vulcan does it, and this edge is why the models carry a seam instead of a decoder. Only a
+    // hosted build takes it: a build with no operating system under it has no threads to run a
+    // warp on and nowhere to map code it compiled. Made here because the runner and the boot gate
+    // both take it, and they are built in two blocks.
+    const jit: ?*std.Build.Module = if (has_os) made: {
         const vulcan = b.dependency("vulcan", .{
             .target = target,
             .optimize = optimize,
         });
-        const jit = add.lib("mirage-jit", &.{
+        break :made add.lib("mirage-jit", &.{
             .{ .name = "mirage-device", .module = device },
             .{ .name = "mirage-memory", .module = memory },
             .{ .name = "vulcan-ir", .module = vulcan.module("vulcan-ir") },
             .{ .name = "vulcan-opt", .module = vulcan.module("vulcan-opt") },
             .{ .name = "vulcan-target", .module = vulcan.module("vulcan-target") },
         });
+    } else null;
 
+    if (has_os) {
         const mirage = b.addExecutable(.{
             .name = "mirage",
             .root_module = b.createModule(.{
@@ -261,7 +264,7 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "mirage-attest", .module = attest },
                     .{ .name = "mirage-session", .module = session },
                     .{ .name = "mirage-fs", .module = filesystem },
-                    .{ .name = "mirage-jit", .module = jit },
+                    .{ .name = "mirage-jit", .module = jit.? },
                 },
             }),
         });
@@ -400,6 +403,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "mirage-image", .module = image },
                 .{ .name = "mirage-net", .module = net },
                 .{ .name = "mirage-fs", .module = filesystem },
+                .{ .name = "mirage-jit", .module = jit.? },
                 .{ .name = "boot-options", .module = boot_options.createModule() },
             },
         });

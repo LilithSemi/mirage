@@ -9,6 +9,7 @@
 //! descriptor so its output is not lost. If opening fails it falls back to descriptor one.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 const attest = @import("mirage-attest");
 const Chain = attest.Chain;
@@ -1028,6 +1029,502 @@ fn stream() void {
     say(buffer[0..have]);
 }
 
+/// What a Glacier card answers with, and the registers a driver drives it through.
+///
+/// A driver has to know these. Everything else it reads off the card: the device table says where
+/// each block of the fabric sits, and each block says what it is.
+const glacier = struct {
+    const vendor: u32 = 0x10ee;
+    const model: u32 = 0x7203;
+
+    /// The engine behind the first region, which carries words between this guest's memory and
+    /// the fabric. Nothing outside the window can be reached any other way.
+    const engine: u32 = 0x4844_4d41;
+    const control = 0x04;
+    const status = 0x08;
+    const host_low = 0x0c;
+    const host_high = 0x10;
+    const local_low = 0x14;
+    const local_high = 0x18;
+    const length = 0x1c;
+    const start: u32 = 1 << 0;
+    const clear: u32 = 1 << 1;
+    const to_host: u32 = 1 << 2;
+    const done: u32 = 1 << 1;
+    const failed: u32 = 1 << 2;
+
+    /// The device table, and the blocks this driver looks for in it.
+    const table = 0x100;
+    const table_id: u32 = 0x4744_4556;
+    const entries = 0x40;
+    const window_block: u32 = 0x5744_574e;
+    const display_block: u32 = 0x4744_4953;
+    const core_block: u32 = 0x474c_4352;
+
+    /// Inside a display block: where the first display starts, and the words of it worth reading.
+    const displays = 0x40;
+    const width = 0x10;
+    const height = 0x14;
+    const framebuffer = 0x1c;
+    const pitch = 0x2c;
+    const frames = 0x30;
+
+    /// Inside a core's window: what a launch is written to, what it reports, and where a program
+    /// goes.
+    const core_control = 0x04;
+    const launch_warp = 0x08;
+    const launch_pc = 0x0c;
+    const launch_mask = 0x10;
+    const core_status = 0x14;
+    const caps = 0x18;
+    const program = 0x8000;
+    const run: u32 = 1 << 0;
+    const launch: u32 = 1 << 1;
+    const issued: u32 = 1 << 1;
+    const idle: u32 = 1 << 2;
+    const bus_error: u32 = 1 << 3;
+
+    /// The mark the kernel writes, with the warp folded into its low bits, so a word in the frame
+    /// buffer says which warp put it there.
+    const mark: u32 = 0x5a5a_0000;
+};
+
+/// A Glacier card this guest has mapped, and the page the engine moves words through.
+const Card = struct {
+    regs: usize,
+    window: usize,
+    /// The page the engine reads and writes, and where that page sits in the machine's memory. The
+    /// engine takes an address off the bus, so a buffer whose physical address is unknown is no
+    /// use to it.
+    page: usize,
+    page_at: u64,
+
+    fn reg(self: Card, at: usize) u32 {
+        return offBus(self.regs + at);
+    }
+
+    fn put(self: Card, at: usize, value: u32) void {
+        ontoBus(self.regs + at, value);
+    }
+
+    fn word(self: Card, index: usize) u32 {
+        return @as(*volatile u32, @ptrFromInt(self.page + index * 4)).*;
+    }
+
+    fn setWord(self: Card, index: usize, value: u32) void {
+        @as(*volatile u32, @ptrFromInt(self.page + index * 4)).* = value;
+    }
+
+    /// Move words between the page and the fabric, and say whether the engine finished. A driver
+    /// clears what the last transfer left, stages both addresses and the count, then starts.
+    fn move(self: Card, at: u64, words: u32, out: bool) bool {
+        self.put(glacier.control, glacier.clear);
+        self.put(glacier.host_low, @truncate(self.page_at));
+        self.put(glacier.host_high, @truncate(self.page_at >> 32));
+        self.put(glacier.local_low, @truncate(at));
+        self.put(glacier.local_high, @truncate(at >> 32));
+        self.put(glacier.length, words);
+        self.put(glacier.control, glacier.start | if (out) 0 else glacier.to_host);
+        const state = self.reg(glacier.status);
+        return state & glacier.done != 0 and state & glacier.failed == 0;
+    }
+
+    /// One word of the fabric, wherever in it the word sits.
+    fn fabric(self: Card, at: u64) ?u32 {
+        if (!self.move(at, 1, false)) return null;
+        return self.word(0);
+    }
+
+    fn setFabric(self: Card, at: u64, value: u32) bool {
+        self.setWord(0, value);
+        return self.move(at, 1, true);
+    }
+
+    /// One word of the window, which this guest reaches without the engine.
+    fn shown(self: Card, offset: usize) u32 {
+        return offBus(self.window + offset);
+    }
+};
+
+/// One word off a device region, and one word into it, with the instruction said here rather than
+/// left to the compiler.
+///
+/// A loop of plain volatile reads becomes a post indexed load on aarch64, and a hypervisor cannot
+/// say what a load that writes its own address register back did: the access leaves it with no
+/// syndrome to report and the guest dies on it. Linux reaches a device register this way for the
+/// same reason. Nothing else needs it, because the loads a compiler pairs are the ones in a row.
+fn offBus(at: usize) u32 {
+    if (builtin.cpu.arch != .aarch64) return @as(*volatile u32, @ptrFromInt(at)).*;
+    // The register is named because the word has to be the one a `w` names: a value handed to
+    // `%[...]` is printed as the whole register, which would make this a load of eight bytes.
+    return asm volatile ("ldr w8, [%[at]]"
+        : [got] "={x8}" (-> u32),
+        : [at] "r" (at),
+        : .{ .memory = true });
+}
+
+fn ontoBus(at: usize, value: u32) void {
+    if (builtin.cpu.arch != .aarch64) {
+        @as(*volatile u32, @ptrFromInt(at)).* = value;
+        return;
+    }
+    asm volatile ("str w9, [%[at]]"
+        :
+        : [at] "r" (at),
+          [value] "{x9}" (value),
+        : .{ .memory = true });
+}
+
+/// The words of the kernel every warp runs: read which warp I am, then write one word for myself
+/// into the frame buffer.
+///
+/// Written here rather than read from a file. A guest that cannot put eight words together has
+/// nothing to launch, and the words a core runs are RISC-V.
+fn kernel(into: []u32, at: u32) []u32 {
+    const words = [_]u32{
+        csrrs(5, 0xf14),
+        lui(6, at >> 12),
+        slli(7, 5, 2),
+        add(6, 6, 7),
+        lui(8, glacier.mark >> 12),
+        bitOr(8, 8, 5),
+        sw(8, 6),
+        ebreak,
+    };
+    @memcpy(into[0..words.len], &words);
+    return into[0..words.len];
+}
+
+fn csrrs(rd: u32, which: u32) u32 {
+    return 0x73 | (rd << 7) | (2 << 12) | (which << 20);
+}
+
+fn lui(rd: u32, high: u32) u32 {
+    return 0x37 | (rd << 7) | (high << 12);
+}
+
+fn slli(rd: u32, from: u32, by: u32) u32 {
+    return 0x13 | (rd << 7) | (1 << 12) | (from << 15) | (by << 20);
+}
+
+fn add(rd: u32, left: u32, right: u32) u32 {
+    return 0x33 | (rd << 7) | (left << 15) | (right << 20);
+}
+
+fn bitOr(rd: u32, left: u32, right: u32) u32 {
+    return 0x33 | (rd << 7) | (6 << 12) | (left << 15) | (right << 20);
+}
+
+fn sw(value: u32, base: u32) u32 {
+    return 0x23 | (2 << 12) | (base << 15) | (value << 20);
+}
+
+const ebreak: u32 = 0x0010_0073;
+
+/// The sysfs name of the first Glacier card, or nothing where this guest has none.
+fn cardNamed(into: []u8) ?[]const u8 {
+    const opened = linux.open("/sys/bus/pci/devices", .{ .DIRECTORY = true }, 0);
+    if (std.posix.errno(opened) != .SUCCESS) return null;
+    const dir: i32 = @intCast(opened);
+    defer _ = linux.close(dir);
+
+    var room: [2048]u8 align(8) = undefined;
+    while (true) {
+        const got = linux.getdents64(dir, &room, room.len);
+        if (std.posix.errno(got) != .SUCCESS or got == 0) return null;
+
+        var at: usize = 0;
+        while (at + @sizeOf(linux.dirent64) <= got) {
+            const one: *align(1) const linux.dirent64 = @ptrCast(&room[at]);
+            if (one.reclen == 0) return null;
+            at += one.reclen;
+
+            const name: [*:0]const u8 = @ptrCast(&one.name);
+            if (name[0] == '.') continue;
+            const named = std.mem.sliceTo(name, 0);
+            if (named.len > into.len) continue;
+            if (numberIn(named, "vendor") != glacier.vendor) continue;
+            if (numberIn(named, "device") != glacier.model) continue;
+            @memcpy(into[0..named.len], named);
+            return into[0..named.len];
+        }
+    }
+}
+
+/// One of the numbers sysfs keeps about a device, which it writes as hexadecimal.
+fn numberIn(named: []const u8, which: []const u8) u32 {
+    var path: [96]u8 = undefined;
+    const at = std.fmt.bufPrintSentinel(&path, "/sys/bus/pci/devices/{s}/{s}", .{ named, which }, 0) catch return 0;
+    const opened = linux.open(at.ptr, .{}, 0);
+    if (std.posix.errno(opened) != .SUCCESS) return 0;
+    const fd: i32 = @intCast(opened);
+    defer _ = linux.close(fd);
+
+    var room: [32]u8 = undefined;
+    const got = linux.read(fd, &room, room.len);
+    if (std.posix.errno(got) != .SUCCESS or got < 3) return 0;
+    const said = std.mem.trim(u8, room[0..got], " \n");
+    if (said.len < 3 or said[0] != '0' or said[1] != 'x') return 0;
+    return std.fmt.parseInt(u32, said[2..], 16) catch 0;
+}
+
+/// Let the card decode its regions. Nothing is bound to it, so this guest is what enables it, the
+/// way a driver's first act does.
+fn decodeOn(named: []const u8) bool {
+    var path: [96]u8 = undefined;
+    const at = std.fmt.bufPrintSentinel(&path, "/sys/bus/pci/devices/{s}/config", .{named}, 0) catch return false;
+    const opened = linux.open(at.ptr, .{ .ACCMODE = .RDWR }, 0);
+    if (std.posix.errno(opened) != .SUCCESS) return false;
+    const fd: i32 = @intCast(opened);
+    defer _ = linux.close(fd);
+
+    var room: [2]u8 = undefined;
+    const got = linux.pread(fd, &room, room.len, 0x04);
+    if (std.posix.errno(got) != .SUCCESS or got != room.len) return false;
+    const command = std.mem.readInt(u16, &room, .little);
+    if (command & 0x0002 != 0) return true;
+
+    std.mem.writeInt(u16, &room, command | 0x0002, .little);
+    const written = linux.pwrite(fd, &room, room.len, 0x04);
+    return std.posix.errno(written) == .SUCCESS and written == room.len;
+}
+
+/// One of the card's regions, mapped where this guest can reach it.
+fn mapped(named: []const u8, which: u8, len: usize) ?usize {
+    var path: [96]u8 = undefined;
+    const at = std.fmt.bufPrintSentinel(&path, "/sys/bus/pci/devices/{s}/resource{d}", .{ named, which }, 0) catch return null;
+    const opened = linux.open(at.ptr, .{ .ACCMODE = .RDWR }, 0);
+    if (std.posix.errno(opened) != .SUCCESS) return null;
+    const fd: i32 = @intCast(opened);
+    defer _ = linux.close(fd);
+
+    const where = linux.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0);
+    if (std.posix.errno(where) != .SUCCESS) return null;
+    return where;
+}
+
+/// A page of this guest's memory the engine can reach, and where that page sits in the machine's
+/// memory. The page is held where it is, because a page that moved would leave the engine writing
+/// into whatever took its place.
+fn enginePage() ?struct { at: usize, physical: u64 } {
+    const size = 4096;
+    const where = linux.mmap(null, size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    if (std.posix.errno(where) != .SUCCESS) return null;
+
+    @as(*volatile u32, @ptrFromInt(where)).* = 0;
+    if (std.posix.errno(linux.mlock(@ptrFromInt(where), size)) != .SUCCESS) return null;
+
+    return .{ .at = where, .physical = physicalOf(where) orelse return null };
+}
+
+/// Where a page of this process sits in the machine's memory, out of the kernel's own table.
+fn physicalOf(at: usize) ?u64 {
+    const opened = linux.open("/proc/self/pagemap", .{}, 0);
+    if (std.posix.errno(opened) != .SUCCESS) return null;
+    const fd: i32 = @intCast(opened);
+    defer _ = linux.close(fd);
+
+    var room: [8]u8 = undefined;
+    const got = linux.pread(fd, &room, room.len, @intCast((at / 4096) * 8));
+    if (std.posix.errno(got) != .SUCCESS or got != room.len) return null;
+
+    const entry = std.mem.readInt(u64, &room, .little);
+    // The top bit says the page is there to point at. Without it the rest of the word means
+    // nothing.
+    if (entry >> 63 == 0) return null;
+    return (entry & 0x007f_ffff_ffff_ffff) * 4096;
+}
+
+/// Wait a while, which is what a driver does between reads of a status register.
+fn rest(ms: u32) void {
+    var pause: linux.timespec = .{ .sec = 0, .nsec = @as(isize, ms) * std.time.ns_per_ms };
+    while (linux.nanosleep(&pause, &pause) == @as(usize, @bitCast(@as(isize, -4)))) {}
+}
+
+/// Drive the card: find it, read what it says it is, launch a kernel on its core, and read back
+/// what the kernel wrote.
+///
+/// This is the whole path a driver takes, and every address comes off the card. The display and
+/// the core sit past the window, so the engine is the only way to either, and the frame buffer is
+/// inside the window, so the pixels are read straight.
+fn card() void {
+    _ = linux.mkdir("/sys", 0o755);
+    _ = linux.mount("none", "/sys", "sysfs", 0, 0);
+    _ = linux.mkdir("/proc", 0o755);
+    _ = linux.mount("none", "/proc", "proc", 0, 0);
+
+    var name: [32]u8 = undefined;
+    const named = cardNamed(&name) orelse {
+        say("card: no glacier card\n");
+        return;
+    };
+    if (!decodeOn(named)) {
+        say("card: the card would not decode\n");
+        return;
+    }
+
+    const regs = mapped(named, 0, 0x1000) orelse {
+        say("card: the registers would not be mapped\n");
+        return;
+    };
+    var one: Card = .{ .regs = regs, .window = 0, .page = 0, .page_at = 0 };
+    if (one.reg(0) != glacier.engine) {
+        say("card: another card answers here\n");
+        return;
+    }
+    if (one.reg(glacier.table) != glacier.table_id) {
+        say("card: no device table\n");
+        return;
+    }
+
+    // Where everything is, as the card says it rather than as this guest was built to think.
+    var window_at: u64 = 0;
+    var window_len: u64 = 0;
+    var display_at: u64 = 0;
+    var core_at: u64 = 0;
+    const blocks = one.reg(glacier.table + 0x08);
+    const stride = one.reg(glacier.table + 0x0c);
+    var which: u32 = 0;
+    while (which < blocks and stride != 0) : (which += 1) {
+        const entry = glacier.table + glacier.entries + which * stride;
+        const base = one.reg(entry + 0x04);
+        switch (one.reg(entry)) {
+            glacier.window_block => {
+                window_at = base;
+                window_len = one.reg(entry + 0x08);
+            },
+            glacier.display_block => display_at = base,
+            glacier.core_block => core_at = base,
+            else => {},
+        }
+    }
+    sayNumber("card: blocks in the table", blocks);
+
+    if (window_len == 0) {
+        say("card: the table names no window\n");
+        return;
+    }
+    // The window is the card's second region. The kernel module names it there, so a driver looks
+    // there and nowhere else.
+    one.window = mapped(named, 2, @intCast(window_len)) orelse {
+        say("card: the window would not be mapped\n");
+        return;
+    };
+    const page = enginePage() orelse {
+        say("card: no page the engine can reach\n");
+        return;
+    };
+    one.page = page.at;
+    one.page_at = page.physical;
+
+    if (display_at == 0) {
+        say("card: the table names no display\n");
+        return;
+    }
+    const first = display_at + glacier.displays;
+    const width = one.fabric(first + glacier.width) orelse {
+        say("card: the engine would not read the display\n");
+        return;
+    };
+    const height = one.fabric(first + glacier.height) orelse 0;
+    const pitch = one.fabric(first + glacier.pitch) orelse 0;
+    const buffer = one.fabric(first + glacier.framebuffer) orelse 0;
+    const began = one.fabric(first + glacier.frames) orelse 0;
+
+    var line: [96]u8 = undefined;
+    say(std.fmt.bufPrint(&line, "card: {d}x{d} pitch {d} at 0x{x}\n", .{
+        width,
+        height,
+        pitch,
+        buffer,
+    }) catch "card: a mode too long to say\n");
+
+    if (buffer < window_at or buffer - window_at >= window_len) {
+        say("card: the frame buffer is outside the window\n");
+        return;
+    }
+    if (core_at == 0) {
+        say("card: the table names no core\n");
+        return;
+    }
+
+    // What the core was built with. A driver can guess none of it.
+    const caps = one.fabric(core_at + glacier.caps) orelse {
+        say("card: the engine would not read the core\n");
+        return;
+    };
+    const warps = caps & 0xff;
+    const lanes = (caps >> 8) & 0xff;
+    say(std.fmt.bufPrint(&line, "card: the core holds {d} warps of {d} lanes\n", .{ warps, lanes }) catch
+        "card: a core too wide to say\n");
+    if (warps == 0 or lanes == 0 or lanes > 32 or warps > 32) {
+        say("card: a core nobody could have built\n");
+        return;
+    }
+
+    var words: [16]u32 = undefined;
+    const held = kernel(&words, buffer);
+    for (held, 0..) |each, index| one.setWord(index, each);
+    if (!one.move(core_at + glacier.program, @intCast(held.len), true)) {
+        say("card: the program would not be written\n");
+        return;
+    }
+
+    // Out of reset first, then one launch for each warp. Each warp writes a word of its own, so
+    // the order they run in changes nothing.
+    if (!one.setFabric(core_at + glacier.core_control, glacier.run)) {
+        say("card: the core would not leave reset\n");
+        return;
+    }
+    // Every lane of the datapath. The shift is done wide and cut back, because a core as wide as
+    // the register would shift a word by its own width.
+    const mask: u32 = @truncate((@as(u64, 1) << @intCast(lanes)) - 1);
+    var warp: u32 = 0;
+    while (warp < warps) : (warp += 1) {
+        _ = one.setFabric(core_at + glacier.launch_warp, warp);
+        _ = one.setFabric(core_at + glacier.launch_pc, 0);
+        _ = one.setFabric(core_at + glacier.launch_mask, mask);
+        if (!one.setFabric(core_at + glacier.core_control, glacier.run | glacier.launch)) {
+            say("card: a launch was refused\n");
+            return;
+        }
+    }
+
+    // Every warp has issued and none is running. A kernel that retired without issuing would read
+    // as idle from the start, which is why both bits are waited on.
+    var state: u32 = 0;
+    var tries: u32 = 0;
+    while (tries < 200) : (tries += 1) {
+        state = one.fabric(core_at + glacier.core_status) orelse break;
+        if (state & glacier.issued != 0 and state & glacier.idle != 0) break;
+        rest(5);
+    }
+    if (state & glacier.idle == 0) {
+        say("card: the core never went idle\n");
+        return;
+    }
+    if (state & glacier.bus_error != 0) say("card: a kernel reached an address nothing claims\n");
+
+    // What the kernel wrote, read through the window. The words went into the fabric from the
+    // core's side and come back from the guest's, so a match is the whole path.
+    const offset: usize = @intCast(buffer - window_at);
+    var wrote: u32 = 0;
+    warp = 0;
+    while (warp < warps) : (warp += 1) {
+        if (one.shown(offset + warp * 4) == glacier.mark | warp) wrote += 1;
+    }
+    if (wrote == warps) {
+        say("card: every warp wrote its own word\n");
+    } else {
+        sayNumber("card: warps that wrote their own word", wrote);
+    }
+
+    // The counter the card keeps for the display. Nothing scans out here, so this moves because
+    // the machine says frames began, and a guest waiting on it is answered.
+    const now = one.fabric(first + glacier.frames) orelse began;
+    if (now > began) say("card: the frame counter moved\n") else say("card: the frame counter stood still\n");
+}
+
 pub fn main() void {
     openConsole();
     say("mirage guest is alive\n");
@@ -1037,6 +1534,7 @@ pub fn main() void {
     network();
     ping();
     stream();
+    card();
 
     // Give the devices that work in the background time to do so. The balloon driver hands
     // pages over on a worker, and a guest that powers off the instant it starts proves
