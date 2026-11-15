@@ -2034,7 +2034,7 @@ test "the prototype shape is the card this runner always had" {
     try testing.expectEqual(@as(u64, prototype_display_at), shape.displayAt());
     try testing.expectEqual(@as(u64, prototype_pool_at), shape.poolAt());
     try testing.expectEqual(@as(usize, Core.max_program_words), shape.programWords());
-    try testing.expectEqual(@as(usize, 8 * 2048), shape.scratchBytes());
+    try testing.expectEqual(@as(usize, 16 * 2048), shape.scratchBytes());
 
     // And the board, which is the card the gateware is built for. Both are cards someone could
     // build, which is the whole of what `check` answers.
@@ -2117,7 +2117,7 @@ test "a card is placed where its shape says, and nothing else places it" {
     const shape = try Build.parse("board=chenega-v1-ax7203,windowsize=16K,res=64x32");
     var fabric: [0x4000 + Build.blocks_size]u8 = @splat(0);
     var program: [Core.max_program_words]u32 = @splat(0);
-    var scratch: [8 * 2048]u8 = @splat(0);
+    var scratch: [16 * 2048]u8 = @splat(0);
 
     // What a runner allocates comes from the shape, so these three are what it would have asked
     // for and not what this test chose.

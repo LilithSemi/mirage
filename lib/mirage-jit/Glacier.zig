@@ -22,9 +22,10 @@ const lift = vulcan.glacier.lift;
 const Jit = @This();
 
 comptime {
-    // Both sides count the arguments a launch carries, and a launch here is copied into a warp
-    // there whole. The hardware's count is what both of them were written from.
-    std.debug.assert(Core.launch_args == vulcan.glacier.encode.Csr.launch_args);
+    // Both sides count the arguments a launch carries, and a launch here is copied into the front
+    // of a warp there. The card's register block holds fewer than the control registers reserve,
+    // so the engine may carry more and this side may not carry more than it.
+    std.debug.assert(Core.launch_args <= vulcan.glacier.encode.Csr.launch_args);
     std.debug.assert(Core.warp_registers == @typeInfo(@FieldType(lift.Warp, "x")).array.len);
 }
 
@@ -169,7 +170,11 @@ fn begin(ctx: *anyopaque, state: []u8, which: u8, from: Core.Launch, shape: Core
             // Zero asks for the resident warps instead, which is the answer the core's own
             // register gives.
             .grid_dim = if (from.grid_dim == 0) shape.warps else from.grid_dim,
-            .args = from.args,
+            // Compiled code reads both rather than having them baked in, so one engine serves
+            // every profile. The count is the datapath the card was built with, the mask is the
+            // lanes this launch asked for.
+            .lane_count = shape.lanes,
+            .lane_mask = from.lanes,
             .fabric = self.fabric.ptr,
             .fabric_at = self.fabric_at,
             .fabric_size = @intCast(self.fabric.len),
@@ -177,6 +182,13 @@ fn begin(ctx: *anyopaque, state: []u8, which: u8, from: Core.Launch, shape: Core
             .away_ctx = one,
         },
     };
+
+    // The launch arguments a host can reach, into the front of however many the engine carries.
+    // The core's register block puts its debug registers where the upper arguments would land, so
+    // a host writes eight and cannot address the rest. A kernel that reads past the eighth reads
+    // zero here, and on the card reads whatever a debug write left there. Nothing can answer both
+    // while the two share an address.
+    @memcpy(one.warp.args[0..Core.launch_args], &from.args);
 
     const per = shape.scratch_per_warp;
     const at = @as(usize, which) * per;

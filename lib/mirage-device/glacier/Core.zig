@@ -168,10 +168,10 @@ pub const Shape = struct {
     perf: bool = true,
 };
 
-/// The profile the Chenega boards are built with: four lanes with eight warps to hide latency
+/// The profile the Chenega boards are built with: four lanes with sixteen warps to hide latency
 /// behind. From `config.dart` and `devices.nix`, so it is the shape of the card and not a choice
 /// made here.
-pub const gc1mi: Shape = .{ .warps = 8, .lanes = 4, .width = 4 };
+pub const gc1mi: Shape = .{ .warps = 16, .lanes = 4, .width = 4 };
 
 /// The rest of the generation, smallest to largest, from the same place. A profile is a build of
 /// the hardware and not a dial, so a caller asks for one of these rather than for any pair of
@@ -731,7 +731,7 @@ test "a core answers its name and the shape it was built with" {
     try testing.expectEqual(@as(u32, 16), one.read(reg.program_words));
 
     const caps = one.read(reg.caps);
-    try testing.expectEqual(@as(u32, 8), caps & caps_field);
+    try testing.expectEqual(@as(u32, 16), caps & caps_field);
     try testing.expectEqual(@as(u32, 4), (caps >> caps_lanes_shift) & caps_field);
     try testing.expectEqual(@as(u32, 4), (caps >> caps_width_shift) & caps_field);
     try std.testing.expect(caps & caps_perf != 0);

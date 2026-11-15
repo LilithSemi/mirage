@@ -1213,7 +1213,7 @@ test "a real linux kernel boots far enough to speak" {
         if (glacier_card.len == 0) {
             try std.testing.expect(std.mem.indexOf(u8, log, "card: blocks in the table 4") != null);
             try std.testing.expect(std.mem.indexOf(u8, log, "card: 640x480 pitch 2560 at 0x80000000") != null);
-            try std.testing.expect(std.mem.indexOf(u8, log, "card: the core holds 8 warps of 4 lanes") != null);
+            try std.testing.expect(std.mem.indexOf(u8, log, "card: the core holds 16 warps of 4 lanes") != null);
 
             // A kernel the guest wrote itself ran on every warp, and each warp's own word came
             // back through the window. Nothing on this side put those words there.
