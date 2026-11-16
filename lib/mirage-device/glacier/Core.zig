@@ -83,8 +83,9 @@ pub const max_warps = 16;
 pub const warp_registers = 32;
 
 /// The launch arguments, which a kernel reads as read only control registers. They belong to the
-/// core and not to a warp, so every warp of one launch reads the same values.
-pub const launch_args = 8;
+/// core and not to a warp, so every warp of one launch reads the same values. A host reaches all of
+/// them through the window, which is why the debug block sits above them rather than inside.
+pub const launch_args = 16;
 
 /// The register offsets, public so a host and this decode read the same numbers and the two cannot
 /// drift apart.
@@ -110,16 +111,19 @@ pub const reg = struct {
     pub const grid_dim = 0x38;
     pub const fault_warp = 0x3c;
     pub const launch_arg0 = 0x40;
-    pub const debug_select = 0x60;
-    pub const debug_data = 0x64;
-    pub const halt_on_fault = 0x68;
-    pub const scratch_at = 0x6c;
-    pub const scratch_data = 0x70;
-    pub const watch_at = 0x74;
-    pub const watch_pc = 0x78;
-    pub const watch_data = 0x7c;
-    pub const watch_fired = 0x80;
     pub const program_words = 0x84;
+    /// The debug block, which sits above the launch arguments and not inside them. Sixteen
+    /// arguments fill 0x40 through 0x7c, so these start past the last register below them and
+    /// leave 0x88 and 0x8c free.
+    pub const debug_select = 0x90;
+    pub const debug_data = 0x94;
+    pub const halt_on_fault = 0x98;
+    pub const scratch_at = 0x9c;
+    pub const scratch_data = 0xa0;
+    pub const watch_at = 0xa4;
+    pub const watch_pc = 0xa8;
+    pub const watch_data = 0xac;
+    pub const watch_fired = 0xb0;
 };
 
 /// Bit zero of control holds the core out of reset. The other two are strobes that clear
@@ -768,6 +772,8 @@ test "the strobe latches the arguments that were written before it" {
 
     one.write(reg.launch_arg0, 0x1111_0000);
     one.write(reg.launch_arg0 + 4 * 7, 0x7777_0000);
+    // The last one, which the debug block used to answer for.
+    one.write(reg.launch_arg0 + 4 * 15, 0xffff_0000);
     one.write(reg.workgroup_base, 3);
     one.write(reg.grid_dim, 12);
     one.write(reg.launch_pc, 0x40);
@@ -776,6 +782,9 @@ test "the strobe latches the arguments that were written before it" {
 
     try testing.expectEqual(@as(u32, 0x1111_0000), one.live.args[0]);
     try testing.expectEqual(@as(u32, 0x7777_0000), one.live.args[7]);
+    try testing.expectEqual(@as(u32, 0xffff_0000), one.live.args[15]);
+    try testing.expectEqual(@as(u32, 0), one.read(reg.debug_select));
+    try testing.expectEqual(@as(u32, 0), one.read(reg.watch_data));
     try testing.expectEqual(@as(u32, 3), one.live.workgroup_base);
     try testing.expectEqual(@as(u32, 12), one.live.grid_dim);
     try testing.expectEqual(@as(u32, 0x40), one.live.pc);
